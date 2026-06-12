@@ -34,11 +34,22 @@ Game logic, formats, and structure carry over; the platform layer is new.
    - Both loaders are validated in CI against every shipped asset
      (`vita/tools/validate_assets.c`, "validate-assets" job): all 149
      `.rmesh` rooms and 213 `.b3d` models parse.
-   - Still to do: texture loading (PNG/JPG via libpng/libjpeg already
-     linked) and the asset conversion step — Vita RAM is 512 MB, so
-     `GFX/` (≈400 MB) needs downscaling/recompression and `SFX/`
-     (≈120 MB) conversion to OGG/AT9. Assets ship in the VPK or as a
-     separate data package.
+   - Texture loading *(done — `src/formats/texture.c`)*: PNG/JPG/BMP
+     via vendored stb_image plus a DXT1/3/5 DDS decoder (the forest
+     tree texture is DXT5), with box-filter downscaling to a budget
+     cap. Reference resolution matches the game (room folder, then
+     `GFX/Map/Textures`, case-insensitive) with an extension-agnostic
+     fallback that fixes shipped rooms referencing `.jpg` names for
+     `.png` files. All 431 referenced textures decode in CI; the only
+     2 unresolved references are files absent from the game data.
+   - Measured RGBA8 texture footprint across everything the rooms and
+     models reference: **1110 MB native, 365 MB capped at 512px,
+     102 MB capped at 256px** — so the renderer budget is a 256px cap
+     by default (with the cap per-texture-class tunable later), well
+     within the Vita's 512 MB.
+   - Still to do: `SFX/` (≈120 MB) conversion to OGG/AT9, and the
+     packaging decision (assets in the VPK vs. a separate data
+     download).
 
 3. **Renderer**
    - Replace the shell's vita2d usage with VitaGL (OpenGL 1.x-style API

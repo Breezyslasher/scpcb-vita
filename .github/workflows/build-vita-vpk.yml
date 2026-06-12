@@ -20,9 +20,11 @@ jobs:
           gcc -O2 -Wall -Wextra -o validate_assets \
             vita/tools/validate_assets.c \
             vita/src/formats/rmesh.c \
-            vita/src/formats/b3d.c
+            vita/src/formats/b3d.c \
+            vita/src/formats/texture.c \
+            -lm
 
-      - name: Parse all RMesh rooms and B3D models
+      - name: Parse all RMesh rooms, B3D models and referenced textures
         run: ./validate_assets GFX Data
 
   build-vpk:
