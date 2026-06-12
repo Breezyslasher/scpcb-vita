@@ -8,7 +8,7 @@ if(NOT DEFINED CMAKE_TOOLCHAIN_FILE)
   endif()
 endif()
 
-project(scpcb_ue_vita C)
+project(scpcb_ue_vita C CXX)
 include("${VITASDK}/share/vita.cmake" REQUIRED)
 
 set(VITA_APP_NAME "SCP:CB Ultimate Edition")
@@ -25,6 +25,9 @@ add_executable(${PROJECT_NAME}
   src/formats/texture.c
   src/render/scene.c
 )
+
+# vitaGL contains C++ objects; link with the C++ runtime.
+set_target_properties(${PROJECT_NAME} PROPERTIES LINKER_LANGUAGE CXX)
 
 target_link_libraries(${PROJECT_NAME}
   vitaGL
