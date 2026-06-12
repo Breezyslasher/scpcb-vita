@@ -20,10 +20,45 @@ jobs:
           gcc -O2 -Wall -Wextra -o validate_assets \
             vita/tools/validate_assets.c \
             vita/src/formats/rmesh.c \
-            vita/src/formats/b3d.c
+            vita/src/formats/b3d.c \
+            vita/src/formats/texture.c \
+            vita/src/render/scene.c \
+            -lm
 
-      - name: Parse all RMesh rooms and B3D models
+      - name: Parse all RMesh rooms, B3D models and referenced textures
         run: ./validate_assets GFX Data
+
+  package-data:
+    name: Package device data (manual trigger only)
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build tools
+        run: |
+          gcc -O2 -Wall -o convert_assets \
+            vita/tools/convert_assets.c vita/src/formats/texture.c -lm
+          gcc -O2 -Wall -o validate_assets \
+            vita/tools/validate_assets.c \
+            vita/src/formats/rmesh.c \
+            vita/src/formats/b3d.c \
+            vita/src/formats/texture.c \
+            -lm
+
+      - name: Stage device data (world textures capped at 256px)
+        run: ./convert_assets staging --cap 256 GFX/Map GFX/NPCs --copy Data SFX GFX
+
+      - name: Validate staged package
+        run: cd staging && ../validate_assets GFX Data
+
+      - name: Upload data package
+        uses: actions/upload-artifact@v4
+        with:
+          name: scpcb-ue-vita-data
+          path: staging/
+          if-no-files-found: error
 
   build-vpk:
     name: Build VPK (VitaSDK)

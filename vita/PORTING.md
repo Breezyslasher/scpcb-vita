@@ -34,17 +34,46 @@ Game logic, formats, and structure carry over; the platform layer is new.
    - Both loaders are validated in CI against every shipped asset
      (`vita/tools/validate_assets.c`, "validate-assets" job): all 149
      `.rmesh` rooms and 213 `.b3d` models parse.
-   - Still to do: texture loading (PNG/JPG via libpng/libjpeg already
-     linked) and the asset conversion step — Vita RAM is 512 MB, so
-     `GFX/` (≈400 MB) needs downscaling/recompression and `SFX/`
-     (≈120 MB) conversion to OGG/AT9. Assets ship in the VPK or as a
-     separate data package.
+   - Texture loading *(done — `src/formats/texture.c`)*: PNG/JPG/BMP
+     via vendored stb_image plus a DXT1/3/5 DDS decoder (the forest
+     tree texture is DXT5), with box-filter downscaling to a budget
+     cap. Reference resolution matches the game (room folder, then
+     `GFX/Map/Textures`, case-insensitive) with an extension-agnostic
+     fallback that fixes shipped rooms referencing `.jpg` names for
+     `.png` files. All 431 referenced textures decode in CI; the only
+     2 unresolved references are files absent from the game data.
+   - Measured RGBA8 texture footprint across everything the rooms and
+     models reference: **1110 MB native, 365 MB capped at 512px,
+     102 MB capped at 256px** — so the renderer budget is a 256px cap
+     by default (with the cap per-texture-class tunable later), well
+     within the Vita's 512 MB.
+   - Audio: `SFX/` already ships as 959 Ogg Vorbis files, which decode
+     fine on the Vita (libvorbis) — no conversion step needed.
+   - Device packaging *(done — `tools/convert_assets.c`)*: assets ship
+     as a separate data package rather than inside the VPK (keeps the
+     bubble small and lets code and data update independently). The
+     packager stages `Data/ + GFX/ + SFX/`, downscales world textures
+     (`GFX/Map`, `GFX/NPCs`) to a 256px cap while copying UI art,
+     geometry and audio verbatim, and preserves all filenames so
+     texture references keep resolving. Result: 459 MB → 304 MB on
+     disk, 150 MB decoded RGBA8. The CI job (manual trigger) validates
+     the staged tree with the same loaders, then uploads it as the
+     `scpcb-ue-vita-data` artifact; contents install to
+     `ux0:data/scpcb-ue/`.
 
-3. **Renderer**
-   - Replace the shell's vita2d usage with VitaGL (OpenGL 1.x-style API
-     maps well onto Blitz3D's DX7 fixed-function model: entities, brightness,
-     fog, FX flags).
-   - Room rendering with the original lightmaps, then entities/NPC meshes.
+3. **Renderer** *(in progress)*
+   - Room viewer *(done — `src/render/scene.c`, `src/main.c`)*: vitaGL
+     fixed-function rendering of real rooms. The scene builder converts
+     parsed RMesh into 16-bit-indexed batches (GL-free, validated on the
+     host against all 149 rooms: 1,663 batches, max 8,182 verts/batch),
+     recovering the layer semantics from `Map_Core.bb` — texture slot j
+     samples UV set 1-j, `_lm` names are lightmaps (additive, Blitz
+     TextureBlend 3), flag 3 means alpha-clip. Two-pass draw: diffuse ×
+     vertex color, then additive lightmap; alpha-clipped surfaces last
+     with alpha test. Free-fly camera on the sticks, room cycling on the
+     D-pad, status HUD via stb_easy_font.
+   - Still to do: B3D props/entity placement in rooms, dynamic lights,
+     fog, sky, and screen-space effects; then NPC meshes.
 
 4. **Game systems** (grafted from CBN, adapted to UE Reborn content)
    - Player movement/collision, doors, items/inventory (touch-driven UI),
