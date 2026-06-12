@@ -19,6 +19,7 @@
 #include <psp2/kernel/processmgr.h>
 #include <vitaGL.h>
 
+#include "audio/audio.h"
 #include "formats/b3d.h"
 #include "formats/rmesh.h"
 #include "formats/texture.h"
@@ -508,6 +509,53 @@ typedef struct {
     int ok;
 } ModelRT;
 
+/* ---------------- sounds ---------------- */
+
+#define SFX_DIR DATA_ROOT "/SFX"
+
+static int sndDoorOpen[3], sndDoorClose[3];
+static int sndBigOpen[3], sndBigClose[3];
+static int sndStep[8], sndRun[7];
+static int sndButton[2], sndKeycardUse[2], sndDoorLock;
+static int sndPick[4];
+static int sndAmbience;
+static float stepAccum;
+
+static void loadSounds(void) {
+    char p[256];
+    for (int i = 0; i < 3; i++) {
+        snprintf(p, sizeof(p), SFX_DIR "/Door/DoorOpen%d.ogg", i);
+        sndDoorOpen[i] = audioLoad(p);
+        snprintf(p, sizeof(p), SFX_DIR "/Door/DoorClose%d.ogg", i);
+        sndDoorClose[i] = audioLoad(p);
+        snprintf(p, sizeof(p), SFX_DIR "/Door/BigDoorOpen%d.ogg", i);
+        sndBigOpen[i] = audioLoad(p);
+        snprintf(p, sizeof(p), SFX_DIR "/Door/BigDoorClose%d.ogg", i);
+        sndBigClose[i] = audioLoad(p);
+    }
+    for (int i = 0; i < 8; i++) {
+        snprintf(p, sizeof(p), SFX_DIR "/Step/Step%d.ogg", i);
+        sndStep[i] = audioLoad(p);
+    }
+    for (int i = 0; i < 7; i++) {
+        snprintf(p, sizeof(p), SFX_DIR "/Step/Run%d.ogg", i);
+        sndRun[i] = audioLoad(p);
+    }
+    for (int i = 0; i < 2; i++) {
+        snprintf(p, sizeof(p), SFX_DIR "/Interact/Button%d.ogg", i);
+        sndButton[i] = audioLoad(p);
+        snprintf(p, sizeof(p), SFX_DIR "/Interact/KeycardUse%d.ogg", i);
+        sndKeycardUse[i] = audioLoad(p);
+    }
+    sndDoorLock = audioLoad(SFX_DIR "/Interact/DoorLock.ogg");
+    for (int i = 0; i < 4; i++) {
+        snprintf(p, sizeof(p), SFX_DIR "/Interact/PickItem%d.ogg", i);
+        sndPick[i] = audioLoad(p);
+    }
+    sndAmbience = audioLoad(SFX_DIR "/Ambient/Room ambience/rumble.ogg");
+    audioLoopAmbience(sndAmbience, 0.30f);
+}
+
 static ModelRT doorFrameRT, doorPanelRT, heavy1RT, heavy2RT;
 static ModelRT buttonRT, buttonKeycardRT;
 static char toastMsg[128];
@@ -848,6 +896,7 @@ int main(void) {
     if (haveData) {
         tplRT = (TemplateRT *)calloc(tplList.count, sizeof(TemplateRT));
         buildDoorAssets();
+        if (audioInit()) loadSounds();
         regenerateMap((uint32_t)(sceKernelGetProcessTimeWide() & 0xFFFFFF) | 1u);
     } else {
         snprintf(statusLine, sizeof(statusLine),
@@ -886,20 +935,38 @@ int main(void) {
                 snprintf(toastMsg, sizeof(toastMsg), "PICKED UP %s",
                          ITEM_TEMPLATES[picked].name);
                 toastTimer = 150;
+                audioPlay(sndPick[rand() % 4], 0.8f, 0.0f);
             } else {
             Door *pressed = NULL;
             switch (doorsPressButton(&doors, camPos, playerKeycard(),
                                      &pressed)) {
+                case DOOR_PRESS_TOGGLED:
+                    if (pressed) {
+                        float dpos[3] = { pressed->x, camPos[1], pressed->z };
+                        int v = rand() % 3;
+                        int snd = pressed->heavy
+                                ? (pressed->open ? sndBigOpen[v]
+                                                 : sndBigClose[v])
+                                : (pressed->open ? sndDoorOpen[v]
+                                                 : sndDoorClose[v]);
+                        audioPlay(pressed->keycard > 0
+                                      ? sndKeycardUse[rand() % 2]
+                                      : sndButton[rand() % 2], 0.9f, 0.0f);
+                        audioPlay3D(snd, dpos, camPos, camYaw, 2500.0f);
+                    }
+                    break;
                 case DOOR_PRESS_KEYCARD:
                     snprintf(toastMsg, sizeof(toastMsg),
                              "ACCESS DENIED - LEVEL %d KEYCARD REQUIRED"
                              " (press x3 to force)",
                              pressed ? pressed->keycard : 0);
                     toastTimer = 150;
+                    audioPlay(sndDoorLock, 0.9f, 0.0f);
                     break;
                 case DOOR_PRESS_LOCKED:
                     snprintf(toastMsg, sizeof(toastMsg), "THE DOOR IS LOCKED");
                     toastTimer = 150;
+                    audioPlay(sndDoorLock, 0.9f, 0.0f);
                     break;
                 default:
                     break;
@@ -937,8 +1004,25 @@ int main(void) {
             } else if (inputDown(ACTION_SPRINT)) {
                 speed *= SPRINT_MULT;
             }
-            camPos[0] += (fwdX * -move.y + cosf(camYaw) * move.x) * speed;
-            camPos[2] += (fwdZ * -move.y + sinf(camYaw) * move.x) * speed;
+            float mvx = (fwdX * -move.y + cosf(camYaw) * move.x) * speed;
+            float mvz = (fwdZ * -move.y + sinf(camYaw) * move.x) * speed;
+            camPos[0] += mvx;
+            camPos[2] += mvz;
+
+            /* Footstep cadence by distance walked (PlayStepSound). */
+            if (velY > -1.0f) {
+                stepAccum += sqrtf(mvx * mvx + mvz * mvz);
+                float strideLen = 170.0f;
+                if (stepAccum >= strideLen) {
+                    stepAccum = 0.0f;
+                    if (inputDown(ACTION_SPRINT) && !crouched) {
+                        audioPlay(sndRun[rand() % 7], 0.7f, 0.0f);
+                    } else {
+                        audioPlay(sndStep[rand() % 8],
+                                  crouched ? 0.25f : 0.5f, 0.0f);
+                    }
+                }
+            }
 
             velY -= GRAVITY;
             if (velY < -TERMINAL_FALL) velY = -TERMINAL_FALL;
