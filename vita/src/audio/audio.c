@@ -125,16 +125,31 @@ int audioSoundCount(void) {
     return soundCount;
 }
 
+static int loadFopenFails, loadDecodeFails;
+
+int audioLoadFopenFails(void) { return loadFopenFails; }
+int audioLoadDecodeFails(void) { return loadDecodeFails; }
+
 int audioLoad(const char *path) {
     for (int i = 0; i < soundCount; i++) {
         if (strcmp(sounds[i].path, path) == 0) return i;
     }
     if (soundCount >= MAX_SOUNDS) return -1;
 
+    FILE *probe = fopen(path, "rb");
+    if (!probe) {
+        loadFopenFails++;
+        return -1;
+    }
+    fclose(probe);
+
     int chans = 0, rate = 0;
     short *pcm = NULL;
     int frames = stb_vorbis_decode_filename(path, &chans, &rate, &pcm);
-    if (frames <= 0 || !pcm) return -1;
+    if (frames <= 0 || !pcm) {
+        loadDecodeFails++;
+        return -1;
+    }
 
     Sound *s = &sounds[soundCount];
     s->path = strdup(path);

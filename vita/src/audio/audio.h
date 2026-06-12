@@ -29,5 +29,9 @@ void audioLoopAmbience(int sound, float vol);
  * 0 not initialized) and number of sounds successfully decoded. */
 int audioStatus(void);
 int audioSoundCount(void);
+/* Load failure breakdown: files that would not open vs. would not
+ * decode. */
+int audioLoadFopenFails(void);
+int audioLoadDecodeFails(void);
 
 #endif
