@@ -24,6 +24,7 @@
 #include "formats/texture.h"
 #include "game/collision.h"
 #include "game/doors.h"
+#include "game/item_spawns.h"
 #include "game/mapgen.h"
 #include "input.h"
 #include "render/scene.h"
@@ -40,6 +41,7 @@
 #define MAP_TEXTURES_DIR DATA_ROOT "/GFX/Map/Textures"
 #define PROPS_DIR DATA_ROOT "/GFX/Map/Props"
 #define ITEMS_DIR DATA_ROOT "/GFX/Items"
+#define ITEMS_HUD_DIR DATA_ROOT "/GFX/Items/HUD Textures"
 #define ROOMS_INI DATA_ROOT "/Data/rooms.ini"
 
 /* RoomSpacing is 8 world units = 2048 raw mesh units. */
@@ -77,9 +79,10 @@ static GLuint textureGet(const char *name) {
     }
 
     GLuint handle = 0;
-    const char *dirs[4] = { MAP_DIR, MAP_TEXTURES_DIR, PROPS_DIR, ITEMS_DIR };
+    const char *dirs[5] = { MAP_DIR, MAP_TEXTURES_DIR, PROPS_DIR, ITEMS_DIR,
+                            ITEMS_HUD_DIR };
     char path[1024];
-    if (textureResolve(name, dirs, 4, path, sizeof(path))) {
+    if (textureResolve(name, dirs, 5, path, sizeof(path))) {
         char err[128];
         TextureImage *img = textureLoadFile(path, TEXTURE_CAP, err, sizeof(err));
         if (img) {
@@ -577,28 +580,16 @@ static void drawModelRT(const ModelRT *rt);
 
 /* ---------------- items and inventory ---------------- */
 
-/* Subset of the game's item templates (Loading_Core.bb): name, model,
- * texture override, world-unit scale, keycard level granted. */
-typedef struct {
-    const char *displayName;
-    const char *model;
-    const char *texture;
-    float worldScale;
-    int keycardLevel;
-} ItemDef;
-
-static const ItemDef itemDefs[] = {
-    { "Level 1 Key Card", "key_card.b3d", "key_card_lvl_1.png", 0.00037f, 1 },
-    { "Level 3 Key Card", "key_card.b3d", "key_card_lvl_3.png", 0.00037f, 3 },
-    { "Level 5 Key Card", "key_card.b3d", "key_card_lvl_5.png", 0.00037f, 5 },
-};
-#define ITEM_DEF_COUNT (sizeof(itemDefs) / sizeof(itemDefs[0]))
-#define MAX_WORLD_ITEMS 32
+/* Templates and per-room spawns generated from the Blitz sources by
+ * vita/tools/extract_items.py (item_spawns.h). */
+#define ITEM_TPL_COUNT \
+    ((int)(sizeof(ITEM_TEMPLATES) / sizeof(ITEM_TEMPLATES[0])))
+#define MAX_WORLD_ITEMS 512
 #define MAX_INVENTORY 10
 #define ITEM_PICKUP_REACH 250.0f
 
 typedef struct {
-    int def;
+    int tpl;
     float x, y, z;
     int taken;
 } WorldItem;
@@ -608,53 +599,91 @@ static unsigned worldItemCount;
 static int inventory[MAX_INVENTORY];
 static unsigned inventoryCount;
 static int invOpen;
-static ModelRT itemRT[ITEM_DEF_COUNT];
+static ModelRT itemRT[sizeof(ITEM_TEMPLATES) / sizeof(ITEM_TEMPLATES[0])];
 static float itemSpin;
 
-static void buildItemAssets(void) {
-    for (unsigned i = 0; i < ITEM_DEF_COUNT; i++) {
-        buildModelRT(&itemRT[i], itemDefs[i].model, 0, 0, 0,
-                     itemDefs[i].texture);
-        /* Normalize to a hand-sized card (~60 raw units wide); the
-         * game's per-template world scales assume model-native units. */
-        float ext = itemRT[i].scene
-            ? itemRT[i].scene->boundsMax[0] - itemRT[i].scene->boundsMin[0]
-            : 0.0f;
-        if (ext > 0.0f) {
-            float k = 60.0f / ext;
-            itemRT[i].scale[0] = itemRT[i].scale[1] = itemRT[i].scale[2] = k;
-        }
+static int itemTplFind(const char *name) {
+    for (int i = 0; i < ITEM_TPL_COUNT; i++) {
+        if (strcmp(ITEM_TEMPLATES[i].name, name) == 0) return i;
     }
+    return -1;
+}
+
+/* "Level N Key Card" / "Level N key Card" grants keycard level N. */
+static int itemKeycardLevel(int tpl) {
+    const char *n = ITEM_TEMPLATES[tpl].name;
+    int level = 0;
+    if (sscanf(n, "Level %d", &level) == 1
+        && (strstr(n, "Key Card") || strstr(n, "key Card"))) {
+        return level;
+    }
+    return 0;
+}
+
+static const ModelRT *itemModel(int tpl) {
+    ModelRT *rt = &itemRT[tpl];
+    if (!rt->ok && !rt->scene) {
+        const ItemTemplateDef *def = &ITEM_TEMPLATES[tpl];
+        buildModelRT(rt, def->model, 0, 0, 0,
+                     def->texture[0] ? def->texture : NULL);
+        /* ScaleEntity(worldScale) on model-native units; our raw units
+         * are world * 256. */
+        float k = def->worldScale * 256.0f;
+        rt->scale[0] = rt->scale[1] = rt->scale[2] = k;
+    }
+    return rt;
 }
 
 static int playerKeycard(void) {
     int level = 0;
     for (unsigned i = 0; i < inventoryCount; i++) {
-        if (itemDefs[inventory[i]].keycardLevel > level) {
-            level = itemDefs[inventory[i]].keycardLevel;
-        }
+        int l = itemKeycardLevel(inventory[i]);
+        if (l > level) level = l;
     }
     return level;
 }
 
-/* Provisional spawns until per-room item scripts are ported: a level 1
- * keycard near spawn, level 3 in HCZ, level 5 in EZ. */
+static void worldItemAdd(int tpl, float x, float y, float z) {
+    if (tpl < 0 || worldItemCount >= MAX_WORLD_ITEMS) return;
+    WorldItem *w = &worldItems[worldItemCount++];
+    w->tpl = tpl;
+    w->x = x;
+    w->y = y;
+    w->z = z;
+    w->taken = 0;
+}
+
+/* Place FillRoom's literal item spawns in every placed room (rotated
+ * with the room), plus one keycard per zone as progression safety
+ * until the scripted keycard sources are ported. */
 static void spawnItems(void) {
     worldItemCount = 0;
     inventoryCount = 0;
-    int wantZoneFor[3] = { 1, 2, 3 }; /* LCZ, HCZ, EZ */
-    for (int k = 0; k < 3 && worldItemCount < MAX_WORLD_ITEMS; k++) {
+    for (uint32_t i = 0; i < map.roomCount; i++) {
+        const RoomPlacement *p = &map.rooms[i];
+        const char *roomName = tplList.items[p->templateIndex].name;
+        for (unsigned s = 0;
+             s < sizeof(ITEM_SPAWNS) / sizeof(ITEM_SPAWNS[0]); s++) {
+            if (strcmp(ITEM_SPAWNS[s].room, roomName) != 0) continue;
+            float local[3] = { ITEM_SPAWNS[s].x, ITEM_SPAWNS[s].y,
+                               ITEM_SPAWNS[s].z };
+            float w[3];
+            localToWorld(p, local, w);
+            worldItemAdd(itemTplFind(ITEM_SPAWNS[s].item), w[0], w[1], w[2]);
+        }
+    }
+
+    const char *zoneCard[3] = { "Level 1 Key Card", "Level 3 key Card",
+                                "Level 5 key Card" };
+    for (int k = 0; k < 3; k++) {
         for (uint32_t i = 0; i < map.roomCount; i++) {
             const RoomPlacement *p = &map.rooms[i];
             int zone = (p->gridY < MAPGEN_GRID / 3 + 1) ? 3
                      : (p->gridY < (int)(MAPGEN_GRID * (2.0 / 3.0))) ? 2 : 1;
-            if (zone != wantZoneFor[k]) continue;
-            WorldItem *w = &worldItems[worldItemCount++];
-            w->def = k;
-            w->x = p->gridX * ROOM_SPACING;
-            w->y = 60.0f;
-            w->z = p->gridY * ROOM_SPACING;
-            w->taken = 0;
+            if (zone != k + 1) continue;
+            worldItemAdd(itemTplFind(zoneCard[k]),
+                         p->gridX * ROOM_SPACING, 60.0f,
+                         p->gridY * ROOM_SPACING);
             break;
         }
     }
@@ -667,6 +696,8 @@ static int itemPickupNearest(const float pos[3]) {
         WorldItem *w = &worldItems[i];
         if (w->taken) continue;
         float dx = pos[0] - w->x, dz = pos[2] - w->z;
+        float dy = pos[1] - EYE_HEIGHT - w->y;
+        if (dy < -350.0f || dy > 350.0f) continue;
         float d2 = dx * dx + dz * dz;
         if (d2 < bestD2) {
             bestD2 = d2;
@@ -675,8 +706,8 @@ static int itemPickupNearest(const float pos[3]) {
     }
     if (best < 0 || inventoryCount >= MAX_INVENTORY) return -1;
     worldItems[best].taken = 1;
-    inventory[inventoryCount++] = worldItems[best].def;
-    return worldItems[best].def;
+    inventory[inventoryCount++] = worldItems[best].tpl;
+    return worldItems[best].tpl;
 }
 
 static void drawItems(const float viewPos[3]) {
@@ -688,7 +719,7 @@ static void drawItems(const float viewPos[3]) {
         glPushMatrix();
         glTranslatef(w->x, w->y, w->z);
         glRotatef(itemSpin, 0.0f, 1.0f, 0.0f);
-        drawModelRT(&itemRT[w->def]);
+        drawModelRT(itemModel(w->tpl));
         glPopMatrix();
     }
 }
@@ -817,7 +848,6 @@ int main(void) {
     if (haveData) {
         tplRT = (TemplateRT *)calloc(tplList.count, sizeof(TemplateRT));
         buildDoorAssets();
-        buildItemAssets();
         regenerateMap((uint32_t)(sceKernelGetProcessTimeWide() & 0xFFFFFF) | 1u);
     } else {
         snprintf(statusLine, sizeof(statusLine),
@@ -854,7 +884,7 @@ int main(void) {
             int picked = itemPickupNearest(camPos);
             if (picked >= 0) {
                 snprintf(toastMsg, sizeof(toastMsg), "PICKED UP %s",
-                         itemDefs[picked].displayName);
+                         ITEM_TEMPLATES[picked].name);
                 toastTimer = 150;
             } else {
             Door *pressed = NULL;
@@ -978,7 +1008,7 @@ int main(void) {
             snprintf(invText, sizeof(invText), "INVENTORY (%u/%u)\n",
                      inventoryCount, (unsigned)MAX_INVENTORY);
             for (unsigned ii = 0; ii < inventoryCount; ii++) {
-                strncat(invText, itemDefs[inventory[ii]].displayName,
+                strncat(invText, ITEM_TEMPLATES[inventory[ii]].name,
                         sizeof(invText) - strlen(invText) - 2);
                 strncat(invText, "\n", sizeof(invText) - strlen(invText) - 1);
             }

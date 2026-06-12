@@ -207,6 +207,11 @@ DoorPressResult doorsPressButton(DoorList *list, const float pos[3],
 void doorsCollide(const DoorList *list, float pos[3], float radius) {
     for (uint32_t i = 0; i < list->count; i++) {
         const Door *d = &list->items[i];
+        /* Once the panels are mostly retracted the doorway is clear;
+         * per-panel boxes never opened a gap for heavy doors whose
+         * slide is shorter than the panel width. */
+        if (d->openState > 140.0f) continue;
+
         float dx = pos[0] - d->x, dz = pos[2] - d->z;
         if (dx * dx + dz * dz > 1024.0f * 1024.0f) continue;
         if (pos[1] > DOOR_PANEL_H + 200.0f) continue;
@@ -221,27 +226,16 @@ void doorsCollide(const DoorList *list, float pos[3], float radius) {
             lz = dz;
         }
 
-        float slide = doorSlide(d);
-        for (int panel = 0; panel < 2; panel++) {
-            float cx = panel == 0 ? slide : -slide;
-            float px = lx - cx;
-            if (fabsf(px) >= DOOR_PANEL_HALF_W + radius) continue;
-            if (fabsf(lz) >= DOOR_PANEL_HALF_D + radius) continue;
-            /* Push out along the through-axis. */
-            float push = (DOOR_PANEL_HALF_D + radius - fabsf(lz))
-                       * (lz >= 0.0f ? 1.0f : -1.0f);
-            lz += push;
-            if (d->angle == 90) {
-                pos[0] = d->x + lz;
-            } else {
-                pos[2] = d->z + lz;
-            }
-            /* Recompute for the second panel. */
-            if (d->angle == 90) {
-                lz = pos[0] - d->x;
-            } else {
-                lz = pos[2] - d->z;
-            }
+        /* One box across the whole doorway. */
+        if (fabsf(lx) >= 220.0f + radius) continue;
+        if (fabsf(lz) >= DOOR_PANEL_HALF_D + radius) continue;
+        float push = (DOOR_PANEL_HALF_D + radius - fabsf(lz))
+                   * (lz >= 0.0f ? 1.0f : -1.0f);
+        lz += push;
+        if (d->angle == 90) {
+            pos[0] = d->x + lz;
+        } else {
+            pos[2] = d->z + lz;
         }
     }
 }
