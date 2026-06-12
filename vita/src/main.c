@@ -15,8 +15,6 @@
 #define SCREEN_W 960
 #define SCREEN_H 544
 
-#define RGBA8(r, g, b, a) ((a) << 24 | (b) << 16 | (g) << 8 | (r))
-
 static const unsigned int COLOR_BG     = RGBA8(10, 10, 12, 255);
 static const unsigned int COLOR_TEXT   = RGBA8(200, 200, 200, 255);
 static const unsigned int COLOR_TITLE  = RGBA8(255, 255, 255, 255);
