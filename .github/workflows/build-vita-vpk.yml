@@ -25,6 +25,9 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: List SDK stub libraries (diagnostic)
+        run: ls /usr/local/vitasdk/arm-vita-eabi/lib/ | grep -iE 'sharedfb|appmgr|vita2d|ctrl|touch' || true
+
       - name: Configure
         run: cmake -S vita -B vita/build -DCMAKE_BUILD_TYPE=Release
 
