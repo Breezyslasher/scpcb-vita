@@ -20,26 +20,27 @@ set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wall -O2")
 add_executable(${PROJECT_NAME}
   src/main.c
   src/input.c
-  src/sharedfb_compat.c
   src/formats/rmesh.c
   src/formats/b3d.c
   src/formats/texture.c
+  src/render/scene.c
 )
 
 target_link_libraries(${PROJECT_NAME}
-  vita2d
+  vitaGL
+  vitashark
+  SceShaccCgExt
+  taihen_stub
+  SceShaccCg_stub
+  mathneon
   SceDisplay_stub
   SceGxm_stub
   SceSysmodule_stub
   SceCtrl_stub
   SceTouch_stub
   SceAppMgr_stub
-  ScePgf_stub
-  ScePvf_stub
   SceCommonDialog_stub
-  freetype
-  png
-  jpeg
+  SceKernelDmacMgr_stub
   z
   m
 )

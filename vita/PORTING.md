@@ -61,11 +61,19 @@ Game logic, formats, and structure carry over; the platform layer is new.
      `scpcb-ue-vita-data` artifact; contents install to
      `ux0:data/scpcb-ue/`.
 
-3. **Renderer**
-   - Replace the shell's vita2d usage with VitaGL (OpenGL 1.x-style API
-     maps well onto Blitz3D's DX7 fixed-function model: entities, brightness,
-     fog, FX flags).
-   - Room rendering with the original lightmaps, then entities/NPC meshes.
+3. **Renderer** *(in progress)*
+   - Room viewer *(done — `src/render/scene.c`, `src/main.c`)*: vitaGL
+     fixed-function rendering of real rooms. The scene builder converts
+     parsed RMesh into 16-bit-indexed batches (GL-free, validated on the
+     host against all 149 rooms: 1,663 batches, max 8,182 verts/batch),
+     recovering the layer semantics from `Map_Core.bb` — texture slot j
+     samples UV set 1-j, `_lm` names are lightmaps (additive, Blitz
+     TextureBlend 3), flag 3 means alpha-clip. Two-pass draw: diffuse ×
+     vertex color, then additive lightmap; alpha-clipped surfaces last
+     with alpha test. Free-fly camera on the sticks, room cycling on the
+     D-pad, status HUD via stb_easy_font.
+   - Still to do: B3D props/entity placement in rooms, dynamic lights,
+     fog, sky, and screen-space effects; then NPC meshes.
 
 4. **Game systems** (grafted from CBN, adapted to UE Reborn content)
    - Player movement/collision, doors, items/inventory (touch-driven UI),

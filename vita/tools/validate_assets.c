@@ -30,6 +30,7 @@
 #include "../src/formats/b3d.h"
 #include "../src/formats/rmesh.h"
 #include "../src/formats/texture.h"
+#include "../src/render/scene.h"
 
 #define MAP_TEXTURES_DIR "GFX/Map/Textures"
 
@@ -40,6 +41,8 @@ static struct {
     unsigned long long b3dMeshNodes, b3dVertices, b3dTriangles;
     unsigned texDecoded, texDecodeFail, texMissing;
     unsigned long long texBytesNative, texBytesCap512, texBytesCap256;
+    unsigned sceneOk, sceneFail;
+    unsigned long long sceneBatches, sceneVertices, maxBatchVertices;
 } stats;
 
 static int failures;
@@ -144,6 +147,24 @@ static void checkFile(const char *path) {
         stats.rmeshOk++;
         stats.surfaces += m->surfaceCount;
         stats.entities += m->entityCount;
+
+        Scene *sc = sceneBuild(m);
+        if (!sc) {
+            printf("FAIL scene %s\n", path);
+            stats.sceneFail++;
+            failures = 1;
+        } else {
+            stats.sceneOk++;
+            stats.sceneBatches += sc->batchCount;
+            for (uint32_t i = 0; i < sc->batchCount; i++) {
+                stats.sceneVertices += sc->batches[i].vertexCount;
+                if (sc->batches[i].vertexCount > stats.maxBatchVertices) {
+                    stats.maxBatchVertices = sc->batches[i].vertexCount;
+                }
+            }
+            sceneFree(sc);
+        }
+
         dirOf(path, dir, sizeof(dir));
         for (uint32_t i = 0; i < m->surfaceCount; i++) {
             stats.vertices += m->surfaces[i].vertexCount;
@@ -243,6 +264,9 @@ int main(int argc, char **argv) {
     printf("B3D:   %u ok, %u failed\n", stats.b3dOk, stats.b3dFail);
     printf("  mesh nodes=%llu vertices=%llu triangles=%llu\n",
            stats.b3dMeshNodes, stats.b3dVertices, stats.b3dTriangles);
+    printf("Scenes: %u built, %u failed\n", stats.sceneOk, stats.sceneFail);
+    printf("  batches=%llu vertices=%llu maxBatchVertices=%llu\n",
+           stats.sceneBatches, stats.sceneVertices, stats.maxBatchVertices);
     printf("Textures: %u decoded, %u decode failures, %u unresolved refs\n",
            stats.texDecoded, stats.texDecodeFail, stats.texMissing);
     printf("  RGBA8 footprint: native=%.1f MB, cap512=%.1f MB, cap256=%.1f MB\n",

@@ -3,11 +3,16 @@
 This directory contains the native PS Vita port project. It builds with
 [VitaSDK](https://vitasdk.org/) into an installable `.vpk` package.
 
-**Current state: Milestone 1 — port shell.** The VPK boots on a homebrew-enabled
-Vita (or PS TV), initializes the renderer, and runs a live controller test
-covering every game action, both analog sticks, and the front touch panel.
-Game systems are ported on top of this shell — the plan is in
+**Current state: Milestone 3 — room viewer.** The VPK boots on a
+homebrew-enabled Vita (or PS TV) and renders the game's actual rooms: it
+loads `.rmesh` files from the data package, uploads their textures (capped
+to the memory budget), and draws geometry with lightmaps. Fly through with
+the sticks; cycle rooms with the D-pad. The roadmap is in
 [PORTING.md](PORTING.md).
+
+Note: like most vitaGL homebrew, the app requires `libshacccg.suprx` (the
+runtime shader compiler) to be installed on the device — see
+https://vita.hacks.guide/ for the standard extraction steps.
 
 ## Building from CI
 
