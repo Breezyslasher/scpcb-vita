@@ -502,6 +502,10 @@ typedef struct {
 } ModelRT;
 
 static ModelRT doorFrameRT, doorPanelRT, heavy1RT, heavy2RT;
+static ModelRT buttonRT, buttonKeycardRT;
+static int playerKeycardLevel = 0; /* items not ported yet */
+static char toastMsg[128];
+static int toastTimer;
 
 /* Build a standalone renderable from a Props b3d. Targets > 0 scale
  * the model to that extent on the axis (CreateDoor sizes the default
@@ -556,6 +560,8 @@ static void buildDoorAssets(void) {
     buildModelRT(&heavy1RT, "HeavyDoor1.b3d", 0, 0, 0);
     buildModelRT(&heavy2RT, "HeavyDoor2.b3d", 0, 0, 0);
     buildModelRT(&doorFrameRT, "DoorFrame.b3d", 0, 0, 0);
+    buildModelRT(&buttonRT, "Button.b3d", 0, 0, 0);
+    buildModelRT(&buttonKeycardRT, "ButtonKeycard.b3d", 0, 0, 0);
 }
 
 static void drawModelRT(const ModelRT *rt) {
@@ -593,6 +599,17 @@ static void drawDoors(const float viewPos[3]) {
         drawModelRT(p2);
         glPopMatrix();
 
+        /* Buttons on both sides; the 180-degree side rotation mirrors
+         * the (+0.6, 0.7, -0.1) CreateDoor offset for side 1. */
+        const ModelRT *btn = d->keycard > 0 ? &buttonKeycardRT : &buttonRT;
+        for (int side = 0; side < 2; side++) {
+            glPushMatrix();
+            glRotatef((float)(side * 180), 0.0f, 1.0f, 0.0f);
+            glTranslatef(0.6f * 256.0f, 0.7f * 256.0f, -0.1f * 256.0f);
+            drawModelRT(btn);
+            glPopMatrix();
+        }
+
         glPopMatrix();
     }
 }
@@ -621,7 +638,8 @@ static void drawText(float x, float y, const char *text) {
     glDrawArrays(GL_TRIANGLES, 0, v / 2);
 }
 
-static void drawHud(const char *line1, const char *line2) {
+static void drawHud(const char *line1, const char *line2,
+                    const char *toast) {
     /* Defense in depth: HUD text uses client-side arrays. */
     glBindBuffer(GL_ARRAY_BUFFER, 0);
     glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
@@ -644,6 +662,7 @@ static void drawHud(const char *line1, const char *line2) {
     glScalef(2.0f, 2.0f, 1.0f);
     if (line1) drawText(8, 8, line1);
     if (line2) drawText(8, 22, line2);
+    if (toast) drawText(120, 200, toast);
     glPopMatrix();
 
     glEnableClientState(GL_COLOR_ARRAY);
@@ -700,11 +719,28 @@ int main(void) {
             velY = 0.0f;
         }
         if (haveData && inputHit(ACTION_INTERACT)) {
-            doorsToggleNearest(&doors, camPos, 400.0f);
+            Door *pressed = NULL;
+            switch (doorsPressButton(&doors, camPos, playerKeycardLevel,
+                                     &pressed)) {
+                case DOOR_PRESS_KEYCARD:
+                    snprintf(toastMsg, sizeof(toastMsg),
+                             "ACCESS DENIED - LEVEL %d KEYCARD REQUIRED"
+                             " (press x3 to force)",
+                             pressed ? pressed->keycard : 0);
+                    toastTimer = 150;
+                    break;
+                case DOOR_PRESS_LOCKED:
+                    snprintf(toastMsg, sizeof(toastMsg), "THE DOOR IS LOCKED");
+                    toastTimer = 150;
+                    break;
+                default:
+                    break;
+            }
         }
         if (haveData) {
             doorsUpdate(&doors);
         }
+        if (toastTimer > 0) toastTimer--;
         if (haveData && inputHit(ACTION_LEAN_RIGHT)) {
             regenerateMap(mapSeed * 7919u + 17u);
         }
@@ -795,7 +831,7 @@ int main(void) {
                  "fps=%.0f  x: door  up: %s  dpad>: new map  tri: fog=%s"
                  "  sq: cull=%d  start x3: exit", fps,
                  walkMode ? "WALK" : "fly", fogOn ? "on" : "off", cullMode);
-        drawHud(line1, line2);
+        drawHud(line1, line2, toastTimer > 0 ? toastMsg : NULL);
 
         vglSwapBuffers(GL_FALSE);
     }
