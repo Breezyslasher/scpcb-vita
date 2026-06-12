@@ -39,6 +39,7 @@
 #define MAP_DIR DATA_ROOT "/GFX/Map"
 #define MAP_TEXTURES_DIR DATA_ROOT "/GFX/Map/Textures"
 #define PROPS_DIR DATA_ROOT "/GFX/Map/Props"
+#define ITEMS_DIR DATA_ROOT "/GFX/Items"
 #define ROOMS_INI DATA_ROOT "/Data/rooms.ini"
 
 /* RoomSpacing is 8 world units = 2048 raw mesh units. */
@@ -76,9 +77,9 @@ static GLuint textureGet(const char *name) {
     }
 
     GLuint handle = 0;
-    const char *dirs[3] = { MAP_DIR, MAP_TEXTURES_DIR, PROPS_DIR };
+    const char *dirs[4] = { MAP_DIR, MAP_TEXTURES_DIR, PROPS_DIR, ITEMS_DIR };
     char path[1024];
-    if (textureResolve(name, dirs, 3, path, sizeof(path))) {
+    if (textureResolve(name, dirs, 4, path, sizeof(path))) {
         char err[128];
         TextureImage *img = textureLoadFile(path, TEXTURE_CAP, err, sizeof(err));
         if (img) {
@@ -145,9 +146,9 @@ static B3DModel *propModelGet(const char *rawName) {
     }
 
     B3DModel *model = NULL;
-    const char *dirs[1] = { PROPS_DIR };
+    const char *dirs[2] = { PROPS_DIR, ITEMS_DIR };
     char path[1024];
-    if (textureResolve(name, dirs, 1, path, sizeof(path))) {
+    if (textureResolve(name, dirs, 2, path, sizeof(path))) {
         char err[128];
         model = b3dLoadFile(path, err, sizeof(err));
     }
@@ -373,6 +374,8 @@ static int cullMode = 0;
 static int fogOn = 1;
 static char statusLine[256];
 
+static void spawnItems(void);
+
 static void spawnPlayer(void) {
     camPos[0] = map.startX * ROOM_SPACING;
     camPos[1] = 400.0f;
@@ -391,6 +394,7 @@ static void regenerateMap(uint32_t seed) {
     mapSeed = seed;
     if (mapGenerate(&tplList, mapSeed, &map)) {
         doorsGenerate(&map, &tplList, mapSeed ^ 0x9E3779B9u, &doors);
+        spawnItems();
         snprintf(statusLine, sizeof(statusLine), "map seed %u: %u rooms %u doors",
                  mapSeed, map.roomCount, doors.count);
     } else {
@@ -503,7 +507,6 @@ typedef struct {
 
 static ModelRT doorFrameRT, doorPanelRT, heavy1RT, heavy2RT;
 static ModelRT buttonRT, buttonKeycardRT;
-static int playerKeycardLevel = 0; /* items not ported yet */
 static char toastMsg[128];
 static int toastTimer;
 
@@ -511,7 +514,7 @@ static int toastTimer;
  * the model to that extent on the axis (CreateDoor sizes the default
  * door panel to 203 x 313 x 15 raw units); 0 keeps model units. */
 static void buildModelRT(ModelRT *rt, const char *name, float tw, float th,
-                         float td) {
+                         float td, const char *textureOverride) {
     memset(rt, 0, sizeof(*rt));
     rt->scale[0] = rt->scale[1] = rt->scale[2] = 1.0f;
     B3DModel *model = propModelGet(name);
@@ -522,7 +525,9 @@ static void buildModelRT(ModelRT *rt, const char *name, float tw, float th,
     rt->scene = sceneBuild(&empty);
     if (!rt->scene) return;
     float pos[3] = { 0, 0, 0 }, euler[3] = { 0, 0, 0 }, scl[3] = { 1, 1, 1 };
-    if (!sceneAppendB3D(rt->scene, model, pos, euler, scl, NULL)) return;
+    if (!sceneAppendB3D(rt->scene, model, pos, euler, scl, textureOverride)) {
+        return;
+    }
 
     float ext[3];
     for (int i = 0; i < 3; i++) {
@@ -556,12 +561,136 @@ static void buildModelRT(ModelRT *rt, const char *name, float tw, float th,
 }
 
 static void buildDoorAssets(void) {
-    buildModelRT(&doorPanelRT, "Door01.b3d", 203.0f, 313.0f, 15.0f);
-    buildModelRT(&heavy1RT, "HeavyDoor1.b3d", 0, 0, 0);
-    buildModelRT(&heavy2RT, "HeavyDoor2.b3d", 0, 0, 0);
-    buildModelRT(&doorFrameRT, "DoorFrame.b3d", 0, 0, 0);
-    buildModelRT(&buttonRT, "Button.b3d", 0, 0, 0);
-    buildModelRT(&buttonKeycardRT, "ButtonKeycard.b3d", 0, 0, 0);
+    buildModelRT(&doorPanelRT, "Door01.b3d", 203.0f, 313.0f, 15.0f, NULL);
+    buildModelRT(&heavy1RT, "HeavyDoor1.b3d", 0, 0, 0, NULL);
+    buildModelRT(&heavy2RT, "HeavyDoor2.b3d", 0, 0, 0, NULL);
+    buildModelRT(&doorFrameRT, "DoorFrame.b3d", 0, 0, 0, NULL);
+    /* CreateButton scales to 0.03 world units = 7.68 raw. */
+    buildModelRT(&buttonRT, "Button.b3d", 0, 0, 0, NULL);
+    buttonRT.scale[0] = buttonRT.scale[1] = buttonRT.scale[2] = 7.68f;
+    buildModelRT(&buttonKeycardRT, "ButtonKeycard.b3d", 0, 0, 0, NULL);
+    buttonKeycardRT.scale[0] = buttonKeycardRT.scale[1] =
+        buttonKeycardRT.scale[2] = 7.68f;
+}
+
+static void drawModelRT(const ModelRT *rt);
+
+/* ---------------- items and inventory ---------------- */
+
+/* Subset of the game's item templates (Loading_Core.bb): name, model,
+ * texture override, world-unit scale, keycard level granted. */
+typedef struct {
+    const char *displayName;
+    const char *model;
+    const char *texture;
+    float worldScale;
+    int keycardLevel;
+} ItemDef;
+
+static const ItemDef itemDefs[] = {
+    { "Level 1 Key Card", "key_card.b3d", "key_card_lvl_1.png", 0.00037f, 1 },
+    { "Level 3 Key Card", "key_card.b3d", "key_card_lvl_3.png", 0.00037f, 3 },
+    { "Level 5 Key Card", "key_card.b3d", "key_card_lvl_5.png", 0.00037f, 5 },
+};
+#define ITEM_DEF_COUNT (sizeof(itemDefs) / sizeof(itemDefs[0]))
+#define MAX_WORLD_ITEMS 32
+#define MAX_INVENTORY 10
+#define ITEM_PICKUP_REACH 250.0f
+
+typedef struct {
+    int def;
+    float x, y, z;
+    int taken;
+} WorldItem;
+
+static WorldItem worldItems[MAX_WORLD_ITEMS];
+static unsigned worldItemCount;
+static int inventory[MAX_INVENTORY];
+static unsigned inventoryCount;
+static int invOpen;
+static ModelRT itemRT[ITEM_DEF_COUNT];
+static float itemSpin;
+
+static void buildItemAssets(void) {
+    for (unsigned i = 0; i < ITEM_DEF_COUNT; i++) {
+        buildModelRT(&itemRT[i], itemDefs[i].model, 0, 0, 0,
+                     itemDefs[i].texture);
+        /* Normalize to a hand-sized card (~60 raw units wide); the
+         * game's per-template world scales assume model-native units. */
+        float ext = itemRT[i].scene
+            ? itemRT[i].scene->boundsMax[0] - itemRT[i].scene->boundsMin[0]
+            : 0.0f;
+        if (ext > 0.0f) {
+            float k = 60.0f / ext;
+            itemRT[i].scale[0] = itemRT[i].scale[1] = itemRT[i].scale[2] = k;
+        }
+    }
+}
+
+static int playerKeycard(void) {
+    int level = 0;
+    for (unsigned i = 0; i < inventoryCount; i++) {
+        if (itemDefs[inventory[i]].keycardLevel > level) {
+            level = itemDefs[inventory[i]].keycardLevel;
+        }
+    }
+    return level;
+}
+
+/* Provisional spawns until per-room item scripts are ported: a level 1
+ * keycard near spawn, level 3 in HCZ, level 5 in EZ. */
+static void spawnItems(void) {
+    worldItemCount = 0;
+    inventoryCount = 0;
+    int wantZoneFor[3] = { 1, 2, 3 }; /* LCZ, HCZ, EZ */
+    for (int k = 0; k < 3 && worldItemCount < MAX_WORLD_ITEMS; k++) {
+        for (uint32_t i = 0; i < map.roomCount; i++) {
+            const RoomPlacement *p = &map.rooms[i];
+            int zone = (p->gridY < MAPGEN_GRID / 3 + 1) ? 3
+                     : (p->gridY < (int)(MAPGEN_GRID * (2.0 / 3.0))) ? 2 : 1;
+            if (zone != wantZoneFor[k]) continue;
+            WorldItem *w = &worldItems[worldItemCount++];
+            w->def = k;
+            w->x = p->gridX * ROOM_SPACING;
+            w->y = 60.0f;
+            w->z = p->gridY * ROOM_SPACING;
+            w->taken = 0;
+            break;
+        }
+    }
+}
+
+static int itemPickupNearest(const float pos[3]) {
+    int best = -1;
+    float bestD2 = ITEM_PICKUP_REACH * ITEM_PICKUP_REACH;
+    for (unsigned i = 0; i < worldItemCount; i++) {
+        WorldItem *w = &worldItems[i];
+        if (w->taken) continue;
+        float dx = pos[0] - w->x, dz = pos[2] - w->z;
+        float d2 = dx * dx + dz * dz;
+        if (d2 < bestD2) {
+            bestD2 = d2;
+            best = (int)i;
+        }
+    }
+    if (best < 0 || inventoryCount >= MAX_INVENTORY) return -1;
+    worldItems[best].taken = 1;
+    inventory[inventoryCount++] = worldItems[best].def;
+    return worldItems[best].def;
+}
+
+static void drawItems(const float viewPos[3]) {
+    for (unsigned i = 0; i < worldItemCount; i++) {
+        const WorldItem *w = &worldItems[i];
+        if (w->taken) continue;
+        float dx = w->x - viewPos[0], dz = w->z - viewPos[2];
+        if (dx * dx + dz * dz > VIEW_RANGE * VIEW_RANGE) continue;
+        glPushMatrix();
+        glTranslatef(w->x, w->y, w->z);
+        glRotatef(itemSpin, 0.0f, 1.0f, 0.0f);
+        drawModelRT(&itemRT[w->def]);
+        glPopMatrix();
+    }
 }
 
 static void drawModelRT(const ModelRT *rt) {
@@ -639,7 +768,7 @@ static void drawText(float x, float y, const char *text) {
 }
 
 static void drawHud(const char *line1, const char *line2,
-                    const char *toast) {
+                    const char *toast, const char *overlay) {
     /* Defense in depth: HUD text uses client-side arrays. */
     glBindBuffer(GL_ARRAY_BUFFER, 0);
     glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
@@ -663,6 +792,7 @@ static void drawHud(const char *line1, const char *line2,
     if (line1) drawText(8, 8, line1);
     if (line2) drawText(8, 22, line2);
     if (toast) drawText(120, 200, toast);
+    if (overlay) drawText(40, 60, overlay);
     glPopMatrix();
 
     glEnableClientState(GL_COLOR_ARRAY);
@@ -687,6 +817,7 @@ int main(void) {
     if (haveData) {
         tplRT = (TemplateRT *)calloc(tplList.count, sizeof(TemplateRT));
         buildDoorAssets();
+        buildItemAssets();
         regenerateMap((uint32_t)(sceKernelGetProcessTimeWide() & 0xFFFFFF) | 1u);
     } else {
         snprintf(statusLine, sizeof(statusLine),
@@ -712,15 +843,22 @@ int main(void) {
         if (inputHit(ACTION_MENU)) {
             if (++menuHits >= 3) running = 0;
         }
-        if (inputHit(ACTION_INVENTORY)) fogOn = !fogOn;
+        if (inputHit(ACTION_INVENTORY)) invOpen = !invOpen;
+        if (inputHit(ACTION_LEAN_LEFT)) fogOn = !fogOn;
         if (inputHit(ACTION_USE_ITEM)) cullMode = (cullMode + 1) % 3;
         if (inputHit(ACTION_SAVE)) { /* D-pad up: walk/fly */
             walkMode = !walkMode;
             velY = 0.0f;
         }
         if (haveData && inputHit(ACTION_INTERACT)) {
+            int picked = itemPickupNearest(camPos);
+            if (picked >= 0) {
+                snprintf(toastMsg, sizeof(toastMsg), "PICKED UP %s",
+                         itemDefs[picked].displayName);
+                toastTimer = 150;
+            } else {
             Door *pressed = NULL;
-            switch (doorsPressButton(&doors, camPos, playerKeycardLevel,
+            switch (doorsPressButton(&doors, camPos, playerKeycard(),
                                      &pressed)) {
                 case DOOR_PRESS_KEYCARD:
                     snprintf(toastMsg, sizeof(toastMsg),
@@ -736,9 +874,12 @@ int main(void) {
                 default:
                     break;
             }
+            }
         }
         if (haveData) {
             doorsUpdate(&doors);
+            itemSpin += 1.0f;
+            if (itemSpin >= 360.0f) itemSpin -= 360.0f;
         }
         if (toastTimer > 0) toastTimer--;
         if (haveData && inputHit(ACTION_LEAN_RIGHT)) {
@@ -817,6 +958,7 @@ int main(void) {
                 drawRoomBatches(activeRooms[i], 0);
             }
             drawDoors(camPos);
+            drawItems(camPos);
             glDisable(GL_CULL_FACE);
             for (int i = 0; i < activeCount; i++) {
                 drawRoomBatches(activeRooms[i], 1);
@@ -831,7 +973,22 @@ int main(void) {
                  "fps=%.0f  x: door  up: %s  dpad>: new map  tri: fog=%s"
                  "  sq: cull=%d  start x3: exit", fps,
                  walkMode ? "WALK" : "fly", fogOn ? "on" : "off", cullMode);
-        drawHud(line1, line2, toastTimer > 0 ? toastMsg : NULL);
+        char invText[512] = "";
+        if (invOpen) {
+            snprintf(invText, sizeof(invText), "INVENTORY (%u/%u)\n",
+                     inventoryCount, (unsigned)MAX_INVENTORY);
+            for (unsigned ii = 0; ii < inventoryCount; ii++) {
+                strncat(invText, itemDefs[inventory[ii]].displayName,
+                        sizeof(invText) - strlen(invText) - 2);
+                strncat(invText, "\n", sizeof(invText) - strlen(invText) - 1);
+            }
+            if (inventoryCount == 0) {
+                strncat(invText, "(empty)",
+                        sizeof(invText) - strlen(invText) - 1);
+            }
+        }
+        drawHud(line1, line2, toastTimer > 0 ? toastMsg : NULL,
+                invOpen ? invText : NULL);
 
         vglSwapBuffers(GL_FALSE);
     }
