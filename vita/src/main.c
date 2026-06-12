@@ -181,25 +181,12 @@ typedef struct {
     GLuint ibo;
 } BatchGL;
 
-enum {
-    TPL_UNLOADED = 0,
-    TPL_REQUESTED,
-    TPL_UPLOADING,
-    TPL_READY,
-    TPL_FAILED
-};
-
 typedef struct {
-    int state;
-    uint32_t cursor; /* next batch to upload while TPL_UPLOADING */
+    int state; /* 0 = not loaded, 1 = ok, -1 = failed */
     Scene *scene;
     BatchGL *gl;
     CollisionWorld *col;
 } TemplateRT;
-
-/* Per-frame budget for room loading so streaming in a new room costs a
- * bounded slice of the frame instead of a multi-frame stall. */
-#define LOADER_BUDGET_US 7000
 
 static RoomTemplateList tplList;
 static TemplateRT *tplRT;
@@ -219,18 +206,12 @@ static void templateUnload(TemplateRT *rt) {
     memset(rt, 0, sizeof(*rt));
 }
 
-static void templateRequest(int idx) {
-    if (tplRT[idx].state == TPL_UNLOADED) {
-        tplRT[idx].state = TPL_REQUESTED;
-    }
-}
-
-/* Stage A: parse the room, build the scene/props/collision. The
- * heaviest single chunk, so at most one per frame. */
-static void templateParse(int idx) {
+static void templateEnsure(int idx) {
     TemplateRT *rt = &tplRT[idx];
+    if (rt->state != 0) return;
+    rt->state = -1;
+
     const RoomTemplateInfo *info = &tplList.items[idx];
-    rt->state = TPL_FAILED;
     if (!info->meshPath) return;
 
     char path[1024];
@@ -260,61 +241,24 @@ static void templateParse(int idx) {
     rt->gl = (BatchGL *)calloc(rt->scene->batchCount ? rt->scene->batchCount : 1,
                                sizeof(BatchGL));
     if (!rt->gl) return;
-    rt->cursor = 0;
-    rt->state = TPL_UPLOADING;
-}
-
-/* Stage B: decode textures and upload VBOs batch by batch until the
- * deadline. */
-static void templateUploadSome(int idx, uint64_t deadline) {
-    TemplateRT *rt = &tplRT[idx];
-    while (rt->cursor < rt->scene->batchCount) {
-        const SceneBatch *b = &rt->scene->batches[rt->cursor];
-        rt->gl[rt->cursor].diffuse = textureGet(b->diffuseName);
-        rt->gl[rt->cursor].lightmap = textureGet(b->lightmapName);
-        glGenBuffers(1, &rt->gl[rt->cursor].vbo);
-        glBindBuffer(GL_ARRAY_BUFFER, rt->gl[rt->cursor].vbo);
+    for (uint32_t i = 0; i < rt->scene->batchCount; i++) {
+        const SceneBatch *b = &rt->scene->batches[i];
+        rt->gl[i].diffuse = textureGet(b->diffuseName);
+        rt->gl[i].lightmap = textureGet(b->lightmapName);
+        glGenBuffers(1, &rt->gl[i].vbo);
+        glBindBuffer(GL_ARRAY_BUFFER, rt->gl[i].vbo);
         glBufferData(GL_ARRAY_BUFFER,
                      (GLsizeiptr)(b->vertexCount * sizeof(SceneVertex)),
                      b->vertices, GL_STATIC_DRAW);
-        glGenBuffers(1, &rt->gl[rt->cursor].ibo);
-        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, rt->gl[rt->cursor].ibo);
+        glGenBuffers(1, &rt->gl[i].ibo);
+        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, rt->gl[i].ibo);
         glBufferData(GL_ELEMENT_ARRAY_BUFFER,
                      (GLsizeiptr)(b->indexCount * sizeof(uint16_t)),
                      b->indices, GL_STATIC_DRAW);
-        rt->cursor++;
-        if (sceKernelGetProcessTimeWide() >= deadline) break;
     }
-    /* Always leave the binding clean: the HUD and room draws use
-     * client-side/per-batch pointers, and a buffer left bound here
-     * turns those pointers into bogus buffer offsets (GPU crash). */
     glBindBuffer(GL_ARRAY_BUFFER, 0);
     glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
-    if (rt->cursor >= rt->scene->batchCount) {
-        rt->state = TPL_READY;
-    }
-}
-
-/* Called once per frame: spend at most the budget making requested
- * templates ready, nearest requests first (request order). */
-static int loaderOrder[64];
-static int loaderOrderCount;
-
-static void templateLoaderTick(void) {
-    uint64_t deadline = sceKernelGetProcessTimeWide() + LOADER_BUDGET_US;
-    int parsedThisTick = 0;
-    for (int i = 0; i < loaderOrderCount; i++) {
-        int idx = loaderOrder[i];
-        TemplateRT *rt = &tplRT[idx];
-        if (rt->state == TPL_REQUESTED && !parsedThisTick) {
-            templateParse(idx);
-            parsedThisTick = 1;
-        }
-        if (rt->state == TPL_UPLOADING) {
-            templateUploadSome(idx, deadline);
-        }
-        if (sceKernelGetProcessTimeWide() >= deadline) break;
-    }
+    rt->state = 1;
 }
 
 /* ---------------- placement transforms ---------------- */
@@ -358,28 +302,17 @@ static void updateActiveRooms(const float pos[3]) {
     int px = (int)floorf(pos[0] / ROOM_SPACING + 0.5f);
     int py = (int)floorf(pos[2] / ROOM_SPACING + 0.5f);
     activeCount = 0;
-    loaderOrderCount = 0;
-    /* Request in rings: the 3x3 around the player first, then the 5x5
-     * prefetch ring, so nearby rooms win the loader budget. */
-    for (int ring = 1; ring <= 2; ring++) {
-        for (uint32_t i = 0; i < map.roomCount; i++) {
-            const RoomPlacement *p = &map.rooms[i];
-            int dx = p->gridX - px, dy = p->gridY - py;
-            int cheb = abs(dx) > abs(dy) ? abs(dx) : abs(dy);
-            if ((ring == 1 && cheb <= 1) || (ring == 2 && cheb == 2)) {
-                templateRequest(p->templateIndex);
-                int st = tplRT[p->templateIndex].state;
-                if (st != TPL_READY && st != TPL_FAILED
-                    && loaderOrderCount < 64) {
-                    loaderOrder[loaderOrderCount++] = p->templateIndex;
-                }
-                if (ring == 1 && st == TPL_READY && activeCount < 16) {
-                    activeRooms[activeCount++] = p;
-                }
+    for (uint32_t i = 0; i < map.roomCount; i++) {
+        const RoomPlacement *p = &map.rooms[i];
+        int dx = p->gridX - px, dy = p->gridY - py;
+        if (dx >= -1 && dx <= 1 && dy >= -1 && dy <= 1
+            && activeCount < 16) {
+            templateEnsure(p->templateIndex);
+            if (tplRT[p->templateIndex].state == 1) {
+                activeRooms[activeCount++] = p;
             }
         }
     }
-    templateLoaderTick();
 }
 
 static const char *roomNameAt(const float pos[3]) {
@@ -502,7 +435,7 @@ static void applyDebugState(void) {
 
 static void drawRoomBatches(const RoomPlacement *p, int alphaPass) {
     const TemplateRT *rt = &tplRT[p->templateIndex];
-    if (rt->state != TPL_READY || !rt->gl) return;
+    if (rt->state != 1 || !rt->gl) return;
 
     glPushMatrix();
     glTranslatef(p->gridX * ROOM_SPACING, 0.0f, p->gridY * ROOM_SPACING);
