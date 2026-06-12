@@ -79,6 +79,11 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: vitaGL API diagnostic (temporary)
+        run: |
+          grep -nE "vgl[A-Za-z]*\(" /usr/local/vitasdk/arm-vita-eabi/include/vitaGL.h | head -40
+          nm /usr/local/vitasdk/arm-vita-eabi/lib/libvitaGL.a 2>/dev/null | grep -iE " T vgl" | head -20
+
       - name: Configure
         run: cmake -S vita -B vita/build -DCMAKE_BUILD_TYPE=Release
 
