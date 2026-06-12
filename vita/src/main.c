@@ -47,6 +47,8 @@ unsigned int _newlib_heap_size_user = 220 * 1024 * 1024;
 #define PROPS_DIR DATA_ROOT "/GFX/Map/Props"
 #define ITEMS_DIR DATA_ROOT "/GFX/Items"
 #define ITEMS_HUD_DIR DATA_ROOT "/GFX/Items/HUD Textures"
+#define HUD_DIR DATA_ROOT "/GFX/HUD"
+#define INV_ICONS_DIR DATA_ROOT "/GFX/Items/Inventory Icons"
 #define ROOMS_INI DATA_ROOT "/Data/rooms.ini"
 
 /* RoomSpacing is 8 world units = 2048 raw mesh units. */
@@ -84,10 +86,10 @@ static GLuint textureGet(const char *name) {
     }
 
     GLuint handle = 0;
-    const char *dirs[5] = { MAP_DIR, MAP_TEXTURES_DIR, PROPS_DIR, ITEMS_DIR,
-                            ITEMS_HUD_DIR };
+    const char *dirs[7] = { MAP_DIR, MAP_TEXTURES_DIR, PROPS_DIR, ITEMS_DIR,
+                            ITEMS_HUD_DIR, HUD_DIR, INV_ICONS_DIR };
     char path[1024];
-    if (textureResolve(name, dirs, 5, path, sizeof(path))) {
+    if (textureResolve(name, dirs, 7, path, sizeof(path))) {
         char err[128];
         TextureImage *img = textureLoadFile(path, TEXTURE_CAP, err, sizeof(err));
         if (img) {
@@ -380,6 +382,12 @@ static float velY = 0.0f;
 static int walkMode = 1;
 static int cullMode = 0;
 static int fogOn = 1;
+
+/* Vitals (approximate Main_Core.bb rates). */
+static float blinkTimer = 100.0f;   /* 0..100, drains ~10s */
+static int blinkFrames;             /* >0 while eyes closed */
+static float stamina = 100.0f;      /* sprint resource */
+static int staminaBlocked;
 static char statusLine[256];
 
 static void spawnItems(void);
@@ -725,7 +733,7 @@ static void spawnItems(void) {
         }
     }
 
-    const char *zoneCard[3] = { "Level 1 Key Card", "Level 3 key Card",
+    const char *zoneCard[3] = { "Level 1 key Card", "Level 3 key Card",
                                 "Level 5 key Card" };
     for (int k = 0; k < 3; k++) {
         for (uint32_t i = 0; i < map.roomCount; i++) {
@@ -826,6 +834,51 @@ static void drawDoors(const float viewPos[3]) {
     }
 }
 
+static GLuint hudBlinkIcon, hudBlinkBar, hudSprintIcon, hudStaminaBar;
+
+static void loadHudTextures(void) {
+    hudBlinkIcon = textureGet("blink_icon(1).png");
+    hudBlinkBar = textureGet("blink_meter(1).png");
+    hudSprintIcon = textureGet("sprint_icon.png");
+    hudStaminaBar = textureGet("stamina_meter(1).png");
+}
+
+/* Textured 2D quad in HUD space (ortho already set, depth off). */
+static void drawTexQuad(float x, float y, float w, float h, GLuint tex,
+                        float alpha) {
+    GLfloat verts[12] = { x, y, x + w, y, x + w, y + h,
+                          x, y, x + w, y + h, x, y + h };
+    GLfloat uvs[12] = { 0, 0, 1, 0, 1, 1, 0, 0, 1, 1, 0, 1 };
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
+    glColor4f(1.0f, 1.0f, 1.0f, alpha);
+    if (tex) {
+        glEnable(GL_TEXTURE_2D);
+        glBindTexture(GL_TEXTURE_2D, tex);
+        glEnableClientState(GL_TEXTURE_COORD_ARRAY);
+        glTexCoordPointer(2, GL_FLOAT, 0, uvs);
+    } else {
+        glDisable(GL_TEXTURE_2D);
+    }
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    glVertexPointer(2, GL_FLOAT, 0, verts);
+    glDrawArrays(GL_TRIANGLES, 0, 6);
+    glDisable(GL_BLEND);
+    if (tex) glDisableClientState(GL_TEXTURE_COORD_ARRAY);
+    glColor4f(1, 1, 1, 1);
+}
+
+/* Icon plus a segmented bar like the game's blink/stamina meters. */
+static void drawMeter(float x, float y, GLuint icon, GLuint seg,
+                      float fraction) {
+    drawTexQuad(x, y, 40, 40, icon, 1.0f);
+    int segs = (int)(fraction * 14.0f + 0.5f);
+    for (int i = 0; i < segs; i++) {
+        drawTexQuad(x + 48 + i * 12, y + 10, 8, 20, seg, 1.0f);
+    }
+}
+
 static void drawText(float x, float y, const char *text) {
     static char buf[64000];
     int quads = stb_easy_font_print(x, y, (char *)text, NULL, buf, sizeof(buf));
@@ -852,6 +905,7 @@ static void drawText(float x, float y, const char *text) {
 
 static void drawHud(const char *line1, const char *line2,
                     const char *toast, const char *overlay) {
+    /* (vitals and inventory drawn by caller via hooks below) */
     /* Defense in depth: HUD text uses client-side arrays. */
     glBindBuffer(GL_ARRAY_BUFFER, 0);
     glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
@@ -900,6 +954,7 @@ int main(void) {
     if (haveData) {
         tplRT = (TemplateRT *)calloc(tplList.count, sizeof(TemplateRT));
         buildDoorAssets();
+        loadHudTextures();
         if (audioInit()) loadSounds();
         regenerateMap((uint32_t)(sceKernelGetProcessTimeWide() & 0xFFFFFF) | 1u);
     } else {
@@ -1002,10 +1057,36 @@ int main(void) {
         if (walkMode && haveData) {
             int crouched = inputDown(ACTION_CROUCH);
             float eye = crouched ? CROUCH_EYE_HEIGHT : EYE_HEIGHT;
+            /* Stamina: drains while sprinting, blocks at empty until
+             * partially recovered. */
+            int wantSprint = inputDown(ACTION_SPRINT) && !crouched;
+            int moving = (move.x != 0.0f || move.y != 0.0f);
+            int sprinting = wantSprint && !staminaBlocked && moving;
+            if (sprinting) {
+                stamina -= 0.45f;
+                if (stamina <= 0.0f) {
+                    stamina = 0.0f;
+                    staminaBlocked = 1;
+                }
+            } else {
+                stamina += 0.25f;
+                if (stamina > 100.0f) stamina = 100.0f;
+                if (staminaBlocked && stamina > 25.0f) staminaBlocked = 0;
+            }
+
+            /* Blink: meter drains; empty or R closes the eyes. */
+            blinkTimer -= 100.0f / 600.0f; /* ~10 s */
+            if (inputHit(ACTION_BLINK)) blinkTimer = 0.0f;
+            if (blinkTimer <= 0.0f && blinkFrames == 0) blinkFrames = 18;
+            if (blinkFrames > 0) {
+                blinkFrames--;
+                if (blinkFrames == 0) blinkTimer = 100.0f;
+            }
+
             float speed = WALK_SPEED;
             if (crouched) {
                 speed *= CROUCH_MULT;
-            } else if (inputDown(ACTION_SPRINT)) {
+            } else if (sprinting) {
                 speed *= SPRINT_MULT;
             }
             float mvx = (fwdX * -move.y + cosf(camYaw) * move.x) * speed;
@@ -1019,7 +1100,7 @@ int main(void) {
                 float strideLen = 170.0f;
                 if (stepAccum >= strideLen) {
                     stepAccum = 0.0f;
-                    if (inputDown(ACTION_SPRINT) && !crouched) {
+                    if (sprinting) {
                         audioPlay(sndRun[rand() % 7], 0.7f, 0.0f);
                     } else {
                         audioPlay(sndStep[rand() % 8],
@@ -1108,6 +1189,39 @@ int main(void) {
         }
         drawHud(line1, line2, toastTimer > 0 ? toastMsg : NULL,
                 invOpen ? invText : NULL);
+
+        /* Vitals meters, inventory icons and the blink blackout share
+         * the HUD's ortho matrices set up by drawHud, but need flat 2D
+         * state again (drawHud restores arrays/depth on exit). */
+        glDisable(GL_DEPTH_TEST);
+        glDisable(GL_FOG);
+        glDisable(GL_CULL_FACE);
+        glDisableClientState(GL_COLOR_ARRAY);
+        glDisableClientState(GL_TEXTURE_COORD_ARRAY);
+        if (haveData && walkMode) {
+            drawMeter(20, SCREEN_H - 60, hudBlinkIcon, hudBlinkBar,
+                      blinkTimer / 100.0f);
+            drawMeter(20, SCREEN_H - 110, hudSprintIcon, hudStaminaBar,
+                      stamina / 100.0f);
+        }
+        if (invOpen) {
+            for (unsigned ii = 0; ii < inventoryCount; ii++) {
+                const char *icon = ITEM_TEMPLATES[inventory[ii]].invIcon;
+                float ix = 320.0f + (ii % 5) * 90.0f;
+                float iy = 140.0f + (ii / 5) * 90.0f;
+                drawTexQuad(ix, iy, 80, 80, 0, 0.5f);
+                if (icon[0]) {
+                    drawTexQuad(ix + 8, iy + 8, 64, 64, textureGet(icon),
+                                1.0f);
+                }
+            }
+        }
+        if (blinkFrames > 0) {
+            drawTexQuad(0, 0, SCREEN_W, SCREEN_H, 0, 1.0f);
+        }
+        glEnableClientState(GL_COLOR_ARRAY);
+        glEnableClientState(GL_TEXTURE_COORD_ARRAY);
+        glEnable(GL_DEPTH_TEST);
 
         vglSwapBuffers(GL_FALSE);
     }
