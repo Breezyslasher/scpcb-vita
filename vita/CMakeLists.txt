@@ -20,6 +20,7 @@ set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wall -O2")
 add_executable(${PROJECT_NAME}
   src/main.c
   src/input.c
+  src/sharedfb_compat.c
 )
 
 target_link_libraries(${PROJECT_NAME}
@@ -30,7 +31,6 @@ target_link_libraries(${PROJECT_NAME}
   SceCtrl_stub
   SceTouch_stub
   SceAppMgr_stub
-  SceSharedFb_stub_weak
   ScePgf_stub
   ScePvf_stub
   SceCommonDialog_stub
