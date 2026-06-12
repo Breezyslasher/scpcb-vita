@@ -33,6 +33,10 @@
 #define STB_EASY_FONT_IMPLEMENTATION
 #include "render/stb_easy_font.h"
 
+/* vitasdk newlib defaults to a 32 MB heap; rooms, collision and PCM
+ * audio need far more. */
+unsigned int _newlib_heap_size_user = 220 * 1024 * 1024;
+
 #define SCREEN_W 960
 #define SCREEN_H 544
 #define TEXTURE_CAP 256

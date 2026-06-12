@@ -1,6 +1,7 @@
 #include "audio.h"
 
 #include <math.h>
+#include <stdarg.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -10,6 +11,24 @@
 
 #define STB_VORBIS_HEADER_ONLY
 #include "stb_vorbis.c"
+
+#include <stdio.h>
+
+/* Boot log on the card for on-device diagnosis. */
+static FILE *logFile;
+
+static void alog(const char *fmt, ...) {
+    if (!logFile) {
+        logFile = fopen("ux0:data/scpcb-ue/port_log.txt", "w");
+        if (!logFile) return;
+    }
+    va_list ap;
+    va_start(ap, fmt);
+    vfprintf(logFile, fmt, ap);
+    va_end(ap);
+    fputc(10, logFile);
+    fflush(logFile);
+}
 
 #define OUT_RATE 44100
 #define GRAIN 256
@@ -94,8 +113,10 @@ static int mixerLoop(SceSize args, void *argp) {
 static int initState; /* 0 not tried, >0 ok, <0 failed step */
 
 int audioInit(void) {
+    alog("audioInit");
     port = sceAudioOutOpenPort(SCE_AUDIO_OUT_PORT_TYPE_MAIN, GRAIN, OUT_RATE,
                                SCE_AUDIO_OUT_MODE_STEREO);
+    alog("port=%d", port);
     if (port < 0) {
         initState = -1;
         return 0;
@@ -134,11 +155,15 @@ int audioLoad(const char *path) {
     for (int i = 0; i < soundCount; i++) {
         if (strcmp(sounds[i].path, path) == 0) return i;
     }
-    if (soundCount >= MAX_SOUNDS) return -1;
+    if (soundCount >= MAX_SOUNDS) {
+        alog("load FULL %s", path);
+        return -1;
+    }
 
     FILE *probe = fopen(path, "rb");
     if (!probe) {
         loadFopenFails++;
+        alog("load OPEN-FAIL %s", path);
         return -1;
     }
     fclose(probe);
@@ -148,6 +173,7 @@ int audioLoad(const char *path) {
     int frames = stb_vorbis_decode_filename(path, &chans, &rate, &pcm);
     if (frames <= 0 || !pcm) {
         loadDecodeFails++;
+        alog("load DECODE-FAIL %s frames=%d", path, frames);
         return -1;
     }
 
@@ -157,7 +183,11 @@ int audioLoad(const char *path) {
     s->frames = (uint32_t)frames;
     s->channels = chans >= 2 ? 2 : 1;
     s->rate = rate;
-    if (!s->path) return -1;
+    if (!s->path) {
+        alog("load OOM %s", path);
+        return -1;
+    }
+    alog("load OK %s frames=%d ch=%d rate=%d", path, frames, chans, rate);
     return soundCount++;
 }
 
