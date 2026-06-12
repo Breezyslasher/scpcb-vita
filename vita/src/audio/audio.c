@@ -30,7 +30,10 @@ static void alog(const char *fmt, ...) {
     fflush(logFile);
 }
 
-#define OUT_RATE 44100
+/* The MAIN port only accepts 48000 Hz (44100 fails with
+ * SCE_AUDIO_OUT_ERROR_INVALID_SAMPLE_FREQ); per-channel rate
+ * conversion handles the 44.1 kHz sources. */
+#define OUT_RATE 48000
 #define GRAIN 256
 #define MAX_SOUNDS 64
 #define MAX_CHANNELS 12
