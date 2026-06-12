@@ -18,7 +18,7 @@ static int randRange(int a, int b) {
 }
 
 static int addDoor(DoorList *list, float x, float z, int angle, int heavy,
-                   int open) {
+                   int open, int keycard) {
     Door *grown = (Door *)realloc(list->items,
                                   (list->count + 1) * sizeof(Door));
     if (!grown) return 0;
@@ -30,6 +30,9 @@ static int addDoor(DoorList *list, float x, float z, int angle, int heavy,
     d->heavy = heavy;
     d->open = open;
     d->openState = open ? 180.0f : 0.0f;
+    d->keycard = keycard;
+    d->locked = 0;
+    d->denials = 0;
     return 1;
 }
 
@@ -42,15 +45,19 @@ int doorsGenerate(const GeneratedMap *map, const RoomTemplateList *templates,
     uint8_t occ[GRID * GRID];
     int8_t shape[GRID * GRID];
     int16_t angleDeg[GRID * GRID];
+    uint8_t chk[GRID * GRID];
     memset(occ, 0, sizeof(occ));
     memset(shape, -1, sizeof(shape));
     memset(angleDeg, 0, sizeof(angleDeg));
+    memset(chk, 0, sizeof(chk));
     for (uint32_t i = 0; i < map->roomCount; i++) {
         const RoomPlacement *p = &map->rooms[i];
         int idx = p->gridX + p->gridY * GRID;
         occ[idx] = 1;
         shape[idx] = (int8_t)templates->items[p->templateIndex].shape;
         angleDeg[idx] = (int16_t)((p->angle * 90) % 360);
+        const char *nm = templates->items[p->templateIndex].name;
+        if (nm && strstr(nm, "checkpoint")) chk[idx] = 1;
     }
 
     const float RS = 2048.0f; /* RoomSpacing in raw units */
@@ -78,8 +85,11 @@ int doorsGenerate(const GeneratedMap *map, const RoomTemplateList *templates,
             }
             if (spawn && x + 1 < GRID && occ[(x + 1) + y * GRID]) {
                 int open = randRange(-3, 1) > 0;
+                int kc = (chk[idx] || chk[(x + 1) + y * GRID])
+                       ? (y > GRID / 2 ? 1 : 3) : 0;
+                if (kc) open = 0;
                 if (!addDoor(out, x * RS + RS / 2.0f, y * RS, 90, heavy,
-                             open)) {
+                             open, kc)) {
                     doorsFree(out);
                     return 0;
                 }
@@ -95,8 +105,11 @@ int doorsGenerate(const GeneratedMap *map, const RoomTemplateList *templates,
             }
             if (spawn && y + 1 < GRID && occ[x + (y + 1) * GRID]) {
                 int open = randRange(-3, 1) > 0;
+                int kc = (chk[idx] || chk[x + (y + 1) * GRID])
+                       ? (y > GRID / 2 ? 1 : 3) : 0;
+                if (kc) open = 0;
                 if (!addDoor(out, x * RS, y * RS + RS / 2.0f, 0, heavy,
-                             open)) {
+                             open, kc)) {
                     doorsFree(out);
                     return 0;
                 }
@@ -131,26 +144,74 @@ float doorSlide(const Door *d) {
     return max * (1.0f - cosf(t)) * 0.5f;
 }
 
-int doorsToggleNearest(DoorList *list, const float pos[3], float maxDist) {
+/* Button local offsets (CreateDoor): x 0.6 - i*1.2, y 0.7,
+ * z -0.1 + i*0.2 world units -> raw. */
+void doorButtonWorldPos(const Door *d, int side, float out[3]) {
+    float lx = (0.6f - side * 1.2f) * 256.0f;
+    float ly = 0.7f * 256.0f;
+    float lz = (-0.1f + side * 0.2f) * 256.0f;
+    /* Same quarter-turn convention as room placement (render rotates
+     * by -angle). */
+    if (d->angle == 90) {
+        out[0] = d->x + lz;
+        out[2] = d->z - lx;
+    } else {
+        out[0] = d->x + lx;
+        out[2] = d->z + lz;
+    }
+    out[1] = ly;
+}
+
+DoorPressResult doorsPressButton(DoorList *list, const float pos[3],
+                                 int keycardLevel, Door **outDoor) {
+    const float REACH = 256.0f; /* |dx|,|dz| < 1.0 world units */
     Door *best = NULL;
-    float bestD2 = maxDist * maxDist;
+    float bestD2 = 1e30f;
     for (uint32_t i = 0; i < list->count; i++) {
         Door *d = &list->items[i];
-        float dx = pos[0] - d->x, dz = pos[2] - d->z;
-        float d2 = dx * dx + dz * dz;
-        if (d2 < bestD2) {
-            bestD2 = d2;
-            best = d;
+        float cdx = pos[0] - d->x, cdz = pos[2] - d->z;
+        if (cdx * cdx + cdz * cdz > 1024.0f * 1024.0f) continue;
+        for (int side = 0; side < 2; side++) {
+            float b[3];
+            doorButtonWorldPos(d, side, b);
+            float dx = fabsf(pos[0] - b[0]);
+            float dz = fabsf(pos[2] - b[2]);
+            float dy = fabsf((pos[1] - 230.0f + 179.0f) - b[1]);
+            if (dx < REACH && dz < REACH && dy < 400.0f) {
+                float d2 = dx * dx + dz * dz;
+                if (d2 < bestD2) {
+                    bestD2 = d2;
+                    best = d;
+                }
+            }
         }
     }
-    if (!best) return 0;
+    if (!best) return DOOR_PRESS_NONE;
+    if (outDoor) *outDoor = best;
+
+    if (best->locked) return DOOR_PRESS_LOCKED;
+    if (best->keycard > 0 && keycardLevel < best->keycard) {
+        best->denials++;
+        if (best->denials >= 3) {
+            /* Debug courtesy until keycard items are ported. */
+            best->denials = 0;
+            best->open = !best->open;
+            return DOOR_PRESS_TOGGLED;
+        }
+        return DOOR_PRESS_KEYCARD;
+    }
     best->open = !best->open;
-    return 1;
+    return DOOR_PRESS_TOGGLED;
 }
 
 void doorsCollide(const DoorList *list, float pos[3], float radius) {
     for (uint32_t i = 0; i < list->count; i++) {
         const Door *d = &list->items[i];
+        /* Once the panels are mostly retracted the doorway is clear;
+         * per-panel boxes never opened a gap for heavy doors whose
+         * slide is shorter than the panel width. */
+        if (d->openState > 140.0f) continue;
+
         float dx = pos[0] - d->x, dz = pos[2] - d->z;
         if (dx * dx + dz * dz > 1024.0f * 1024.0f) continue;
         if (pos[1] > DOOR_PANEL_H + 200.0f) continue;
@@ -165,27 +226,16 @@ void doorsCollide(const DoorList *list, float pos[3], float radius) {
             lz = dz;
         }
 
-        float slide = doorSlide(d);
-        for (int panel = 0; panel < 2; panel++) {
-            float cx = panel == 0 ? slide : -slide;
-            float px = lx - cx;
-            if (fabsf(px) >= DOOR_PANEL_HALF_W + radius) continue;
-            if (fabsf(lz) >= DOOR_PANEL_HALF_D + radius) continue;
-            /* Push out along the through-axis. */
-            float push = (DOOR_PANEL_HALF_D + radius - fabsf(lz))
-                       * (lz >= 0.0f ? 1.0f : -1.0f);
-            lz += push;
-            if (d->angle == 90) {
-                pos[0] = d->x + lz;
-            } else {
-                pos[2] = d->z + lz;
-            }
-            /* Recompute for the second panel. */
-            if (d->angle == 90) {
-                lz = pos[0] - d->x;
-            } else {
-                lz = pos[2] - d->z;
-            }
+        /* One box across the whole doorway. */
+        if (fabsf(lx) >= 220.0f + radius) continue;
+        if (fabsf(lz) >= DOOR_PANEL_HALF_D + radius) continue;
+        float push = (DOOR_PANEL_HALF_D + radius - fabsf(lz))
+                   * (lz >= 0.0f ? 1.0f : -1.0f);
+        lz += push;
+        if (d->angle == 90) {
+            pos[0] = d->x + lz;
+        } else {
+            pos[2] = d->z + lz;
         }
     }
 }

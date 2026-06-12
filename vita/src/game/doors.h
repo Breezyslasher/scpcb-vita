@@ -20,6 +20,9 @@ typedef struct {
     int heavy;         /* HCZ heavy door */
     int open;          /* target state */
     float openState;   /* 0..180, animated */
+    int keycard;       /* 0 = none; >0 = required keycard level */
+    int locked;
+    int denials;       /* failed button presses (debug force-open) */
 } Door;
 
 typedef struct {
@@ -41,9 +44,24 @@ void doorsFree(DoorList *list);
 /* Advance the open/close animation one frame (UpdateDoors: 2 deg). */
 void doorsUpdate(DoorList *list);
 
-/* Toggle the nearest door within maxDist of pos. Returns 1 if one was
- * toggled. */
-int doorsToggleNearest(DoorList *list, const float pos[3], float maxDist);
+/* Button positions (CreateDoor: door-local x +-0.6, y 0.7, z -+0.1
+ * world units, parented to the rotated frame). side is 0 or 1; the
+ * button faces yaw side*180 relative to the door. */
+void doorButtonWorldPos(const Door *d, int side, float out[3]);
+
+typedef enum {
+    DOOR_PRESS_NONE = 0,   /* no button in reach */
+    DOOR_PRESS_TOGGLED,
+    DOOR_PRESS_LOCKED,
+    DOOR_PRESS_KEYCARD     /* denied: keycard required */
+} DoorPressResult;
+
+/* Press the nearest button within reach (the game's |dx|,|dz| < 1.0
+ * world units). keycardLevel is what the player carries; outDoor (may
+ * be NULL) receives the door involved. Three denied presses force a
+ * keycard door open — a debug courtesy until items are ported. */
+DoorPressResult doorsPressButton(DoorList *list, const float pos[3],
+                                 int keycardLevel, Door **outDoor);
 
 /* Current panel slide offset in raw units. */
 float doorSlide(const Door *d);

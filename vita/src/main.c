@@ -19,17 +19,23 @@
 #include <psp2/kernel/processmgr.h>
 #include <vitaGL.h>
 
+#include "audio/audio.h"
 #include "formats/b3d.h"
 #include "formats/rmesh.h"
 #include "formats/texture.h"
 #include "game/collision.h"
 #include "game/doors.h"
+#include "game/item_spawns.h"
 #include "game/mapgen.h"
 #include "input.h"
 #include "render/scene.h"
 
 #define STB_EASY_FONT_IMPLEMENTATION
 #include "render/stb_easy_font.h"
+
+/* vitasdk newlib defaults to a 32 MB heap; rooms, collision and PCM
+ * audio need far more. */
+unsigned int _newlib_heap_size_user = 220 * 1024 * 1024;
 
 #define SCREEN_W 960
 #define SCREEN_H 544
@@ -39,6 +45,8 @@
 #define MAP_DIR DATA_ROOT "/GFX/Map"
 #define MAP_TEXTURES_DIR DATA_ROOT "/GFX/Map/Textures"
 #define PROPS_DIR DATA_ROOT "/GFX/Map/Props"
+#define ITEMS_DIR DATA_ROOT "/GFX/Items"
+#define ITEMS_HUD_DIR DATA_ROOT "/GFX/Items/HUD Textures"
 #define ROOMS_INI DATA_ROOT "/Data/rooms.ini"
 
 /* RoomSpacing is 8 world units = 2048 raw mesh units. */
@@ -76,9 +84,10 @@ static GLuint textureGet(const char *name) {
     }
 
     GLuint handle = 0;
-    const char *dirs[3] = { MAP_DIR, MAP_TEXTURES_DIR, PROPS_DIR };
+    const char *dirs[5] = { MAP_DIR, MAP_TEXTURES_DIR, PROPS_DIR, ITEMS_DIR,
+                            ITEMS_HUD_DIR };
     char path[1024];
-    if (textureResolve(name, dirs, 3, path, sizeof(path))) {
+    if (textureResolve(name, dirs, 5, path, sizeof(path))) {
         char err[128];
         TextureImage *img = textureLoadFile(path, TEXTURE_CAP, err, sizeof(err));
         if (img) {
@@ -145,9 +154,9 @@ static B3DModel *propModelGet(const char *rawName) {
     }
 
     B3DModel *model = NULL;
-    const char *dirs[1] = { PROPS_DIR };
+    const char *dirs[2] = { PROPS_DIR, ITEMS_DIR };
     char path[1024];
-    if (textureResolve(name, dirs, 1, path, sizeof(path))) {
+    if (textureResolve(name, dirs, 2, path, sizeof(path))) {
         char err[128];
         model = b3dLoadFile(path, err, sizeof(err));
     }
@@ -373,6 +382,8 @@ static int cullMode = 0;
 static int fogOn = 1;
 static char statusLine[256];
 
+static void spawnItems(void);
+
 static void spawnPlayer(void) {
     camPos[0] = map.startX * ROOM_SPACING;
     camPos[1] = 400.0f;
@@ -391,6 +402,7 @@ static void regenerateMap(uint32_t seed) {
     mapSeed = seed;
     if (mapGenerate(&tplList, mapSeed, &map)) {
         doorsGenerate(&map, &tplList, mapSeed ^ 0x9E3779B9u, &doors);
+        spawnItems();
         snprintf(statusLine, sizeof(statusLine), "map seed %u: %u rooms %u doors",
                  mapSeed, map.roomCount, doors.count);
     } else {
@@ -501,13 +513,63 @@ typedef struct {
     int ok;
 } ModelRT;
 
+/* ---------------- sounds ---------------- */
+
+#define SFX_DIR DATA_ROOT "/SFX"
+
+static int sndDoorOpen[3], sndDoorClose[3];
+static int sndBigOpen[3], sndBigClose[3];
+static int sndStep[8], sndRun[7];
+static int sndButton[2], sndKeycardUse[2], sndDoorLock;
+static int sndPick[4];
+static int sndAmbience;
+static float stepAccum;
+
+static void loadSounds(void) {
+    char p[256];
+    for (int i = 0; i < 3; i++) {
+        snprintf(p, sizeof(p), SFX_DIR "/Door/DoorOpen%d.ogg", i);
+        sndDoorOpen[i] = audioLoad(p);
+        snprintf(p, sizeof(p), SFX_DIR "/Door/DoorClose%d.ogg", i);
+        sndDoorClose[i] = audioLoad(p);
+        snprintf(p, sizeof(p), SFX_DIR "/Door/BigDoorOpen%d.ogg", i);
+        sndBigOpen[i] = audioLoad(p);
+        snprintf(p, sizeof(p), SFX_DIR "/Door/BigDoorClose%d.ogg", i);
+        sndBigClose[i] = audioLoad(p);
+    }
+    for (int i = 0; i < 8; i++) {
+        snprintf(p, sizeof(p), SFX_DIR "/Step/Step%d.ogg", i);
+        sndStep[i] = audioLoad(p);
+    }
+    for (int i = 0; i < 7; i++) {
+        snprintf(p, sizeof(p), SFX_DIR "/Step/Run%d.ogg", i);
+        sndRun[i] = audioLoad(p);
+    }
+    for (int i = 0; i < 2; i++) {
+        snprintf(p, sizeof(p), SFX_DIR "/Interact/Button%d.ogg", i);
+        sndButton[i] = audioLoad(p);
+        snprintf(p, sizeof(p), SFX_DIR "/Interact/KeycardUse%d.ogg", i);
+        sndKeycardUse[i] = audioLoad(p);
+    }
+    sndDoorLock = audioLoad(SFX_DIR "/Interact/DoorLock.ogg");
+    for (int i = 0; i < 4; i++) {
+        snprintf(p, sizeof(p), SFX_DIR "/Interact/PickItem%d.ogg", i);
+        sndPick[i] = audioLoad(p);
+    }
+    sndAmbience = audioLoad(SFX_DIR "/Ambient/Room ambience/rumble.ogg");
+    audioLoopAmbience(sndAmbience, 0.30f);
+}
+
 static ModelRT doorFrameRT, doorPanelRT, heavy1RT, heavy2RT;
+static ModelRT buttonRT, buttonKeycardRT;
+static char toastMsg[128];
+static int toastTimer;
 
 /* Build a standalone renderable from a Props b3d. Targets > 0 scale
  * the model to that extent on the axis (CreateDoor sizes the default
  * door panel to 203 x 313 x 15 raw units); 0 keeps model units. */
 static void buildModelRT(ModelRT *rt, const char *name, float tw, float th,
-                         float td) {
+                         float td, const char *textureOverride) {
     memset(rt, 0, sizeof(*rt));
     rt->scale[0] = rt->scale[1] = rt->scale[2] = 1.0f;
     B3DModel *model = propModelGet(name);
@@ -518,7 +580,9 @@ static void buildModelRT(ModelRT *rt, const char *name, float tw, float th,
     rt->scene = sceneBuild(&empty);
     if (!rt->scene) return;
     float pos[3] = { 0, 0, 0 }, euler[3] = { 0, 0, 0 }, scl[3] = { 1, 1, 1 };
-    if (!sceneAppendB3D(rt->scene, model, pos, euler, scl, NULL)) return;
+    if (!sceneAppendB3D(rt->scene, model, pos, euler, scl, textureOverride)) {
+        return;
+    }
 
     float ext[3];
     for (int i = 0; i < 3; i++) {
@@ -552,10 +616,164 @@ static void buildModelRT(ModelRT *rt, const char *name, float tw, float th,
 }
 
 static void buildDoorAssets(void) {
-    buildModelRT(&doorPanelRT, "Door01.b3d", 203.0f, 313.0f, 15.0f);
-    buildModelRT(&heavy1RT, "HeavyDoor1.b3d", 0, 0, 0);
-    buildModelRT(&heavy2RT, "HeavyDoor2.b3d", 0, 0, 0);
-    buildModelRT(&doorFrameRT, "DoorFrame.b3d", 0, 0, 0);
+    buildModelRT(&doorPanelRT, "Door01.b3d", 203.0f, 313.0f, 15.0f, NULL);
+    buildModelRT(&heavy1RT, "HeavyDoor1.b3d", 0, 0, 0, NULL);
+    buildModelRT(&heavy2RT, "HeavyDoor2.b3d", 0, 0, 0, NULL);
+    buildModelRT(&doorFrameRT, "DoorFrame.b3d", 0, 0, 0, NULL);
+    /* CreateButton scales to 0.03 world units = 7.68 raw. */
+    buildModelRT(&buttonRT, "Button.b3d", 0, 0, 0, NULL);
+    buttonRT.scale[0] = buttonRT.scale[1] = buttonRT.scale[2] = 7.68f;
+    buildModelRT(&buttonKeycardRT, "ButtonKeycard.b3d", 0, 0, 0, NULL);
+    buttonKeycardRT.scale[0] = buttonKeycardRT.scale[1] =
+        buttonKeycardRT.scale[2] = 7.68f;
+}
+
+static void drawModelRT(const ModelRT *rt);
+
+/* ---------------- items and inventory ---------------- */
+
+/* Templates and per-room spawns generated from the Blitz sources by
+ * vita/tools/extract_items.py (item_spawns.h). */
+#define ITEM_TPL_COUNT \
+    ((int)(sizeof(ITEM_TEMPLATES) / sizeof(ITEM_TEMPLATES[0])))
+#define MAX_WORLD_ITEMS 512
+#define MAX_INVENTORY 10
+#define ITEM_PICKUP_REACH 250.0f
+
+typedef struct {
+    int tpl;
+    float x, y, z;
+    int taken;
+} WorldItem;
+
+static WorldItem worldItems[MAX_WORLD_ITEMS];
+static unsigned worldItemCount;
+static int inventory[MAX_INVENTORY];
+static unsigned inventoryCount;
+static int invOpen;
+static ModelRT itemRT[sizeof(ITEM_TEMPLATES) / sizeof(ITEM_TEMPLATES[0])];
+static float itemSpin;
+
+static int itemTplFind(const char *name) {
+    for (int i = 0; i < ITEM_TPL_COUNT; i++) {
+        if (strcmp(ITEM_TEMPLATES[i].name, name) == 0) return i;
+    }
+    return -1;
+}
+
+/* "Level N Key Card" / "Level N key Card" grants keycard level N. */
+static int itemKeycardLevel(int tpl) {
+    const char *n = ITEM_TEMPLATES[tpl].name;
+    int level = 0;
+    if (sscanf(n, "Level %d", &level) == 1
+        && (strstr(n, "Key Card") || strstr(n, "key Card"))) {
+        return level;
+    }
+    return 0;
+}
+
+static const ModelRT *itemModel(int tpl) {
+    ModelRT *rt = &itemRT[tpl];
+    if (!rt->ok && !rt->scene) {
+        const ItemTemplateDef *def = &ITEM_TEMPLATES[tpl];
+        buildModelRT(rt, def->model, 0, 0, 0,
+                     def->texture[0] ? def->texture : NULL);
+        /* ScaleEntity(worldScale) on model-native units; our raw units
+         * are world * 256. */
+        float k = def->worldScale * 256.0f;
+        rt->scale[0] = rt->scale[1] = rt->scale[2] = k;
+    }
+    return rt;
+}
+
+static int playerKeycard(void) {
+    int level = 0;
+    for (unsigned i = 0; i < inventoryCount; i++) {
+        int l = itemKeycardLevel(inventory[i]);
+        if (l > level) level = l;
+    }
+    return level;
+}
+
+static void worldItemAdd(int tpl, float x, float y, float z) {
+    if (tpl < 0 || worldItemCount >= MAX_WORLD_ITEMS) return;
+    WorldItem *w = &worldItems[worldItemCount++];
+    w->tpl = tpl;
+    w->x = x;
+    w->y = y;
+    w->z = z;
+    w->taken = 0;
+}
+
+/* Place FillRoom's literal item spawns in every placed room (rotated
+ * with the room), plus one keycard per zone as progression safety
+ * until the scripted keycard sources are ported. */
+static void spawnItems(void) {
+    worldItemCount = 0;
+    inventoryCount = 0;
+    for (uint32_t i = 0; i < map.roomCount; i++) {
+        const RoomPlacement *p = &map.rooms[i];
+        const char *roomName = tplList.items[p->templateIndex].name;
+        for (unsigned s = 0;
+             s < sizeof(ITEM_SPAWNS) / sizeof(ITEM_SPAWNS[0]); s++) {
+            if (strcmp(ITEM_SPAWNS[s].room, roomName) != 0) continue;
+            float local[3] = { ITEM_SPAWNS[s].x, ITEM_SPAWNS[s].y,
+                               ITEM_SPAWNS[s].z };
+            float w[3];
+            localToWorld(p, local, w);
+            worldItemAdd(itemTplFind(ITEM_SPAWNS[s].item), w[0], w[1], w[2]);
+        }
+    }
+
+    const char *zoneCard[3] = { "Level 1 Key Card", "Level 3 key Card",
+                                "Level 5 key Card" };
+    for (int k = 0; k < 3; k++) {
+        for (uint32_t i = 0; i < map.roomCount; i++) {
+            const RoomPlacement *p = &map.rooms[i];
+            int zone = (p->gridY < MAPGEN_GRID / 3 + 1) ? 3
+                     : (p->gridY < (int)(MAPGEN_GRID * (2.0 / 3.0))) ? 2 : 1;
+            if (zone != k + 1) continue;
+            worldItemAdd(itemTplFind(zoneCard[k]),
+                         p->gridX * ROOM_SPACING, 60.0f,
+                         p->gridY * ROOM_SPACING);
+            break;
+        }
+    }
+}
+
+static int itemPickupNearest(const float pos[3]) {
+    int best = -1;
+    float bestD2 = ITEM_PICKUP_REACH * ITEM_PICKUP_REACH;
+    for (unsigned i = 0; i < worldItemCount; i++) {
+        WorldItem *w = &worldItems[i];
+        if (w->taken) continue;
+        float dx = pos[0] - w->x, dz = pos[2] - w->z;
+        float dy = pos[1] - EYE_HEIGHT - w->y;
+        if (dy < -350.0f || dy > 350.0f) continue;
+        float d2 = dx * dx + dz * dz;
+        if (d2 < bestD2) {
+            bestD2 = d2;
+            best = (int)i;
+        }
+    }
+    if (best < 0 || inventoryCount >= MAX_INVENTORY) return -1;
+    worldItems[best].taken = 1;
+    inventory[inventoryCount++] = worldItems[best].tpl;
+    return worldItems[best].tpl;
+}
+
+static void drawItems(const float viewPos[3]) {
+    for (unsigned i = 0; i < worldItemCount; i++) {
+        const WorldItem *w = &worldItems[i];
+        if (w->taken) continue;
+        float dx = w->x - viewPos[0], dz = w->z - viewPos[2];
+        if (dx * dx + dz * dz > VIEW_RANGE * VIEW_RANGE) continue;
+        glPushMatrix();
+        glTranslatef(w->x, w->y, w->z);
+        glRotatef(itemSpin, 0.0f, 1.0f, 0.0f);
+        drawModelRT(itemModel(w->tpl));
+        glPopMatrix();
+    }
 }
 
 static void drawModelRT(const ModelRT *rt) {
@@ -593,6 +811,17 @@ static void drawDoors(const float viewPos[3]) {
         drawModelRT(p2);
         glPopMatrix();
 
+        /* Buttons on both sides; the 180-degree side rotation mirrors
+         * the (+0.6, 0.7, -0.1) CreateDoor offset for side 1. */
+        const ModelRT *btn = d->keycard > 0 ? &buttonKeycardRT : &buttonRT;
+        for (int side = 0; side < 2; side++) {
+            glPushMatrix();
+            glRotatef((float)(side * 180), 0.0f, 1.0f, 0.0f);
+            glTranslatef(0.6f * 256.0f, 0.7f * 256.0f, -0.1f * 256.0f);
+            drawModelRT(btn);
+            glPopMatrix();
+        }
+
         glPopMatrix();
     }
 }
@@ -621,7 +850,8 @@ static void drawText(float x, float y, const char *text) {
     glDrawArrays(GL_TRIANGLES, 0, v / 2);
 }
 
-static void drawHud(const char *line1, const char *line2) {
+static void drawHud(const char *line1, const char *line2,
+                    const char *toast, const char *overlay) {
     /* Defense in depth: HUD text uses client-side arrays. */
     glBindBuffer(GL_ARRAY_BUFFER, 0);
     glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
@@ -644,6 +874,8 @@ static void drawHud(const char *line1, const char *line2) {
     glScalef(2.0f, 2.0f, 1.0f);
     if (line1) drawText(8, 8, line1);
     if (line2) drawText(8, 22, line2);
+    if (toast) drawText(120, 200, toast);
+    if (overlay) drawText(40, 60, overlay);
     glPopMatrix();
 
     glEnableClientState(GL_COLOR_ARRAY);
@@ -668,6 +900,7 @@ int main(void) {
     if (haveData) {
         tplRT = (TemplateRT *)calloc(tplList.count, sizeof(TemplateRT));
         buildDoorAssets();
+        if (audioInit()) loadSounds();
         regenerateMap((uint32_t)(sceKernelGetProcessTimeWide() & 0xFFFFFF) | 1u);
     } else {
         snprintf(statusLine, sizeof(statusLine),
@@ -693,18 +926,63 @@ int main(void) {
         if (inputHit(ACTION_MENU)) {
             if (++menuHits >= 3) running = 0;
         }
-        if (inputHit(ACTION_INVENTORY)) fogOn = !fogOn;
+        if (inputHit(ACTION_INVENTORY)) invOpen = !invOpen;
+        if (inputHit(ACTION_LEAN_LEFT)) fogOn = !fogOn;
         if (inputHit(ACTION_USE_ITEM)) cullMode = (cullMode + 1) % 3;
         if (inputHit(ACTION_SAVE)) { /* D-pad up: walk/fly */
             walkMode = !walkMode;
             velY = 0.0f;
         }
         if (haveData && inputHit(ACTION_INTERACT)) {
-            doorsToggleNearest(&doors, camPos, 400.0f);
+            int picked = itemPickupNearest(camPos);
+            if (picked >= 0) {
+                snprintf(toastMsg, sizeof(toastMsg), "PICKED UP %s",
+                         ITEM_TEMPLATES[picked].name);
+                toastTimer = 150;
+                audioPlay(sndPick[rand() % 4], 0.8f, 0.0f);
+            } else {
+            Door *pressed = NULL;
+            switch (doorsPressButton(&doors, camPos, playerKeycard(),
+                                     &pressed)) {
+                case DOOR_PRESS_TOGGLED:
+                    if (pressed) {
+                        float dpos[3] = { pressed->x, camPos[1], pressed->z };
+                        int v = rand() % 3;
+                        int snd = pressed->heavy
+                                ? (pressed->open ? sndBigOpen[v]
+                                                 : sndBigClose[v])
+                                : (pressed->open ? sndDoorOpen[v]
+                                                 : sndDoorClose[v]);
+                        audioPlay(pressed->keycard > 0
+                                      ? sndKeycardUse[rand() % 2]
+                                      : sndButton[rand() % 2], 0.9f, 0.0f);
+                        audioPlay3D(snd, dpos, camPos, camYaw, 2500.0f);
+                    }
+                    break;
+                case DOOR_PRESS_KEYCARD:
+                    snprintf(toastMsg, sizeof(toastMsg),
+                             "ACCESS DENIED - LEVEL %d KEYCARD REQUIRED"
+                             " (press x3 to force)",
+                             pressed ? pressed->keycard : 0);
+                    toastTimer = 150;
+                    audioPlay(sndDoorLock, 0.9f, 0.0f);
+                    break;
+                case DOOR_PRESS_LOCKED:
+                    snprintf(toastMsg, sizeof(toastMsg), "THE DOOR IS LOCKED");
+                    toastTimer = 150;
+                    audioPlay(sndDoorLock, 0.9f, 0.0f);
+                    break;
+                default:
+                    break;
+            }
+            }
         }
         if (haveData) {
             doorsUpdate(&doors);
+            itemSpin += 1.0f;
+            if (itemSpin >= 360.0f) itemSpin -= 360.0f;
         }
+        if (toastTimer > 0) toastTimer--;
         if (haveData && inputHit(ACTION_LEAN_RIGHT)) {
             regenerateMap(mapSeed * 7919u + 17u);
         }
@@ -730,8 +1008,25 @@ int main(void) {
             } else if (inputDown(ACTION_SPRINT)) {
                 speed *= SPRINT_MULT;
             }
-            camPos[0] += (fwdX * -move.y + cosf(camYaw) * move.x) * speed;
-            camPos[2] += (fwdZ * -move.y + sinf(camYaw) * move.x) * speed;
+            float mvx = (fwdX * -move.y + cosf(camYaw) * move.x) * speed;
+            float mvz = (fwdZ * -move.y + sinf(camYaw) * move.x) * speed;
+            camPos[0] += mvx;
+            camPos[2] += mvz;
+
+            /* Footstep cadence by distance walked (PlayStepSound). */
+            if (velY > -1.0f) {
+                stepAccum += sqrtf(mvx * mvx + mvz * mvz);
+                float strideLen = 170.0f;
+                if (stepAccum >= strideLen) {
+                    stepAccum = 0.0f;
+                    if (inputDown(ACTION_SPRINT) && !crouched) {
+                        audioPlay(sndRun[rand() % 7], 0.7f, 0.0f);
+                    } else {
+                        audioPlay(sndStep[rand() % 8],
+                                  crouched ? 0.25f : 0.5f, 0.0f);
+                    }
+                }
+            }
 
             velY -= GRAVITY;
             if (velY < -TERMINAL_FALL) velY = -TERMINAL_FALL;
@@ -781,6 +1076,7 @@ int main(void) {
                 drawRoomBatches(activeRooms[i], 0);
             }
             drawDoors(camPos);
+            drawItems(camPos);
             glDisable(GL_CULL_FACE);
             for (int i = 0; i < activeCount; i++) {
                 drawRoomBatches(activeRooms[i], 1);
@@ -792,10 +1088,26 @@ int main(void) {
                  haveData ? roomNameAt(camPos) : "-");
         char line2[200];
         snprintf(line2, sizeof(line2),
-                 "fps=%.0f  x: door  up: %s  dpad>: new map  tri: fog=%s"
-                 "  sq: cull=%d  start x3: exit", fps,
-                 walkMode ? "WALK" : "fly", fogOn ? "on" : "off", cullMode);
-        drawHud(line1, line2);
+                 "fps=%.0f  au=%d/%d open-fail=%d dec-fail=%d  x: door"
+                 "  up: %s  start x3: exit", fps, audioStatus(),
+                 audioSoundCount(), audioLoadFopenFails(),
+                 audioLoadDecodeFails(), walkMode ? "WALK" : "fly");
+        char invText[512] = "";
+        if (invOpen) {
+            snprintf(invText, sizeof(invText), "INVENTORY (%u/%u)\n",
+                     inventoryCount, (unsigned)MAX_INVENTORY);
+            for (unsigned ii = 0; ii < inventoryCount; ii++) {
+                strncat(invText, ITEM_TEMPLATES[inventory[ii]].name,
+                        sizeof(invText) - strlen(invText) - 2);
+                strncat(invText, "\n", sizeof(invText) - strlen(invText) - 1);
+            }
+            if (inventoryCount == 0) {
+                strncat(invText, "(empty)",
+                        sizeof(invText) - strlen(invText) - 1);
+            }
+        }
+        drawHud(line1, line2, toastTimer > 0 ? toastMsg : NULL,
+                invOpen ? invText : NULL);
 
         vglSwapBuffers(GL_FALSE);
     }

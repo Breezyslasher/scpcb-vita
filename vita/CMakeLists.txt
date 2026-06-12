@@ -27,6 +27,8 @@ add_executable(${PROJECT_NAME}
   src/game/collision.c
   src/game/mapgen.c
   src/game/doors.c
+  src/audio/audio.c
+  src/audio/stb_vorbis.c
 )
 
 # vitaGL contains C++ objects; link with the C++ runtime.
@@ -46,6 +48,7 @@ target_link_libraries(${PROJECT_NAME}
   SceTouch_stub
   SceAppMgr_stub
   SceCommonDialog_stub
+  SceAudio_stub
   SceKernelDmacMgr_stub
   z
   m
