@@ -30,7 +30,7 @@ target_link_libraries(${PROJECT_NAME}
   SceCtrl_stub
   SceTouch_stub
   SceAppMgr_stub
-  SceSharedFb_stub
+  SceSharedFb_stub_weak
   ScePgf_stub
   ScePvf_stub
   SceCommonDialog_stub
