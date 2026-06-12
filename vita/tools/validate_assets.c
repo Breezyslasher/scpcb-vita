@@ -30,6 +30,7 @@
 #include "../src/formats/b3d.h"
 #include "../src/formats/rmesh.h"
 #include "../src/formats/texture.h"
+#include "../src/game/collision.h"
 #include "../src/render/scene.h"
 
 #define MAP_TEXTURES_DIR "GFX/Map/Textures"
@@ -43,6 +44,7 @@ static struct {
     unsigned long long texBytesNative, texBytesCap512, texBytesCap256;
     unsigned sceneOk, sceneFail;
     unsigned long long sceneBatches, sceneVertices, maxBatchVertices;
+    unsigned colOk, colFail, colGrounded;
 } stats;
 
 static int failures;
@@ -161,6 +163,30 @@ static void checkFile(const char *path) {
                 if (sc->batches[i].vertexCount > stats.maxBatchVertices) {
                     stats.maxBatchVertices = sc->batches[i].vertexCount;
                 }
+            }
+            CollisionWorld *cw = collisionBuild(sc, m);
+            if (!cw) {
+                printf("FAIL colw  %s\n", path);
+                stats.colFail++;
+                failures = 1;
+            } else {
+                stats.colOk++;
+                /* Drop a probe from the room center: most rooms should
+                 * report ground below. */
+                float origin[3] = {
+                    (sc->boundsMin[0] + sc->boundsMax[0]) * 0.5f,
+                    sc->boundsMax[1],
+                    (sc->boundsMin[2] + sc->boundsMax[2]) * 0.5f,
+                };
+                float hitY;
+                if (collisionRayDown(cw, origin,
+                                     sc->boundsMax[1] - sc->boundsMin[1]
+                                         + 1.0f, &hitY)) {
+                    stats.colGrounded++;
+                }
+                int up = 0;
+                collisionSpherePush(cw, origin, 38.0f, &up);
+                collisionFree(cw);
             }
             sceneFree(sc);
         }
@@ -283,6 +309,8 @@ int main(int argc, char **argv) {
     printf("Scenes: %u built, %u failed\n", stats.sceneOk, stats.sceneFail);
     printf("  batches=%llu vertices=%llu maxBatchVertices=%llu\n",
            stats.sceneBatches, stats.sceneVertices, stats.maxBatchVertices);
+    printf("Collision: %u worlds built, %u failed, %u rooms grounded\n",
+           stats.colOk, stats.colFail, stats.colGrounded);
     printf("Textures: %u decoded, %u decode failures, %u unresolved refs\n",
            stats.texDecoded, stats.texDecodeFail, stats.texMissing);
     printf("  RGBA8 footprint: native=%.1f MB, cap512=%.1f MB, cap256=%.1f MB\n",

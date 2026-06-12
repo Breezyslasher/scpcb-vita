@@ -23,6 +23,7 @@ jobs:
             vita/src/formats/b3d.c \
             vita/src/formats/texture.c \
             vita/src/render/scene.c \
+            vita/src/game/collision.c \
             -lm
 
       - name: Parse all RMesh rooms, B3D models and referenced textures

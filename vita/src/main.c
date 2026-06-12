@@ -24,6 +24,7 @@
 
 #include "formats/rmesh.h"
 #include "formats/texture.h"
+#include "game/collision.h"
 #include "input.h"
 #include "render/scene.h"
 
@@ -196,6 +197,21 @@ static float camYaw, camPitch;
 static float moveSpeed;
 static float roomDiag = 100.0f;
 
+/* Player metrics in raw mesh units: world units * 2048/8 (RoomScale).
+ * Collider from Loading_Core.bb (EntityRadius 0.15/0.30), walk speed
+ * from Main_Core.bb (0.018/frame, sprint x2.5). */
+#define PLAYER_RADIUS 38.0f
+#define EYE_HEIGHT 140.0f
+#define STEP_SLACK 25.0f
+#define WALK_SPEED 4.6f
+#define SPRINT_MULT 2.5f
+#define GRAVITY 0.5f
+#define TERMINAL_FALL 20.0f
+
+static CollisionWorld *colWorld;
+static int walkMode = 0;
+static float velY = 0.0f;
+
 /* Debug toggles for on-device diagnosis (see HUD). */
 static int cullMode = 0;  /* 0 = off, 1 = CW front, 2 = CCW; assets carry
                            * mixed winding, so default off */
@@ -212,6 +228,8 @@ static void unloadRoom(void) {
     batchTex = NULL;
     sceneFree(scene);
     scene = NULL;
+    collisionFree(colWorld);
+    colWorld = NULL;
     textureCacheClear();
     modelCacheClear();
 }
@@ -258,7 +276,9 @@ static void loadRoom(unsigned index) {
             props++;
         }
     }
+    colWorld = collisionBuild(scene, mesh);
     rmeshFree(mesh);
+    velY = 0.0f;
 
     batchTex = (BatchGL *)calloc(scene->batchCount ? scene->batchCount : 1,
                                  sizeof(BatchGL));
@@ -512,12 +532,45 @@ int main(void) {
         if (camPitch > 1.5f) camPitch = 1.5f;
         if (camPitch < -1.5f) camPitch = -1.5f;
 
-        float speed = moveSpeed * (inputDown(ACTION_SPRINT) ? 2.0f : 1.0f);
+        if (inputHit(ACTION_INTERACT)) {
+            walkMode = !walkMode;
+            velY = 0.0f;
+        }
+
         float fwdX = sinf(camYaw), fwdZ = -cosf(camYaw);
-        camPos[0] += (fwdX * -move.y + cosf(camYaw) * move.x) * speed;
-        camPos[2] += (fwdZ * -move.y + sinf(camYaw) * move.x) * speed;
-        if (inputDown(ACTION_BLINK)) camPos[1] += speed;
-        if (inputDown(ACTION_CROUCH)) camPos[1] -= speed;
+        if (walkMode && colWorld) {
+            /* Walk: game speeds, gravity, slide along geometry. */
+            float speed = WALK_SPEED
+                        * (inputDown(ACTION_SPRINT) ? SPRINT_MULT : 1.0f);
+            camPos[0] += (fwdX * -move.y + cosf(camYaw) * move.x) * speed;
+            camPos[2] += (fwdZ * -move.y + sinf(camYaw) * move.x) * speed;
+
+            velY -= GRAVITY;
+            if (velY < -TERMINAL_FALL) velY = -TERMINAL_FALL;
+            camPos[1] += velY;
+
+            int pushedUp = 0;
+            collisionSpherePush(colWorld, camPos, PLAYER_RADIUS, &pushedUp);
+
+            float hitY;
+            if (collisionRayDown(colWorld, camPos, EYE_HEIGHT + STEP_SLACK,
+                                 &hitY)) {
+                float target = hitY + EYE_HEIGHT;
+                if (camPos[1] <= target) {
+                    camPos[1] = target;
+                    velY = 0.0f;
+                }
+            }
+            if (pushedUp && velY < 0.0f) velY = 0.0f;
+        } else {
+            /* Fly: room-relative speed, vertical on R/Circle. */
+            float speed = moveSpeed
+                        * (inputDown(ACTION_SPRINT) ? 2.0f : 1.0f);
+            camPos[0] += (fwdX * -move.y + cosf(camYaw) * move.x) * speed;
+            camPos[2] += (fwdZ * -move.y + sinf(camYaw) * move.x) * speed;
+            if (inputDown(ACTION_BLINK)) camPos[1] += speed;
+            if (inputDown(ACTION_CROUCH)) camPos[1] -= speed;
+        }
 
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
 
@@ -540,8 +593,8 @@ int main(void) {
         static const char *cullNames[3] = { "off", "cw", "ccw" };
         char controls[200];
         snprintf(controls, sizeof(controls),
-                 "fps=%.0f  dpad: room %u/%u  tri: fog=%s  sq: cull=%s  "
-                 "start x3: exit", fps,
+                 "fps=%.0f  x: %s  dpad: room %u/%u  tri: fog=%s  sq: cull=%s"
+                 "  start x3: exit", fps, walkMode ? "WALK" : "fly",
                  roomCount ? roomIndex + 1 : 0, roomCount,
                  fogOn ? "on" : "off", cullNames[cullMode]);
         drawHud(statusLine, controls);
