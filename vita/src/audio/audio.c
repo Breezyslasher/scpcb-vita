@@ -69,8 +69,12 @@ static volatile int running;
 static int mixerLoop(SceSize args, void *argp) {
     (void)args;
     (void)argp;
-    static int16_t out[GRAIN * 2];
+    /* Ping-pong buffers: the hardware may still read the submitted
+     * buffer after sceAudioOutOutput returns; reusing one buffer
+     * produces constant static. */
+    static int16_t out[2][GRAIN * 2];
     static int32_t acc[GRAIN * 2];
+    int flip = 0;
 
     while (running) {
         memset(acc, 0, sizeof(acc));
@@ -90,12 +94,19 @@ static int mixerLoop(SceSize args, void *argp) {
                     }
                 }
                 uint32_t f = ch->posFx >> 16;
-                int16_t l, r;
+                uint32_t f2 = f + 1 < s->frames ? f + 1 : f;
+                int32_t frac = ch->posFx & 0xFFFF;
+                int32_t l, r;
                 if (s->channels == 2) {
-                    l = s->pcm[f * 2];
-                    r = s->pcm[f * 2 + 1];
+                    l = s->pcm[f * 2]
+                      + (((s->pcm[f2 * 2] - s->pcm[f * 2]) * frac) >> 16);
+                    r = s->pcm[f * 2 + 1]
+                      + (((s->pcm[f2 * 2 + 1] - s->pcm[f * 2 + 1]) * frac)
+                         >> 16);
                 } else {
-                    l = r = s->pcm[f];
+                    l = s->pcm[f]
+                      + (((s->pcm[f2] - s->pcm[f]) * frac) >> 16);
+                    r = l;
                 }
                 acc[i * 2] += (int32_t)(l * ch->volL);
                 acc[i * 2 + 1] += (int32_t)(r * ch->volR);
@@ -106,9 +117,10 @@ static int mixerLoop(SceSize args, void *argp) {
             int32_t v = acc[i];
             if (v > 32767) v = 32767;
             if (v < -32768) v = -32768;
-            out[i] = (int16_t)v;
+            out[flip][i] = (int16_t)v;
         }
-        sceAudioOutOutput(port, out); /* blocks until consumed */
+        sceAudioOutOutput(port, out[flip]); /* blocks until queueable */
+        flip ^= 1;
     }
     return 0;
 }
