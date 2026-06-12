@@ -12,12 +12,14 @@
 
 #include <dirent.h>
 #include <math.h>
+#include <stddef.h>
 #include <strings.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 #include <psp2/kernel/processmgr.h>
+#include <psp2/kernel/threadmgr.h>
 #include <vitaGL.h>
 
 #include "formats/rmesh.h"
@@ -180,10 +182,12 @@ static void scanRooms(void) {
 typedef struct {
     GLuint diffuse;
     GLuint lightmap;
-} BatchTextures;
+    GLuint vbo;
+    GLuint ibo;
+} BatchGL;
 
 static Scene *scene;
-static BatchTextures *batchTex;
+static BatchGL *batchTex;
 static char roomName[256];
 static char statusLine[512];
 
@@ -193,10 +197,17 @@ static float moveSpeed;
 static float roomDiag = 100.0f;
 
 /* Debug toggles for on-device diagnosis (see HUD). */
-static int cullMode = 1;  /* 0 = off, 1 = CW front (Blitz/DX), 2 = CCW */
+static int cullMode = 0;  /* 0 = off, 1 = CW front, 2 = CCW; assets carry
+                           * mixed winding, so default off */
 static int fogOn = 1;
 
 static void unloadRoom(void) {
+    if (batchTex && scene) {
+        for (uint32_t i = 0; i < scene->batchCount; i++) {
+            if (batchTex[i].vbo) glDeleteBuffers(1, &batchTex[i].vbo);
+            if (batchTex[i].ibo) glDeleteBuffers(1, &batchTex[i].ibo);
+        }
+    }
     free(batchTex);
     batchTex = NULL;
     sceneFree(scene);
@@ -249,20 +260,36 @@ static void loadRoom(unsigned index) {
     }
     rmeshFree(mesh);
 
-    batchTex = (BatchTextures *)calloc(scene->batchCount ? scene->batchCount : 1,
-                                       sizeof(BatchTextures));
+    batchTex = (BatchGL *)calloc(scene->batchCount ? scene->batchCount : 1,
+                                 sizeof(BatchGL));
     unsigned missing = 0;
     unsigned long long verts = 0;
     for (uint32_t i = 0; i < scene->batchCount; i++) {
-        verts += scene->batches[i].vertexCount;
+        const SceneBatch *b = &scene->batches[i];
+        verts += b->vertexCount;
         if (batchTex) {
-            batchTex[i].diffuse = textureGet(scene->batches[i].diffuseName);
-            batchTex[i].lightmap = textureGet(scene->batches[i].lightmapName);
-            if (scene->batches[i].diffuseName && !batchTex[i].diffuse) {
+            batchTex[i].diffuse = textureGet(b->diffuseName);
+            batchTex[i].lightmap = textureGet(b->lightmapName);
+            if (b->diffuseName && !batchTex[i].diffuse) {
                 missing++;
             }
+            /* Static geometry goes into VBOs once; drawing from
+             * client-side arrays re-uploads every frame and was the
+             * cause of single-digit FPS. */
+            glGenBuffers(1, &batchTex[i].vbo);
+            glBindBuffer(GL_ARRAY_BUFFER, batchTex[i].vbo);
+            glBufferData(GL_ARRAY_BUFFER,
+                         (GLsizeiptr)(b->vertexCount * sizeof(SceneVertex)),
+                         b->vertices, GL_STATIC_DRAW);
+            glGenBuffers(1, &batchTex[i].ibo);
+            glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, batchTex[i].ibo);
+            glBufferData(GL_ELEMENT_ARRAY_BUFFER,
+                         (GLsizeiptr)(b->indexCount * sizeof(uint16_t)),
+                         b->indices, GL_STATIC_DRAW);
         }
     }
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
 
     /* Start the camera in the middle of the room; scale movement to
      * room size so units don't matter. */
@@ -322,22 +349,25 @@ static void applyDebugState(void) {
     }
 }
 
+#define VTX_OFF(field) ((const void *)offsetof(SceneVertex, field))
+
 static void drawBatches(int alphaPass) {
+    if (!batchTex) return;
     for (uint32_t i = 0; i < scene->batchCount; i++) {
         const SceneBatch *b = &scene->batches[i];
         if (b->alphaClip != alphaPass) continue;
 
-        glVertexPointer(3, GL_FLOAT, sizeof(SceneVertex), &b->vertices[0].x);
-        glColorPointer(4, GL_UNSIGNED_BYTE, sizeof(SceneVertex),
-                       &b->vertices[0].r);
+        glBindBuffer(GL_ARRAY_BUFFER, batchTex[i].vbo);
+        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, batchTex[i].ibo);
+        glVertexPointer(3, GL_FLOAT, sizeof(SceneVertex), VTX_OFF(x));
+        glColorPointer(4, GL_UNSIGNED_BYTE, sizeof(SceneVertex), VTX_OFF(r));
 
         /* Pass 1: diffuse * vertex color. */
-        GLuint diffuse = batchTex ? batchTex[i].diffuse : 0;
+        GLuint diffuse = batchTex[i].diffuse;
         if (diffuse) {
             glEnable(GL_TEXTURE_2D);
             glBindTexture(GL_TEXTURE_2D, diffuse);
-            glTexCoordPointer(2, GL_FLOAT, sizeof(SceneVertex),
-                              &b->vertices[0].du);
+            glTexCoordPointer(2, GL_FLOAT, sizeof(SceneVertex), VTX_OFF(du));
         } else {
             glDisable(GL_TEXTURE_2D);
         }
@@ -346,25 +376,26 @@ static void drawBatches(int alphaPass) {
             glAlphaFunc(GL_GREATER, 0.5f);
         }
         glDrawElements(GL_TRIANGLES, (GLsizei)b->indexCount,
-                       GL_UNSIGNED_SHORT, b->indices);
+                       GL_UNSIGNED_SHORT, NULL);
         if (alphaPass) {
             glDisable(GL_ALPHA_TEST);
         }
 
         /* Pass 2: additive lightmap (Blitz TextureBlend 3). */
-        GLuint lightmap = batchTex ? batchTex[i].lightmap : 0;
+        GLuint lightmap = batchTex[i].lightmap;
         if (lightmap) {
             glEnable(GL_TEXTURE_2D);
             glBindTexture(GL_TEXTURE_2D, lightmap);
-            glTexCoordPointer(2, GL_FLOAT, sizeof(SceneVertex),
-                              &b->vertices[0].lu);
+            glTexCoordPointer(2, GL_FLOAT, sizeof(SceneVertex), VTX_OFF(lu));
             glEnable(GL_BLEND);
             glBlendFunc(GL_ONE, GL_ONE);
             glDrawElements(GL_TRIANGLES, (GLsizei)b->indexCount,
-                           GL_UNSIGNED_SHORT, b->indices);
+                           GL_UNSIGNED_SHORT, NULL);
             glDisable(GL_BLEND);
         }
     }
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
 }
 
 static void drawText(float x, float y, const char *text) {
@@ -442,7 +473,17 @@ int main(void) {
 
     int running = 1;
     int menuHits = 0;
+    uint64_t fpsLast = sceKernelGetProcessTimeWide();
+    unsigned fpsFrames = 0;
+    float fps = 0.0f;
     while (running) {
+        fpsFrames++;
+        uint64_t now = sceKernelGetProcessTimeWide();
+        if (now - fpsLast >= 500000) {
+            fps = fpsFrames * 1000000.0f / (float)(now - fpsLast);
+            fpsFrames = 0;
+            fpsLast = now;
+        }
         inputUpdate();
 
         if (inputHit(ACTION_MENU)) {
@@ -499,7 +540,8 @@ int main(void) {
         static const char *cullNames[3] = { "off", "cw", "ccw" };
         char controls[200];
         snprintf(controls, sizeof(controls),
-                 "dpad: room %u/%u  tri: fog=%s  sq: cull=%s  start x3: exit",
+                 "fps=%.0f  dpad: room %u/%u  tri: fog=%s  sq: cull=%s  "
+                 "start x3: exit", fps,
                  roomCount ? roomIndex + 1 : 0, roomCount,
                  fogOn ? "on" : "off", cullNames[cullMode]);
         drawHud(statusLine, controls);
