@@ -3,6 +3,7 @@
 
 #include <stdint.h>
 
+#include "../formats/b3d.h"
 #include "../formats/rmesh.h"
 
 /*
@@ -45,6 +46,16 @@ typedef struct {
  * vertices are split across batches. Returns NULL on allocation
  * failure only. */
 Scene *sceneBuild(const RMesh *mesh);
+
+/* Append a B3D model (a room prop) to the scene, baking the placement
+ * transform and the model's node hierarchy into the vertices.
+ * Position/rotation/scale are in the same space as the room mesh
+ * vertices (Blitz: RotateEntity order yaw-pitch-roll, degrees).
+ * textureOverride, when non-NULL/non-empty, replaces every brush
+ * texture. Returns 0 on allocation failure. */
+int sceneAppendB3D(Scene *scene, const B3DModel *model,
+                   const float pos[3], const float eulerDeg[3],
+                   const float scale[3], const char *textureOverride);
 
 void sceneFree(Scene *scene);
 

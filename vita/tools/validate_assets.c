@@ -30,6 +30,8 @@
 #include "../src/formats/b3d.h"
 #include "../src/formats/rmesh.h"
 #include "../src/formats/texture.h"
+#include "../src/game/collision.h"
+#include "../src/game/mapgen.h"
 #include "../src/render/scene.h"
 
 #define MAP_TEXTURES_DIR "GFX/Map/Textures"
@@ -43,6 +45,7 @@ static struct {
     unsigned long long texBytesNative, texBytesCap512, texBytesCap256;
     unsigned sceneOk, sceneFail;
     unsigned long long sceneBatches, sceneVertices, maxBatchVertices;
+    unsigned colOk, colFail, colGrounded;
 } stats;
 
 static int failures;
@@ -162,6 +165,30 @@ static void checkFile(const char *path) {
                     stats.maxBatchVertices = sc->batches[i].vertexCount;
                 }
             }
+            CollisionWorld *cw = collisionBuild(sc, m);
+            if (!cw) {
+                printf("FAIL colw  %s\n", path);
+                stats.colFail++;
+                failures = 1;
+            } else {
+                stats.colOk++;
+                /* Drop a probe from the room center: most rooms should
+                 * report ground below. */
+                float origin[3] = {
+                    (sc->boundsMin[0] + sc->boundsMax[0]) * 0.5f,
+                    sc->boundsMax[1],
+                    (sc->boundsMin[2] + sc->boundsMax[2]) * 0.5f,
+                };
+                float hitY;
+                if (collisionRayDown(cw, origin,
+                                     sc->boundsMax[1] - sc->boundsMin[1]
+                                         + 1.0f, &hitY)) {
+                    stats.colGrounded++;
+                }
+                int up = 0;
+                collisionSpherePush(cw, origin, 38.0f, &up);
+                collisionFree(cw);
+            }
             sceneFree(sc);
         }
 
@@ -183,6 +210,22 @@ static void checkFile(const char *path) {
         }
         stats.b3dOk++;
         tallyNode(m->root);
+
+        /* Exercise prop scene-building with an identity placement. */
+        RMesh empty;
+        memset(&empty, 0, sizeof(empty));
+        Scene *sc = sceneBuild(&empty);
+        if (sc) {
+            float pos[3] = { 0, 0, 0 };
+            float euler[3] = { 0, 0, 0 };
+            float scl[3] = { 1, 1, 1 };
+            if (!sceneAppendB3D(sc, m, pos, euler, scl, NULL)) {
+                printf("FAIL scene-b3d %s\n", path);
+                failures = 1;
+            }
+            sceneFree(sc);
+        }
+
         dirOf(path, dir, sizeof(dir));
         for (uint32_t i = 0; i < m->textureCount; i++) {
             collectTexture(m->textures[i].file, dir);
@@ -267,6 +310,8 @@ int main(int argc, char **argv) {
     printf("Scenes: %u built, %u failed\n", stats.sceneOk, stats.sceneFail);
     printf("  batches=%llu vertices=%llu maxBatchVertices=%llu\n",
            stats.sceneBatches, stats.sceneVertices, stats.maxBatchVertices);
+    printf("Collision: %u worlds built, %u failed, %u rooms grounded\n",
+           stats.colOk, stats.colFail, stats.colGrounded);
     printf("Textures: %u decoded, %u decode failures, %u unresolved refs\n",
            stats.texDecoded, stats.texDecodeFail, stats.texMissing);
     printf("  RGBA8 footprint: native=%.1f MB, cap512=%.1f MB, cap256=%.1f MB\n",
@@ -278,6 +323,29 @@ int main(int argc, char **argv) {
         for (size_t i = 0; i < texMissing.count; i++) {
             printf("    %s\n", texMissing.items[i]);
         }
+    }
+
+    /* Map generation against the shipped template list. */
+    RoomTemplateList tpls;
+    if (templatesLoad("Data/rooms.ini", &tpls)) {
+        unsigned genOk = 0;
+        unsigned long long totalRooms = 0;
+        for (uint32_t seed = 1; seed <= 50; seed++) {
+            GeneratedMap m;
+            if (mapGenerate(&tpls, seed, &m)) {
+                genOk++;
+                totalRooms += m.roomCount;
+                mapFree(&m);
+            } else {
+                printf("FAIL mapgen seed %u\n", seed);
+                failures = 1;
+            }
+        }
+        printf("MapGen: %u templates, %u/50 seeds ok, avg rooms=%.1f\n",
+               tpls.count, genOk, genOk ? (double)totalRooms / genOk : 0.0);
+        templatesFree(&tpls);
+    } else {
+        printf("MapGen: Data/rooms.ini not found (skipped)\n");
     }
 
     if (stats.rmeshOk + stats.rmeshFail + stats.b3dOk + stats.b3dFail == 0) {
