@@ -1084,9 +1084,9 @@ int main(void) {
                  haveData ? roomNameAt(camPos) : "-");
         char line2[200];
         snprintf(line2, sizeof(line2),
-                 "fps=%.0f  x: door  up: %s  dpad>: new map  tri: fog=%s"
-                 "  sq: cull=%d  start x3: exit", fps,
-                 walkMode ? "WALK" : "fly", fogOn ? "on" : "off", cullMode);
+                 "fps=%.0f  au=%d/%d  x: door  up: %s  dpad>: new map"
+                 "  tri: inv  start x3: exit", fps, audioStatus(),
+                 audioSoundCount(), walkMode ? "WALK" : "fly");
         char invText[512] = "";
         if (invOpen) {
             snprintf(invText, sizeof(invText), "INVENTORY (%u/%u)\n",

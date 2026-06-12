@@ -91,17 +91,38 @@ static int mixerLoop(SceSize args, void *argp) {
     return 0;
 }
 
+static int initState; /* 0 not tried, >0 ok, <0 failed step */
+
 int audioInit(void) {
-    port = sceAudioOutOpenPort(SCE_AUDIO_OUT_PORT_TYPE_BGM, GRAIN, OUT_RATE,
+    port = sceAudioOutOpenPort(SCE_AUDIO_OUT_PORT_TYPE_MAIN, GRAIN, OUT_RATE,
                                SCE_AUDIO_OUT_MODE_STEREO);
-    if (port < 0) return 0;
+    if (port < 0) {
+        initState = -1;
+        return 0;
+    }
+    int vols[2] = { SCE_AUDIO_OUT_MAX_VOL, SCE_AUDIO_OUT_MAX_VOL };
+    sceAudioOutSetVolume(port,
+                         SCE_AUDIO_VOLUME_FLAG_L_CH | SCE_AUDIO_VOLUME_FLAG_R_CH,
+                         vols);
     for (int c = 0; c <= MAX_CHANNELS; c++) channels[c].sound = -1;
     running = 1;
-    mixThread = sceKernelCreateThread("audio_mix", mixerLoop, 0x10000040,
-                                      0x10000, 0, 0, NULL);
-    if (mixThread < 0) return 0;
+    mixThread = sceKernelCreateThread("audio_mix", mixerLoop, 64, 0x10000,
+                                      0, 0, NULL);
+    if (mixThread < 0) {
+        initState = -2;
+        return 0;
+    }
     sceKernelStartThread(mixThread, 0, NULL);
+    initState = 1;
     return 1;
+}
+
+int audioStatus(void) {
+    return initState;
+}
+
+int audioSoundCount(void) {
+    return soundCount;
 }
 
 int audioLoad(const char *path) {

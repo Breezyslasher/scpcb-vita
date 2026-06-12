@@ -25,4 +25,9 @@ void audioPlay3D(int sound, const float pos[3], const float listener[3],
 /* Loop a sound on the dedicated ambience channel (replaces previous). */
 void audioLoopAmbience(int sound, float vol);
 
+/* Diagnostics: init state (1 ok, -1 port failed, -2 thread failed,
+ * 0 not initialized) and number of sounds successfully decoded. */
+int audioStatus(void);
+int audioSoundCount(void);
+
 #endif
