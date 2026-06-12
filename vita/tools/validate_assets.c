@@ -183,6 +183,22 @@ static void checkFile(const char *path) {
         }
         stats.b3dOk++;
         tallyNode(m->root);
+
+        /* Exercise prop scene-building with an identity placement. */
+        RMesh empty;
+        memset(&empty, 0, sizeof(empty));
+        Scene *sc = sceneBuild(&empty);
+        if (sc) {
+            float pos[3] = { 0, 0, 0 };
+            float euler[3] = { 0, 0, 0 };
+            float scl[3] = { 1, 1, 1 };
+            if (!sceneAppendB3D(sc, m, pos, euler, scl, NULL)) {
+                printf("FAIL scene-b3d %s\n", path);
+                failures = 1;
+            }
+            sceneFree(sc);
+        }
+
         dirOf(path, dir, sizeof(dir));
         for (uint32_t i = 0; i < m->textureCount; i++) {
             collectTexture(m->textures[i].file, dir);

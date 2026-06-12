@@ -35,6 +35,7 @@
 #define DATA_ROOT "ux0:data/scpcb-ue"
 #define MAP_DIR DATA_ROOT "/GFX/Map"
 #define MAP_TEXTURES_DIR DATA_ROOT "/GFX/Map/Textures"
+#define PROPS_DIR DATA_ROOT "/GFX/Map/Props"
 
 /* ---------------- texture cache ---------------- */
 
@@ -53,9 +54,9 @@ static GLuint textureGet(const char *name) {
     }
 
     GLuint handle = 0;
-    const char *dirs[2] = { MAP_DIR, MAP_TEXTURES_DIR };
+    const char *dirs[3] = { MAP_DIR, MAP_TEXTURES_DIR, PROPS_DIR };
     char path[1024];
-    if (textureResolve(name, dirs, 2, path, sizeof(path))) {
+    if (textureResolve(name, dirs, 3, path, sizeof(path))) {
         char err[128];
         TextureImage *img = textureLoadFile(path, TEXTURE_CAP, err, sizeof(err));
         if (img) {
@@ -84,6 +85,7 @@ static GLuint textureGet(const char *name) {
 }
 
 static void textureCacheClear(void) {
+    glBindTexture(GL_TEXTURE_2D, 0);
     for (unsigned i = 0; i < texCacheCount; i++) {
         if (texCache[i].handle) glDeleteTextures(1, &texCache[i].handle);
         free(texCache[i].name);
@@ -91,6 +93,64 @@ static void textureCacheClear(void) {
     free(texCache);
     texCache = NULL;
     texCacheCount = 0;
+}
+
+/* ---------------- prop model cache (per room) ---------------- */
+
+typedef struct {
+    char *name;
+    B3DModel *model; /* NULL = load failed (cached negative) */
+} CachedModel;
+
+static CachedModel *modelCache;
+static unsigned modelCacheCount;
+
+static B3DModel *propModelGet(const char *rawName) {
+    /* The game strips a trailing .b3d, then appends .b3d
+     * (Map_Core.bb "mesh" entity). Use the final path component. */
+    const char *base = rawName;
+    for (const char *p = rawName; *p; p++) {
+        if (*p == '\\' || *p == '/') base = p + 1;
+    }
+    char name[256];
+    snprintf(name, sizeof(name), "%s", base);
+    size_t len = strlen(name);
+    if (len > 4 && strcasecmp(name + len - 4, ".b3d") == 0) {
+        name[len - 4] = '\0';
+    }
+    strncat(name, ".b3d", sizeof(name) - strlen(name) - 1);
+
+    for (unsigned i = 0; i < modelCacheCount; i++) {
+        if (strcmp(modelCache[i].name, name) == 0) return modelCache[i].model;
+    }
+
+    B3DModel *model = NULL;
+    const char *dirs[1] = { PROPS_DIR };
+    char path[1024];
+    if (textureResolve(name, dirs, 1, path, sizeof(path))) {
+        char err[128];
+        model = b3dLoadFile(path, err, sizeof(err));
+    }
+
+    CachedModel *grown = (CachedModel *)realloc(
+        modelCache, (modelCacheCount + 1) * sizeof(CachedModel));
+    if (grown) {
+        modelCache = grown;
+        modelCache[modelCacheCount].name = strdup(name);
+        modelCache[modelCacheCount].model = model;
+        if (modelCache[modelCacheCount].name) modelCacheCount++;
+    }
+    return model;
+}
+
+static void modelCacheClear(void) {
+    for (unsigned i = 0; i < modelCacheCount; i++) {
+        b3dFree(modelCache[i].model);
+        free(modelCache[i].name);
+    }
+    free(modelCache);
+    modelCache = NULL;
+    modelCacheCount = 0;
 }
 
 /* ---------------- room list ---------------- */
@@ -130,6 +190,11 @@ static char statusLine[512];
 static float camPos[3];
 static float camYaw, camPitch;
 static float moveSpeed;
+static float roomDiag = 100.0f;
+
+/* Debug toggles for on-device diagnosis (see HUD). */
+static int cullMode = 1;  /* 0 = off, 1 = CW front (Blitz/DX), 2 = CCW */
+static int fogOn = 1;
 
 static void unloadRoom(void) {
     free(batchTex);
@@ -137,6 +202,7 @@ static void unloadRoom(void) {
     sceneFree(scene);
     scene = NULL;
     textureCacheClear();
+    modelCacheClear();
 }
 
 static void loadRoom(unsigned index) {
@@ -154,11 +220,34 @@ static void loadRoom(unsigned index) {
         return;
     }
     scene = sceneBuild(mesh);
-    rmeshFree(mesh);
     if (!scene) {
+        rmeshFree(mesh);
         snprintf(statusLine, sizeof(statusLine), "%s: out of memory", roomName);
         return;
     }
+
+    /* Place the room's B3D props ("mesh" entities). Entity coords are
+     * already in mesh-vertex space: the game multiplies them by
+     * RoomScale but also scales the whole room object by RoomScale,
+     * and prop scale is local under that parent (Rooms_Core.bb 4226,
+     * Map_Core.bb CreateProp). */
+    unsigned props = 0, propFails = 0;
+    for (uint32_t i = 0; i < mesh->entityCount; i++) {
+        const RMeshEntity *e = &mesh->entities[i];
+        if (e->type != RMESH_ENTITY_PROP || !e->u.prop.file) continue;
+        B3DModel *model = propModelGet(e->u.prop.file);
+        if (!model) {
+            propFails++;
+            continue;
+        }
+        float pos[3] = { e->x, e->y, e->z };
+        float euler[3] = { e->u.prop.pitch, e->u.prop.yaw, e->u.prop.roll };
+        float scl[3] = { e->u.prop.scaleX, e->u.prop.scaleY, e->u.prop.scaleZ };
+        if (sceneAppendB3D(scene, model, pos, euler, scl, e->u.prop.texture)) {
+            props++;
+        }
+    }
+    rmeshFree(mesh);
 
     batchTex = (BatchTextures *)calloc(scene->batchCount ? scene->batchCount : 1,
                                        sizeof(BatchTextures));
@@ -183,25 +272,54 @@ static void loadRoom(unsigned index) {
         size[i] = scene->boundsMax[i] - scene->boundsMin[i];
     }
     float diag = sqrtf(size[0] * size[0] + size[1] * size[1] + size[2] * size[2]);
-    moveSpeed = diag > 0.0f ? diag / 240.0f : 0.05f;
+    roomDiag = diag > 0.0f ? diag : 100.0f;
+    moveSpeed = roomDiag / 240.0f;
     camYaw = 0.0f;
     camPitch = 0.0f;
 
     snprintf(statusLine, sizeof(statusLine),
-             "%s  batches=%u verts=%llu texMissing=%u", roomName,
-             scene->batchCount, verts, missing);
+             "%s  batches=%u verts=%llu texMissing=%u props=%u/%u", roomName,
+             scene->batchCount, verts, missing, props, props + propFails);
 }
 
 /* ---------------- rendering ---------------- */
 
 static void setPerspective(void) {
-    float zNear = 0.05f, zFar = 1000.0f;
+    /* Room-relative depth range keeps depth precision sane regardless
+     * of the file's units. */
+    float zNear = roomDiag / 2000.0f;
+    float zFar = roomDiag * 4.0f;
     float fovY = 60.0f * 3.14159265f / 180.0f;
     float top = zNear * tanf(fovY * 0.5f);
     float right = top * ((float)SCREEN_W / (float)SCREEN_H);
     glMatrixMode(GL_PROJECTION);
     glLoadIdentity();
     glFrustum(-right, right, -top, top, zNear, zFar);
+}
+
+static void applyDebugState(void) {
+    if (cullMode == 0) {
+        glDisable(GL_CULL_FACE);
+    } else {
+        glEnable(GL_CULL_FACE);
+        glCullFace(GL_BACK);
+        /* Blitz3D/DirectX winding: clockwise faces are front. */
+        glFrontFace(cullMode == 1 ? GL_CW : GL_CCW);
+    }
+
+    if (fogOn) {
+        /* The game runs linear black fog from ~0.1 to ~6 world units
+         * against rooms ~8 units wide; scale the same ratios to the
+         * room diagonal. */
+        GLfloat fogColor[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
+        glEnable(GL_FOG);
+        glFogf(GL_FOG_MODE, GL_LINEAR);
+        glFogfv(GL_FOG_COLOR, fogColor);
+        glFogf(GL_FOG_START, roomDiag * 0.05f);
+        glFogf(GL_FOG_END, roomDiag * 1.1f);
+    } else {
+        glDisable(GL_FOG);
+    }
 }
 
 static void drawBatches(int alphaPass) {
@@ -242,7 +360,6 @@ static void drawBatches(int alphaPass) {
                               &b->vertices[0].lu);
             glEnable(GL_BLEND);
             glBlendFunc(GL_ONE, GL_ONE);
-            glDepthFunc(GL_LEQUAL);
             glDrawElements(GL_TRIANGLES, (GLsizei)b->indexCount,
                            GL_UNSIGNED_SHORT, b->indices);
             glDisable(GL_BLEND);
@@ -284,6 +401,8 @@ static void drawHud(const char *line1, const char *line2) {
 
     glDisable(GL_DEPTH_TEST);
     glDisable(GL_TEXTURE_2D);
+    glDisable(GL_FOG);
+    glDisable(GL_CULL_FACE);
     glDisableClientState(GL_COLOR_ARRAY);
     glDisableClientState(GL_TEXTURE_COORD_ARRAY);
     glColor4f(1.0f, 1.0f, 1.0f, 1.0f);
@@ -303,8 +422,9 @@ int main(void) {
     vglInit(0x800000);
 
     glViewport(0, 0, SCREEN_W, SCREEN_H);
-    glClearColor(0.02f, 0.02f, 0.03f, 1.0f);
+    glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
     glEnable(GL_DEPTH_TEST);
+    glDepthFunc(GL_LEQUAL); /* lightmap pass re-draws at equal depth */
     glEnableClientState(GL_VERTEX_ARRAY);
     glEnableClientState(GL_COLOR_ARRAY);
     glEnableClientState(GL_TEXTURE_COORD_ARRAY);
@@ -328,6 +448,8 @@ int main(void) {
         if (inputHit(ACTION_MENU)) {
             if (++menuHits >= 3) running = 0;
         }
+        if (inputHit(ACTION_INVENTORY)) fogOn = !fogOn;
+        if (inputHit(ACTION_USE_ITEM)) cullMode = (cullMode + 1) % 3;
         if (roomCount > 0) {
             if (inputHit(ACTION_LEAN_RIGHT)) {
                 roomIndex = (roomIndex + 1) % roomCount;
@@ -360,6 +482,7 @@ int main(void) {
 
         if (scene) {
             setPerspective();
+            applyDebugState();
             glMatrixMode(GL_MODELVIEW);
             glLoadIdentity();
             glRotatef(camPitch * 180.0f / 3.14159265f, 1, 0, 0);
@@ -368,13 +491,17 @@ int main(void) {
 
             glColor4f(1, 1, 1, 1);
             drawBatches(0); /* opaque */
+            /* The game flip-copies alpha surfaces (double-sided). */
+            glDisable(GL_CULL_FACE);
             drawBatches(1); /* alpha-clipped */
         }
 
-        char controls[160];
+        static const char *cullNames[3] = { "off", "cw", "ccw" };
+        char controls[200];
         snprintf(controls, sizeof(controls),
-                 "sticks: move/look  L: sprint  dpad </>: room %u/%u  "
-                 "start x3: exit", roomCount ? roomIndex + 1 : 0, roomCount);
+                 "dpad: room %u/%u  tri: fog=%s  sq: cull=%s  start x3: exit",
+                 roomCount ? roomIndex + 1 : 0, roomCount,
+                 fogOn ? "on" : "off", cullNames[cullMode]);
         drawHud(statusLine, controls);
 
         vglSwapBuffers(GL_FALSE);
