@@ -198,13 +198,17 @@ static float moveSpeed;
 static float roomDiag = 100.0f;
 
 /* Player metrics in raw mesh units: world units * 2048/8 (RoomScale).
- * Collider from Loading_Core.bb (EntityRadius 0.15/0.30), walk speed
- * from Main_Core.bb (0.018/frame, sprint x2.5). */
+ * Collider from Loading_Core.bb (EntityRadius 0.15/0.30); camera at
+ * collider + 0.6, crouch -0.3 (Main_Core.bb 3057); walk speed
+ * 0.018/frame, sprint x2.5, crouch x0.5 (Main_Core.bb). */
 #define PLAYER_RADIUS 38.0f
-#define EYE_HEIGHT 140.0f
+#define EYE_HEIGHT 230.0f
+#define CROUCH_EYE_HEIGHT 153.0f
+#define BODY_DROP 150.0f
 #define STEP_SLACK 25.0f
 #define WALK_SPEED 4.6f
 #define SPRINT_MULT 2.5f
+#define CROUCH_MULT 0.5f
 #define GRAVITY 0.5f
 #define TERMINAL_FALL 20.0f
 
@@ -540,8 +544,14 @@ int main(void) {
         float fwdX = sinf(camYaw), fwdZ = -cosf(camYaw);
         if (walkMode && colWorld) {
             /* Walk: game speeds, gravity, slide along geometry. */
-            float speed = WALK_SPEED
-                        * (inputDown(ACTION_SPRINT) ? SPRINT_MULT : 1.0f);
+            int crouched = inputDown(ACTION_CROUCH);
+            float eye = crouched ? CROUCH_EYE_HEIGHT : EYE_HEIGHT;
+            float speed = WALK_SPEED;
+            if (crouched) {
+                speed *= CROUCH_MULT;
+            } else if (inputDown(ACTION_SPRINT)) {
+                speed *= SPRINT_MULT;
+            }
             camPos[0] += (fwdX * -move.y + cosf(camYaw) * move.x) * speed;
             camPos[2] += (fwdZ * -move.y + sinf(camYaw) * move.x) * speed;
 
@@ -549,13 +559,20 @@ int main(void) {
             if (velY < -TERMINAL_FALL) velY = -TERMINAL_FALL;
             camPos[1] += velY;
 
+            /* Body sphere keeps furniture from passing through the
+             * torso; only its horizontal correction is applied. */
+            float body[3] = { camPos[0], camPos[1] - BODY_DROP, camPos[2] };
+            collisionSpherePush(colWorld, body, PLAYER_RADIUS, NULL);
+            camPos[0] = body[0];
+            camPos[2] = body[2];
+
             int pushedUp = 0;
             collisionSpherePush(colWorld, camPos, PLAYER_RADIUS, &pushedUp);
 
             float hitY;
-            if (collisionRayDown(colWorld, camPos, EYE_HEIGHT + STEP_SLACK,
+            if (collisionRayDown(colWorld, camPos, eye + STEP_SLACK,
                                  &hitY)) {
-                float target = hitY + EYE_HEIGHT;
+                float target = hitY + eye;
                 if (camPos[1] <= target) {
                     camPos[1] = target;
                     velY = 0.0f;

@@ -154,10 +154,14 @@ static void matMul(float out[16], const float a[16], const float b[16]) {
     memcpy(out, r, sizeof(r));
 }
 
-/* Blitz3D rotation: yaw (Y), then pitch (X, sign flipped), then roll (Z). */
+/* Blitz3D rotation: yaw (Y), then pitch (X, sign flipped), then roll (Z).
+ * Blitz space is left-handed and ours is right-handed with the same raw
+ * coordinates, i.e. mirrored through z=0 — that flips the sign of X and
+ * Y axis rotations (M*R*M), so the net signs here are +pitch, -yaw,
+ * +roll. */
 static void matFromEulerBlitz(float m[16], const float eulerDeg[3]) {
-    float p = -eulerDeg[0] * 3.14159265f / 180.0f;
-    float y = eulerDeg[1] * 3.14159265f / 180.0f;
+    float p = eulerDeg[0] * 3.14159265f / 180.0f;
+    float y = -eulerDeg[1] * 3.14159265f / 180.0f;
     float r = eulerDeg[2] * 3.14159265f / 180.0f;
     float cy = cosf(y), sy = sinf(y);
     float cp = cosf(p), sp = sinf(p);
@@ -174,8 +178,10 @@ static void matFromEulerBlitz(float m[16], const float eulerDeg[3]) {
 }
 
 static void matFromQuat(float m[16], const float q[4]) {
-    /* b3d stores w,x,y,z */
-    float w = q[0], x = q[1], y = q[2], z = q[3];
+    /* b3d stores w,x,y,z. Mirroring left-handed Blitz space into our
+     * right-handed space flips the X and Y axis components (the
+     * rotation axis is a pseudovector under reflection). */
+    float w = q[0], x = -q[1], y = -q[2], z = q[3];
     float n = w * w + x * x + y * y + z * z;
     float s = n > 0.0f ? 2.0f / n : 0.0f;
     matIdentity(m);
