@@ -285,9 +285,12 @@ static void templateUploadSome(int idx, uint64_t deadline) {
         rt->cursor++;
         if (sceKernelGetProcessTimeWide() >= deadline) break;
     }
+    /* Always leave the binding clean: the HUD and room draws use
+     * client-side/per-batch pointers, and a buffer left bound here
+     * turns those pointers into bogus buffer offsets (GPU crash). */
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
     if (rt->cursor >= rt->scene->batchCount) {
-        glBindBuffer(GL_ARRAY_BUFFER, 0);
-        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
         rt->state = TPL_READY;
     }
 }
@@ -574,6 +577,10 @@ static void drawText(float x, float y, const char *text) {
 }
 
 static void drawHud(const char *line1, const char *line2) {
+    /* Defense in depth: HUD text uses client-side arrays. */
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
+
     glMatrixMode(GL_PROJECTION);
     glLoadIdentity();
     glOrtho(0, SCREEN_W, SCREEN_H, 0, -1, 1);
