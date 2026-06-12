@@ -21,6 +21,8 @@ add_executable(${PROJECT_NAME}
   src/main.c
   src/input.c
   src/sharedfb_compat.c
+  src/formats/rmesh.c
+  src/formats/b3d.c
 )
 
 target_link_libraries(${PROJECT_NAME}

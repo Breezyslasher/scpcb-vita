@@ -8,6 +8,23 @@ on:
       - '.github/workflows/build-vita-vpk.yml'
 
 jobs:
+  validate-assets:
+    name: Validate game assets with port loaders
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build validator
+        run: |
+          gcc -O2 -Wall -Wextra -o validate_assets \
+            vita/tools/validate_assets.c \
+            vita/src/formats/rmesh.c \
+            vita/src/formats/b3d.c
+
+      - name: Parse all RMesh rooms and B3D models
+        run: ./validate_assets GFX Data
+
   build-vpk:
     name: Build VPK (VitaSDK)
     runs-on: ubuntu-latest

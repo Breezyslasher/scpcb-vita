@@ -22,14 +22,23 @@ Game logic, formats, and structure carry over; the platform layer is new.
    - Manually triggerable CI workflow building the VPK
      (`.github/workflows/build-vita-vpk.yml`).
 
-2. **Asset pipeline**
-   - RMesh (room) and B3D (model) loaders in C++ — CBN's
-     `Src/Graphics/Rooms` and PGE mesh code are the reference.
-   - Texture loading (PNG/JPG via libpng/libjpeg already linked).
-   - Asset conversion step in CI: Vita RAM is 512 MB, so `GFX/` (≈400 MB)
-     needs downscaling/recompression (PVRTC/DXT via texture tools) and
-     `SFX/` (≈120 MB) conversion to OGG/AT9. Assets ship in the VPK or as
-     a separate data package.
+2. **Asset pipeline** *(in progress)*
+   - RMesh room loader *(done — `src/formats/rmesh.c`)*: parses the
+     exact stream `LoadRMesh()` in `Source Code/Map_Core.bb` reads —
+     drawn meshes (2 texture layers, lightmap UVs, vertex colors),
+     invisible collision meshes, and all point entity types including
+     the UE-specific `light_fix` and `mesh` (prop) entities.
+   - B3D model loader *(done — `src/formats/b3d.c`)*: static geometry
+     (TEXS/BRUS/NODE/MESH/VRTS/TRIS); animation chunks (ANIM/KEYS/BONE)
+     are skipped until NPCs are ported.
+   - Both loaders are validated in CI against every shipped asset
+     (`vita/tools/validate_assets.c`, "validate-assets" job): all 149
+     `.rmesh` rooms and 213 `.b3d` models parse.
+   - Still to do: texture loading (PNG/JPG via libpng/libjpeg already
+     linked) and the asset conversion step — Vita RAM is 512 MB, so
+     `GFX/` (≈400 MB) needs downscaling/recompression and `SFX/`
+     (≈120 MB) conversion to OGG/AT9. Assets ship in the VPK or as a
+     separate data package.
 
 3. **Renderer**
    - Replace the shell's vita2d usage with VitaGL (OpenGL 1.x-style API
