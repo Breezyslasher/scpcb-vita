@@ -381,7 +381,6 @@ int main(void) {
     }
 
     unloadRoom();
-    vglEnd();
     sceKernelExitProcess(0);
     return 0;
 }
