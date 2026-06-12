@@ -3,8 +3,8 @@
  *
  * Milestone 4: the facility. Generates the map (CreateMap port), loads
  * room templates on demand as the player approaches, and renders the
- * connected world. Walk mode with gravity/collision is the default;
- * Cross toggles fly mode. Requires the data package at
+ * connected world with sliding doors between rooms (Cross interacts;
+ * D-pad up toggles walk/fly). Requires the data package at
  * ux0:data/scpcb-ue/ and libshacccg.suprx (see vita/README.md).
  */
 
@@ -23,6 +23,7 @@
 #include "formats/rmesh.h"
 #include "formats/texture.h"
 #include "game/collision.h"
+#include "game/doors.h"
 #include "game/mapgen.h"
 #include "input.h"
 #include "render/scene.h"
@@ -191,6 +192,7 @@ typedef struct {
 static RoomTemplateList tplList;
 static TemplateRT *tplRT;
 static GeneratedMap map;
+static DoorList doors;
 static uint32_t mapSeed = 1;
 
 static void templateUnload(TemplateRT *rt) {
@@ -385,10 +387,12 @@ static void regenerateMap(uint32_t seed) {
         templateUnload(&tplRT[i]);
     }
     mapFree(&map);
+    doorsFree(&doors);
     mapSeed = seed;
     if (mapGenerate(&tplList, mapSeed, &map)) {
-        snprintf(statusLine, sizeof(statusLine), "map seed %u: %u rooms",
-                 mapSeed, map.roomCount);
+        doorsGenerate(&map, &tplList, mapSeed ^ 0x9E3779B9u, &doors);
+        snprintf(statusLine, sizeof(statusLine), "map seed %u: %u rooms %u doors",
+                 mapSeed, map.roomCount, doors.count);
     } else {
         snprintf(statusLine, sizeof(statusLine), "map generation failed");
     }
@@ -433,24 +437,17 @@ static void applyDebugState(void) {
     }
 }
 
-static void drawRoomBatches(const RoomPlacement *p, int alphaPass) {
-    const TemplateRT *rt = &tplRT[p->templateIndex];
-    if (rt->state != 1 || !rt->gl) return;
-
-    glPushMatrix();
-    glTranslatef(p->gridX * ROOM_SPACING, 0.0f, p->gridY * ROOM_SPACING);
-    glRotatef(-(float)(p->angle * 90), 0.0f, 1.0f, 0.0f);
-
-    for (uint32_t i = 0; i < rt->scene->batchCount; i++) {
-        const SceneBatch *b = &rt->scene->batches[i];
+static void drawBatchSet(const Scene *scene, const BatchGL *gl, int alphaPass) {
+    for (uint32_t i = 0; i < scene->batchCount; i++) {
+        const SceneBatch *b = &scene->batches[i];
         if (b->alphaClip != alphaPass) continue;
 
-        glBindBuffer(GL_ARRAY_BUFFER, rt->gl[i].vbo);
-        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, rt->gl[i].ibo);
+        glBindBuffer(GL_ARRAY_BUFFER, gl[i].vbo);
+        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, gl[i].ibo);
         glVertexPointer(3, GL_FLOAT, sizeof(SceneVertex), VTX_OFF(x));
         glColorPointer(4, GL_UNSIGNED_BYTE, sizeof(SceneVertex), VTX_OFF(r));
 
-        GLuint diffuse = rt->gl[i].diffuse;
+        GLuint diffuse = gl[i].diffuse;
         if (diffuse) {
             glEnable(GL_TEXTURE_2D);
             glBindTexture(GL_TEXTURE_2D, diffuse);
@@ -468,7 +465,7 @@ static void drawRoomBatches(const RoomPlacement *p, int alphaPass) {
             glDisable(GL_ALPHA_TEST);
         }
 
-        GLuint lightmap = rt->gl[i].lightmap;
+        GLuint lightmap = gl[i].lightmap;
         if (lightmap) {
             glEnable(GL_TEXTURE_2D);
             glBindTexture(GL_TEXTURE_2D, lightmap);
@@ -482,7 +479,122 @@ static void drawRoomBatches(const RoomPlacement *p, int alphaPass) {
     }
     glBindBuffer(GL_ARRAY_BUFFER, 0);
     glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
+}
+
+static void drawRoomBatches(const RoomPlacement *p, int alphaPass) {
+    const TemplateRT *rt = &tplRT[p->templateIndex];
+    if (rt->state != 1 || !rt->gl) return;
+
+    glPushMatrix();
+    glTranslatef(p->gridX * ROOM_SPACING, 0.0f, p->gridY * ROOM_SPACING);
+    glRotatef(-(float)(p->angle * 90), 0.0f, 1.0f, 0.0f);
+    drawBatchSet(rt->scene, rt->gl, alphaPass);
     glPopMatrix();
+}
+
+/* ---------------- door assets and drawing ---------------- */
+
+typedef struct {
+    Scene *scene;
+    BatchGL *gl;
+    float scale[3];
+    int ok;
+} ModelRT;
+
+static ModelRT doorFrameRT, doorPanelRT, heavy1RT, heavy2RT;
+
+/* Build a standalone renderable from a Props b3d. Targets > 0 scale
+ * the model to that extent on the axis (CreateDoor sizes the default
+ * door panel to 203 x 313 x 15 raw units); 0 keeps model units. */
+static void buildModelRT(ModelRT *rt, const char *name, float tw, float th,
+                         float td) {
+    memset(rt, 0, sizeof(*rt));
+    rt->scale[0] = rt->scale[1] = rt->scale[2] = 1.0f;
+    B3DModel *model = propModelGet(name);
+    if (!model) return;
+
+    RMesh empty;
+    memset(&empty, 0, sizeof(empty));
+    rt->scene = sceneBuild(&empty);
+    if (!rt->scene) return;
+    float pos[3] = { 0, 0, 0 }, euler[3] = { 0, 0, 0 }, scl[3] = { 1, 1, 1 };
+    if (!sceneAppendB3D(rt->scene, model, pos, euler, scl, NULL)) return;
+
+    float ext[3];
+    for (int i = 0; i < 3; i++) {
+        ext[i] = rt->scene->boundsMax[i] - rt->scene->boundsMin[i];
+    }
+    if (tw > 0 && ext[0] > 0) rt->scale[0] = tw / ext[0];
+    if (th > 0 && ext[1] > 0) rt->scale[1] = th / ext[1];
+    if (td > 0 && ext[2] > 0) rt->scale[2] = td / ext[2];
+
+    rt->gl = (BatchGL *)calloc(rt->scene->batchCount ? rt->scene->batchCount : 1,
+                               sizeof(BatchGL));
+    if (!rt->gl) return;
+    for (uint32_t i = 0; i < rt->scene->batchCount; i++) {
+        const SceneBatch *b = &rt->scene->batches[i];
+        rt->gl[i].diffuse = textureGet(b->diffuseName);
+        rt->gl[i].lightmap = 0;
+        glGenBuffers(1, &rt->gl[i].vbo);
+        glBindBuffer(GL_ARRAY_BUFFER, rt->gl[i].vbo);
+        glBufferData(GL_ARRAY_BUFFER,
+                     (GLsizeiptr)(b->vertexCount * sizeof(SceneVertex)),
+                     b->vertices, GL_STATIC_DRAW);
+        glGenBuffers(1, &rt->gl[i].ibo);
+        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, rt->gl[i].ibo);
+        glBufferData(GL_ELEMENT_ARRAY_BUFFER,
+                     (GLsizeiptr)(b->indexCount * sizeof(uint16_t)),
+                     b->indices, GL_STATIC_DRAW);
+    }
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
+    rt->ok = 1;
+}
+
+static void buildDoorAssets(void) {
+    buildModelRT(&doorPanelRT, "Door01.b3d", 203.0f, 313.0f, 15.0f);
+    buildModelRT(&heavy1RT, "HeavyDoor1.b3d", 0, 0, 0);
+    buildModelRT(&heavy2RT, "HeavyDoor2.b3d", 0, 0, 0);
+    buildModelRT(&doorFrameRT, "DoorFrame.b3d", 0, 0, 0);
+}
+
+static void drawModelRT(const ModelRT *rt) {
+    if (!rt->ok) return;
+    glPushMatrix();
+    glScalef(rt->scale[0], rt->scale[1], rt->scale[2]);
+    drawBatchSet(rt->scene, rt->gl, 0);
+    glPopMatrix();
+}
+
+static void drawDoors(const float viewPos[3]) {
+    for (uint32_t i = 0; i < doors.count; i++) {
+        const Door *d = &doors.items[i];
+        float dx = d->x - viewPos[0], dz = d->z - viewPos[2];
+        if (dx * dx + dz * dz > VIEW_RANGE * VIEW_RANGE) continue;
+
+        glPushMatrix();
+        glTranslatef(d->x, 0.0f, d->z);
+        glRotatef(-(float)d->angle, 0.0f, 1.0f, 0.0f);
+
+        drawModelRT(&doorFrameRT);
+
+        float slide = doorSlide(d);
+        const ModelRT *p1 = d->heavy ? &heavy1RT : &doorPanelRT;
+        const ModelRT *p2 = d->heavy ? &heavy2RT : &doorPanelRT;
+
+        glPushMatrix();
+        glTranslatef(slide, 0.0f, 0.0f);
+        drawModelRT(p1);
+        glPopMatrix();
+
+        glPushMatrix();
+        glRotatef(180.0f, 0.0f, 1.0f, 0.0f);
+        glTranslatef(slide, 0.0f, 0.0f);
+        drawModelRT(p2);
+        glPopMatrix();
+
+        glPopMatrix();
+    }
 }
 
 static void drawText(float x, float y, const char *text) {
@@ -510,6 +622,10 @@ static void drawText(float x, float y, const char *text) {
 }
 
 static void drawHud(const char *line1, const char *line2) {
+    /* Defense in depth: HUD text uses client-side arrays. */
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
+
     glMatrixMode(GL_PROJECTION);
     glLoadIdentity();
     glOrtho(0, SCREEN_W, SCREEN_H, 0, -1, 1);
@@ -551,6 +667,7 @@ int main(void) {
     int haveData = templatesLoad(ROOMS_INI, &tplList) && tplList.count > 0;
     if (haveData) {
         tplRT = (TemplateRT *)calloc(tplList.count, sizeof(TemplateRT));
+        buildDoorAssets();
         regenerateMap((uint32_t)(sceKernelGetProcessTimeWide() & 0xFFFFFF) | 1u);
     } else {
         snprintf(statusLine, sizeof(statusLine),
@@ -578,9 +695,15 @@ int main(void) {
         }
         if (inputHit(ACTION_INVENTORY)) fogOn = !fogOn;
         if (inputHit(ACTION_USE_ITEM)) cullMode = (cullMode + 1) % 3;
-        if (inputHit(ACTION_INTERACT)) {
+        if (inputHit(ACTION_SAVE)) { /* D-pad up: walk/fly */
             walkMode = !walkMode;
             velY = 0.0f;
+        }
+        if (haveData && inputHit(ACTION_INTERACT)) {
+            doorsToggleNearest(&doors, camPos, 400.0f);
+        }
+        if (haveData) {
+            doorsUpdate(&doors);
         }
         if (haveData && inputHit(ACTION_LEAN_RIGHT)) {
             regenerateMap(mapSeed * 7919u + 17u);
@@ -621,6 +744,7 @@ int main(void) {
 
             int pushedUp = 0;
             pushWorld(camPos, PLAYER_RADIUS, &pushedUp);
+            doorsCollide(&doors, camPos, PLAYER_RADIUS);
 
             float hitY;
             if (rayDownWorld(camPos, eye + STEP_SLACK, &hitY)) {
@@ -656,6 +780,7 @@ int main(void) {
             for (int i = 0; i < activeCount; i++) {
                 drawRoomBatches(activeRooms[i], 0);
             }
+            drawDoors(camPos);
             glDisable(GL_CULL_FACE);
             for (int i = 0; i < activeCount; i++) {
                 drawRoomBatches(activeRooms[i], 1);
@@ -667,9 +792,9 @@ int main(void) {
                  haveData ? roomNameAt(camPos) : "-");
         char line2[200];
         snprintf(line2, sizeof(line2),
-                 "fps=%.0f  x: %s  dpad>: new map  tri: fog=%s  sq: cull=%d"
-                 "  start x3: exit", fps, walkMode ? "WALK" : "fly",
-                 fogOn ? "on" : "off", cullMode);
+                 "fps=%.0f  x: door  up: %s  dpad>: new map  tri: fog=%s"
+                 "  sq: cull=%d  start x3: exit", fps,
+                 walkMode ? "WALK" : "fly", fogOn ? "on" : "off", cullMode);
         drawHud(line1, line2);
 
         vglSwapBuffers(GL_FALSE);

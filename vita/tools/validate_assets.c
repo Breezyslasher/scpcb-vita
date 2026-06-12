@@ -31,6 +31,7 @@
 #include "../src/formats/rmesh.h"
 #include "../src/formats/texture.h"
 #include "../src/game/collision.h"
+#include "../src/game/doors.h"
 #include "../src/game/mapgen.h"
 #include "../src/render/scene.h"
 
@@ -329,20 +330,30 @@ int main(int argc, char **argv) {
     RoomTemplateList tpls;
     if (templatesLoad("Data/rooms.ini", &tpls)) {
         unsigned genOk = 0;
-        unsigned long long totalRooms = 0;
+        unsigned long long totalRooms = 0, totalDoors = 0;
         for (uint32_t seed = 1; seed <= 50; seed++) {
             GeneratedMap m;
             if (mapGenerate(&tpls, seed, &m)) {
                 genOk++;
                 totalRooms += m.roomCount;
+                DoorList dl;
+                if (doorsGenerate(&m, &tpls, seed, &dl)) {
+                    totalDoors += dl.count;
+                    doorsFree(&dl);
+                } else {
+                    printf("FAIL doorgen seed %u\n", seed);
+                    failures = 1;
+                }
                 mapFree(&m);
             } else {
                 printf("FAIL mapgen seed %u\n", seed);
                 failures = 1;
             }
         }
-        printf("MapGen: %u templates, %u/50 seeds ok, avg rooms=%.1f\n",
-               tpls.count, genOk, genOk ? (double)totalRooms / genOk : 0.0);
+        printf("MapGen: %u templates, %u/50 seeds ok, avg rooms=%.1f"
+               " avg doors=%.1f\n",
+               tpls.count, genOk, genOk ? (double)totalRooms / genOk : 0.0,
+               genOk ? (double)totalDoors / genOk : 0.0);
         templatesFree(&tpls);
     } else {
         printf("MapGen: Data/rooms.ini not found (skipped)\n");
