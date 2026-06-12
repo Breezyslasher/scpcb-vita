@@ -47,9 +47,19 @@ Game logic, formats, and structure carry over; the platform layer is new.
      102 MB capped at 256px** — so the renderer budget is a 256px cap
      by default (with the cap per-texture-class tunable later), well
      within the Vita's 512 MB.
-   - Still to do: `SFX/` (≈120 MB) conversion to OGG/AT9, and the
-     packaging decision (assets in the VPK vs. a separate data
-     download).
+   - Audio: `SFX/` already ships as 959 Ogg Vorbis files, which decode
+     fine on the Vita (libvorbis) — no conversion step needed.
+   - Device packaging *(done — `tools/convert_assets.c`)*: assets ship
+     as a separate data package rather than inside the VPK (keeps the
+     bubble small and lets code and data update independently). The
+     packager stages `Data/ + GFX/ + SFX/`, downscales world textures
+     (`GFX/Map`, `GFX/NPCs`) to a 256px cap while copying UI art,
+     geometry and audio verbatim, and preserves all filenames so
+     texture references keep resolving. Result: 459 MB → 304 MB on
+     disk, 150 MB decoded RGBA8. The CI job (manual trigger) validates
+     the staged tree with the same loaders, then uploads it as the
+     `scpcb-ue-vita-data` artifact; contents install to
+     `ux0:data/scpcb-ue/`.
 
 3. **Renderer**
    - Replace the shell's vita2d usage with VitaGL (OpenGL 1.x-style API

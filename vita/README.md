@@ -12,11 +12,16 @@ Game systems are ported on top of this shell — the plan is in
 ## Building from CI
 
 Go to the repository's **Actions** tab → **Build PS Vita VPK** → **Run
-workflow**. When the run finishes, download the `scpcb-ue-vita-vpk` artifact;
-it contains `scpcb_ue_vita.vpk`. The workflow also runs automatically on any
-push that touches `vita/`.
+workflow**. A manually triggered run produces two artifacts (pushes touching
+`vita/` rebuild only the first):
 
-Install the VPK with VitaShell on a device running HENkaku/h-encore.
+- `scpcb-ue-vita-vpk` — the installable `scpcb_ue_vita.vpk`.
+- `scpcb-ue-vita-data` — the game data, with world textures downscaled to
+  the Vita memory budget.
+
+On a device running HENkaku/h-encore: install the VPK with VitaShell, then
+copy the data package contents to `ux0:data/scpcb-ue/` (so that e.g.
+`ux0:data/scpcb-ue/GFX/Map/...` exists).
 
 ## Building locally
 
