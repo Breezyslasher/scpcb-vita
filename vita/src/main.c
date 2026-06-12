@@ -1,30 +1,29 @@
 /*
  * SCP - Containment Breach Ultimate Edition Reborn — PS Vita port.
  *
- * Milestone 3: VitaGL room viewer. Loads .rmesh rooms from the data
- * package (ux0:data/scpcb-ue/), uploads their textures (capped to the
- * memory budget), and renders geometry with lightmaps. Left stick
- * moves, right stick looks, D-pad left/right cycles rooms.
- *
- * Requires libshacccg.suprx (vitaGL runtime shader compiler) — see
- * vita/README.md.
+ * Milestone 4: the facility. Generates the map (CreateMap port), loads
+ * room templates on demand as the player approaches, and renders the
+ * connected world. Walk mode with gravity/collision is the default;
+ * Cross toggles fly mode. Requires the data package at
+ * ux0:data/scpcb-ue/ and libshacccg.suprx (see vita/README.md).
  */
 
 #include <dirent.h>
 #include <math.h>
 #include <stddef.h>
-#include <strings.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 
 #include <psp2/kernel/processmgr.h>
-#include <psp2/kernel/threadmgr.h>
 #include <vitaGL.h>
 
+#include "formats/b3d.h"
 #include "formats/rmesh.h"
 #include "formats/texture.h"
 #include "game/collision.h"
+#include "game/mapgen.h"
 #include "input.h"
 #include "render/scene.h"
 
@@ -39,12 +38,31 @@
 #define MAP_DIR DATA_ROOT "/GFX/Map"
 #define MAP_TEXTURES_DIR DATA_ROOT "/GFX/Map/Textures"
 #define PROPS_DIR DATA_ROOT "/GFX/Map/Props"
+#define ROOMS_INI DATA_ROOT "/Data/rooms.ini"
 
-/* ---------------- texture cache ---------------- */
+/* RoomSpacing is 8 world units = 2048 raw mesh units. */
+#define ROOM_SPACING 2048.0f
+#define VIEW_RANGE 3500.0f
+
+/* Player metrics in raw mesh units (see Loading_Core.bb/Main_Core.bb):
+ * collider 0.15/0.30, camera at collider + 0.6, crouch -0.3, walk
+ * 0.018/frame, sprint x2.5, crouch x0.5. */
+#define PLAYER_RADIUS 38.0f
+#define EYE_HEIGHT 230.0f
+#define CROUCH_EYE_HEIGHT 153.0f
+#define BODY_DROP 150.0f
+#define STEP_SLACK 25.0f
+#define WALK_SPEED 4.6f
+#define SPRINT_MULT 2.5f
+#define CROUCH_MULT 0.5f
+#define GRAVITY 0.5f
+#define TERMINAL_FALL 20.0f
+
+/* ---------------- texture cache (global, lives for the map) -------- */
 
 typedef struct {
     char *name;
-    GLuint handle; /* 0 = lookup failed (cached negative) */
+    GLuint handle;
 } CachedTexture;
 
 static CachedTexture *texCache;
@@ -98,19 +116,17 @@ static void textureCacheClear(void) {
     texCacheCount = 0;
 }
 
-/* ---------------- prop model cache (per room) ---------------- */
+/* ---------------- prop model cache ---------------- */
 
 typedef struct {
     char *name;
-    B3DModel *model; /* NULL = load failed (cached negative) */
+    B3DModel *model;
 } CachedModel;
 
 static CachedModel *modelCache;
 static unsigned modelCacheCount;
 
 static B3DModel *propModelGet(const char *rawName) {
-    /* The game strips a trailing .b3d, then appends .b3d
-     * (Map_Core.bb "mesh" entity). Use the final path component. */
     const char *base = rawName;
     for (const char *p = rawName; *p; p++) {
         if (*p == '\\' || *p == '/') base = p + 1;
@@ -156,29 +172,7 @@ static void modelCacheClear(void) {
     modelCacheCount = 0;
 }
 
-/* ---------------- room list ---------------- */
-
-static char **roomList;
-static unsigned roomCount;
-
-static void scanRooms(void) {
-    DIR *d = opendir(MAP_DIR);
-    if (!d) return;
-    struct dirent *de;
-    while ((de = readdir(d)) != NULL) {
-        const char *dot = strrchr(de->d_name, '.');
-        if (!dot || strcasecmp(dot, ".rmesh") != 0) continue;
-        char **grown = (char **)realloc(roomList,
-                                        (roomCount + 1) * sizeof(char *));
-        if (!grown) break;
-        roomList = grown;
-        roomList[roomCount] = strdup(de->d_name);
-        if (roomList[roomCount]) roomCount++;
-    }
-    closedir(d);
-}
-
-/* ---------------- loaded room (GL side) ---------------- */
+/* ---------------- room templates (runtime side) ---------------- */
 
 typedef struct {
     GLuint diffuse;
@@ -187,159 +181,227 @@ typedef struct {
     GLuint ibo;
 } BatchGL;
 
-static Scene *scene;
-static BatchGL *batchTex;
-static char roomName[256];
-static char statusLine[512];
+typedef struct {
+    int state; /* 0 = not loaded, 1 = ok, -1 = failed */
+    Scene *scene;
+    BatchGL *gl;
+    CollisionWorld *col;
+} TemplateRT;
 
-static float camPos[3];
-static float camYaw, camPitch;
-static float moveSpeed;
-static float roomDiag = 100.0f;
+static RoomTemplateList tplList;
+static TemplateRT *tplRT;
+static GeneratedMap map;
+static uint32_t mapSeed = 1;
 
-/* Player metrics in raw mesh units: world units * 2048/8 (RoomScale).
- * Collider from Loading_Core.bb (EntityRadius 0.15/0.30); camera at
- * collider + 0.6, crouch -0.3 (Main_Core.bb 3057); walk speed
- * 0.018/frame, sprint x2.5, crouch x0.5 (Main_Core.bb). */
-#define PLAYER_RADIUS 38.0f
-#define EYE_HEIGHT 230.0f
-#define CROUCH_EYE_HEIGHT 153.0f
-#define BODY_DROP 150.0f
-#define STEP_SLACK 25.0f
-#define WALK_SPEED 4.6f
-#define SPRINT_MULT 2.5f
-#define CROUCH_MULT 0.5f
-#define GRAVITY 0.5f
-#define TERMINAL_FALL 20.0f
-
-static CollisionWorld *colWorld;
-static int walkMode = 0;
-static float velY = 0.0f;
-
-/* Debug toggles for on-device diagnosis (see HUD). */
-static int cullMode = 0;  /* 0 = off, 1 = CW front, 2 = CCW; assets carry
-                           * mixed winding, so default off */
-static int fogOn = 1;
-
-static void unloadRoom(void) {
-    if (batchTex && scene) {
-        for (uint32_t i = 0; i < scene->batchCount; i++) {
-            if (batchTex[i].vbo) glDeleteBuffers(1, &batchTex[i].vbo);
-            if (batchTex[i].ibo) glDeleteBuffers(1, &batchTex[i].ibo);
+static void templateUnload(TemplateRT *rt) {
+    if (rt->gl && rt->scene) {
+        for (uint32_t i = 0; i < rt->scene->batchCount; i++) {
+            if (rt->gl[i].vbo) glDeleteBuffers(1, &rt->gl[i].vbo);
+            if (rt->gl[i].ibo) glDeleteBuffers(1, &rt->gl[i].ibo);
         }
     }
-    free(batchTex);
-    batchTex = NULL;
-    sceneFree(scene);
-    scene = NULL;
-    collisionFree(colWorld);
-    colWorld = NULL;
-    textureCacheClear();
-    modelCacheClear();
+    free(rt->gl);
+    sceneFree(rt->scene);
+    collisionFree(rt->col);
+    memset(rt, 0, sizeof(*rt));
 }
 
-static void loadRoom(unsigned index) {
-    unloadRoom();
-    if (roomCount == 0) return;
-    snprintf(roomName, sizeof(roomName), "%s", roomList[index % roomCount]);
+static void templateEnsure(int idx) {
+    TemplateRT *rt = &tplRT[idx];
+    if (rt->state != 0) return;
+    rt->state = -1;
+
+    const RoomTemplateInfo *info = &tplList.items[idx];
+    if (!info->meshPath) return;
 
     char path[1024];
-    snprintf(path, sizeof(path), "%s/%s", MAP_DIR, roomName);
+    snprintf(path, sizeof(path), MAP_DIR "/%s", info->meshPath);
     char err[128];
     RMesh *mesh = rmeshLoadFile(path, err, sizeof(err));
-    if (!mesh) {
-        snprintf(statusLine, sizeof(statusLine), "%s: load failed (%s)",
-                 roomName, err);
-        return;
-    }
-    scene = sceneBuild(mesh);
-    if (!scene) {
-        rmeshFree(mesh);
-        snprintf(statusLine, sizeof(statusLine), "%s: out of memory", roomName);
-        return;
-    }
+    if (!mesh) return;
 
-    /* Place the room's B3D props ("mesh" entities). Entity coords are
-     * already in mesh-vertex space: the game multiplies them by
-     * RoomScale but also scales the whole room object by RoomScale,
-     * and prop scale is local under that parent (Rooms_Core.bb 4226,
-     * Map_Core.bb CreateProp). */
-    unsigned props = 0, propFails = 0;
+    rt->scene = sceneBuild(mesh);
+    if (!rt->scene) {
+        rmeshFree(mesh);
+        return;
+    }
     for (uint32_t i = 0; i < mesh->entityCount; i++) {
         const RMeshEntity *e = &mesh->entities[i];
         if (e->type != RMESH_ENTITY_PROP || !e->u.prop.file) continue;
         B3DModel *model = propModelGet(e->u.prop.file);
-        if (!model) {
-            propFails++;
-            continue;
-        }
+        if (!model) continue;
         float pos[3] = { e->x, e->y, e->z };
         float euler[3] = { e->u.prop.pitch, e->u.prop.yaw, e->u.prop.roll };
         float scl[3] = { e->u.prop.scaleX, e->u.prop.scaleY, e->u.prop.scaleZ };
-        if (sceneAppendB3D(scene, model, pos, euler, scl, e->u.prop.texture)) {
-            props++;
-        }
+        sceneAppendB3D(rt->scene, model, pos, euler, scl, e->u.prop.texture);
     }
-    colWorld = collisionBuild(scene, mesh);
+    rt->col = collisionBuild(rt->scene, mesh);
     rmeshFree(mesh);
-    velY = 0.0f;
 
-    batchTex = (BatchGL *)calloc(scene->batchCount ? scene->batchCount : 1,
-                                 sizeof(BatchGL));
-    unsigned missing = 0;
-    unsigned long long verts = 0;
-    for (uint32_t i = 0; i < scene->batchCount; i++) {
-        const SceneBatch *b = &scene->batches[i];
-        verts += b->vertexCount;
-        if (batchTex) {
-            batchTex[i].diffuse = textureGet(b->diffuseName);
-            batchTex[i].lightmap = textureGet(b->lightmapName);
-            if (b->diffuseName && !batchTex[i].diffuse) {
-                missing++;
-            }
-            /* Static geometry goes into VBOs once; drawing from
-             * client-side arrays re-uploads every frame and was the
-             * cause of single-digit FPS. */
-            glGenBuffers(1, &batchTex[i].vbo);
-            glBindBuffer(GL_ARRAY_BUFFER, batchTex[i].vbo);
-            glBufferData(GL_ARRAY_BUFFER,
-                         (GLsizeiptr)(b->vertexCount * sizeof(SceneVertex)),
-                         b->vertices, GL_STATIC_DRAW);
-            glGenBuffers(1, &batchTex[i].ibo);
-            glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, batchTex[i].ibo);
-            glBufferData(GL_ELEMENT_ARRAY_BUFFER,
-                         (GLsizeiptr)(b->indexCount * sizeof(uint16_t)),
-                         b->indices, GL_STATIC_DRAW);
-        }
+    rt->gl = (BatchGL *)calloc(rt->scene->batchCount ? rt->scene->batchCount : 1,
+                               sizeof(BatchGL));
+    if (!rt->gl) return;
+    for (uint32_t i = 0; i < rt->scene->batchCount; i++) {
+        const SceneBatch *b = &rt->scene->batches[i];
+        rt->gl[i].diffuse = textureGet(b->diffuseName);
+        rt->gl[i].lightmap = textureGet(b->lightmapName);
+        glGenBuffers(1, &rt->gl[i].vbo);
+        glBindBuffer(GL_ARRAY_BUFFER, rt->gl[i].vbo);
+        glBufferData(GL_ARRAY_BUFFER,
+                     (GLsizeiptr)(b->vertexCount * sizeof(SceneVertex)),
+                     b->vertices, GL_STATIC_DRAW);
+        glGenBuffers(1, &rt->gl[i].ibo);
+        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, rt->gl[i].ibo);
+        glBufferData(GL_ELEMENT_ARRAY_BUFFER,
+                     (GLsizeiptr)(b->indexCount * sizeof(uint16_t)),
+                     b->indices, GL_STATIC_DRAW);
     }
     glBindBuffer(GL_ARRAY_BUFFER, 0);
     glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
+    rt->state = 1;
+}
 
-    /* Start the camera in the middle of the room; scale movement to
-     * room size so units don't matter. */
-    float size[3];
-    for (int i = 0; i < 3; i++) {
-        camPos[i] = (scene->boundsMin[i] + scene->boundsMax[i]) * 0.5f;
-        size[i] = scene->boundsMax[i] - scene->boundsMin[i];
+/* ---------------- placement transforms ---------------- */
+
+/* Render transform: world = T(center) * Ry(-angle * 90deg) * local
+ * (the -angle mirrors Blitz's left-handed rotation into our space). */
+
+static void worldToLocal(const RoomPlacement *p, const float w[3],
+                         float l[3]) {
+    float dx = w[0] - p->gridX * ROOM_SPACING;
+    float dy = w[1];
+    float dz = w[2] - p->gridY * ROOM_SPACING;
+    switch (p->angle & 3) {
+        case 0: l[0] = dx;  l[2] = dz;  break;
+        case 1: l[0] = -dz; l[2] = dx;  break; /* Ry(+90) */
+        case 2: l[0] = -dx; l[2] = -dz; break;
+        case 3: l[0] = dz;  l[2] = -dx; break;
     }
-    float diag = sqrtf(size[0] * size[0] + size[1] * size[1] + size[2] * size[2]);
-    roomDiag = diag > 0.0f ? diag : 100.0f;
-    moveSpeed = roomDiag / 240.0f;
-    camYaw = 0.0f;
-    camPitch = 0.0f;
+    l[1] = dy;
+}
 
-    snprintf(statusLine, sizeof(statusLine),
-             "%s  batches=%u verts=%llu texMissing=%u props=%u/%u", roomName,
-             scene->batchCount, verts, missing, props, props + propFails);
+static void localToWorld(const RoomPlacement *p, const float l[3],
+                         float w[3]) {
+    float x = 0.0f, z = 0.0f;
+    switch (p->angle & 3) {
+        case 0: x = l[0];  z = l[2];  break;
+        case 1: x = l[2];  z = -l[0]; break; /* Ry(-90) */
+        case 2: x = -l[0]; z = -l[2]; break;
+        case 3: x = -l[2]; z = l[0];  break;
+    }
+    w[0] = x + p->gridX * ROOM_SPACING;
+    w[1] = l[1];
+    w[2] = z + p->gridY * ROOM_SPACING;
+}
+
+/* Active set: placements within one cell of the player. */
+static const RoomPlacement *activeRooms[16];
+static int activeCount;
+
+static void updateActiveRooms(const float pos[3]) {
+    int px = (int)floorf(pos[0] / ROOM_SPACING + 0.5f);
+    int py = (int)floorf(pos[2] / ROOM_SPACING + 0.5f);
+    activeCount = 0;
+    for (uint32_t i = 0; i < map.roomCount; i++) {
+        const RoomPlacement *p = &map.rooms[i];
+        int dx = p->gridX - px, dy = p->gridY - py;
+        if (dx >= -1 && dx <= 1 && dy >= -1 && dy <= 1
+            && activeCount < 16) {
+            templateEnsure(p->templateIndex);
+            if (tplRT[p->templateIndex].state == 1) {
+                activeRooms[activeCount++] = p;
+            }
+        }
+    }
+}
+
+static const char *roomNameAt(const float pos[3]) {
+    int px = (int)floorf(pos[0] / ROOM_SPACING + 0.5f);
+    int py = (int)floorf(pos[2] / ROOM_SPACING + 0.5f);
+    for (uint32_t i = 0; i < map.roomCount; i++) {
+        if (map.rooms[i].gridX == px && map.rooms[i].gridY == py) {
+            return tplList.items[map.rooms[i].templateIndex].name;
+        }
+    }
+    return "(void)";
+}
+
+/* ---------------- collision across active rooms ---------------- */
+
+static void pushWorld(float pos[3], float radius, int *pushedUp) {
+    for (int i = 0; i < activeCount; i++) {
+        const RoomPlacement *p = activeRooms[i];
+        const CollisionWorld *col = tplRT[p->templateIndex].col;
+        if (!col) continue;
+        float local[3];
+        worldToLocal(p, pos, local);
+        int up = 0;
+        if (collisionSpherePush(col, local, radius, &up)) {
+            localToWorld(p, local, pos);
+        }
+        if (up && pushedUp) *pushedUp = 1;
+    }
+}
+
+static int rayDownWorld(const float origin[3], float maxDist, float *hitY) {
+    int hit = 0;
+    float best = -1e30f;
+    for (int i = 0; i < activeCount; i++) {
+        const RoomPlacement *p = activeRooms[i];
+        const CollisionWorld *col = tplRT[p->templateIndex].col;
+        if (!col) continue;
+        float local[3], y;
+        worldToLocal(p, origin, local);
+        if (collisionRayDown(col, local, maxDist, &y) && y > best) {
+            best = y;
+            hit = 1;
+        }
+    }
+    if (hit) *hitY = best;
+    return hit;
+}
+
+/* ---------------- player ---------------- */
+
+static float camPos[3];
+static float camYaw, camPitch;
+static float velY = 0.0f;
+static int walkMode = 1;
+static int cullMode = 0;
+static int fogOn = 1;
+static char statusLine[256];
+
+static void spawnPlayer(void) {
+    camPos[0] = map.startX * ROOM_SPACING;
+    camPos[1] = 400.0f;
+    camPos[2] = map.startY * ROOM_SPACING;
+    camYaw = 3.14159265f; /* face into the facility (-z) */
+    camPitch = 0.0f;
+    velY = 0.0f;
+}
+
+static void regenerateMap(uint32_t seed) {
+    for (uint32_t i = 0; i < tplList.count; i++) {
+        templateUnload(&tplRT[i]);
+    }
+    mapFree(&map);
+    mapSeed = seed;
+    if (mapGenerate(&tplList, mapSeed, &map)) {
+        snprintf(statusLine, sizeof(statusLine), "map seed %u: %u rooms",
+                 mapSeed, map.roomCount);
+    } else {
+        snprintf(statusLine, sizeof(statusLine), "map generation failed");
+    }
+    spawnPlayer();
 }
 
 /* ---------------- rendering ---------------- */
 
+#define VTX_OFF(field) ((const void *)offsetof(SceneVertex, field))
+
 static void setPerspective(void) {
-    /* Room-relative depth range keeps depth precision sane regardless
-     * of the file's units. */
-    float zNear = roomDiag / 2000.0f;
-    float zFar = roomDiag * 4.0f;
+    float zNear = 4.0f;
+    float zFar = VIEW_RANGE * 3.0f;
     float fovY = 60.0f * 3.14159265f / 180.0f;
     float top = zNear * tanf(fovY * 0.5f);
     float right = top * ((float)SCREEN_W / (float)SCREEN_H);
@@ -354,40 +416,41 @@ static void applyDebugState(void) {
     } else {
         glEnable(GL_CULL_FACE);
         glCullFace(GL_BACK);
-        /* Blitz3D/DirectX winding: clockwise faces are front. */
         glFrontFace(cullMode == 1 ? GL_CW : GL_CCW);
     }
 
     if (fogOn) {
-        /* The game runs linear black fog from ~0.1 to ~6 world units
-         * against rooms ~8 units wide; scale the same ratios to the
-         * room diagonal. */
+        /* Game fog: ~0.1..6 world units (Main_Core.bb), here in raw
+         * units against 8-unit rooms. */
         GLfloat fogColor[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
         glEnable(GL_FOG);
         glFogf(GL_FOG_MODE, GL_LINEAR);
         glFogfv(GL_FOG_COLOR, fogColor);
-        glFogf(GL_FOG_START, roomDiag * 0.05f);
-        glFogf(GL_FOG_END, roomDiag * 1.1f);
+        glFogf(GL_FOG_START, 100.0f);
+        glFogf(GL_FOG_END, VIEW_RANGE * 0.75f);
     } else {
         glDisable(GL_FOG);
     }
 }
 
-#define VTX_OFF(field) ((const void *)offsetof(SceneVertex, field))
+static void drawRoomBatches(const RoomPlacement *p, int alphaPass) {
+    const TemplateRT *rt = &tplRT[p->templateIndex];
+    if (rt->state != 1 || !rt->gl) return;
 
-static void drawBatches(int alphaPass) {
-    if (!batchTex) return;
-    for (uint32_t i = 0; i < scene->batchCount; i++) {
-        const SceneBatch *b = &scene->batches[i];
+    glPushMatrix();
+    glTranslatef(p->gridX * ROOM_SPACING, 0.0f, p->gridY * ROOM_SPACING);
+    glRotatef(-(float)(p->angle * 90), 0.0f, 1.0f, 0.0f);
+
+    for (uint32_t i = 0; i < rt->scene->batchCount; i++) {
+        const SceneBatch *b = &rt->scene->batches[i];
         if (b->alphaClip != alphaPass) continue;
 
-        glBindBuffer(GL_ARRAY_BUFFER, batchTex[i].vbo);
-        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, batchTex[i].ibo);
+        glBindBuffer(GL_ARRAY_BUFFER, rt->gl[i].vbo);
+        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, rt->gl[i].ibo);
         glVertexPointer(3, GL_FLOAT, sizeof(SceneVertex), VTX_OFF(x));
         glColorPointer(4, GL_UNSIGNED_BYTE, sizeof(SceneVertex), VTX_OFF(r));
 
-        /* Pass 1: diffuse * vertex color. */
-        GLuint diffuse = batchTex[i].diffuse;
+        GLuint diffuse = rt->gl[i].diffuse;
         if (diffuse) {
             glEnable(GL_TEXTURE_2D);
             glBindTexture(GL_TEXTURE_2D, diffuse);
@@ -405,8 +468,7 @@ static void drawBatches(int alphaPass) {
             glDisable(GL_ALPHA_TEST);
         }
 
-        /* Pass 2: additive lightmap (Blitz TextureBlend 3). */
-        GLuint lightmap = batchTex[i].lightmap;
+        GLuint lightmap = rt->gl[i].lightmap;
         if (lightmap) {
             glEnable(GL_TEXTURE_2D);
             glBindTexture(GL_TEXTURE_2D, lightmap);
@@ -420,13 +482,13 @@ static void drawBatches(int alphaPass) {
     }
     glBindBuffer(GL_ARRAY_BUFFER, 0);
     glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
+    glPopMatrix();
 }
 
 static void drawText(float x, float y, const char *text) {
-    static char buf[64000]; /* 16 bytes/vertex, 4 vertices/quad: 1000 quads */
+    static char buf[64000];
     int quads = stb_easy_font_print(x, y, (char *)text, NULL, buf, sizeof(buf));
 
-    /* stb_easy_font emits quads; draw as triangles for safety. */
     static GLfloat tris[1000 * 6 * 2];
     int v = 0;
     for (int q = 0; q < quads && v + 12 <= (int)(sizeof(tris) / sizeof(tris[0])); q++) {
@@ -463,7 +525,7 @@ static void drawHud(const char *line1, const char *line2) {
     glColor4f(1.0f, 1.0f, 1.0f, 1.0f);
 
     glPushMatrix();
-    glScalef(2.0f, 2.0f, 1.0f); /* easy_font is tiny at native scale */
+    glScalef(2.0f, 2.0f, 1.0f);
     if (line1) drawText(8, 8, line1);
     if (line2) drawText(8, 22, line2);
     glPopMatrix();
@@ -479,20 +541,20 @@ int main(void) {
     glViewport(0, 0, SCREEN_W, SCREEN_H);
     glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
     glEnable(GL_DEPTH_TEST);
-    glDepthFunc(GL_LEQUAL); /* lightmap pass re-draws at equal depth */
+    glDepthFunc(GL_LEQUAL);
     glEnableClientState(GL_VERTEX_ARRAY);
     glEnableClientState(GL_COLOR_ARRAY);
     glEnableClientState(GL_TEXTURE_COORD_ARRAY);
 
     inputInit();
-    scanRooms();
 
-    unsigned roomIndex = 0;
-    if (roomCount > 0) {
-        loadRoom(roomIndex);
+    int haveData = templatesLoad(ROOMS_INI, &tplList) && tplList.count > 0;
+    if (haveData) {
+        tplRT = (TemplateRT *)calloc(tplList.count, sizeof(TemplateRT));
+        regenerateMap((uint32_t)(sceKernelGetProcessTimeWide() & 0xFFFFFF) | 1u);
     } else {
         snprintf(statusLine, sizeof(statusLine),
-                 "No rooms found. Install the data package to " DATA_ROOT "/");
+                 "Data not found. Install the data package to " DATA_ROOT "/");
     }
 
     int running = 1;
@@ -508,6 +570,7 @@ int main(void) {
             fpsFrames = 0;
             fpsLast = now;
         }
+
         inputUpdate();
 
         if (inputHit(ACTION_MENU)) {
@@ -515,20 +578,14 @@ int main(void) {
         }
         if (inputHit(ACTION_INVENTORY)) fogOn = !fogOn;
         if (inputHit(ACTION_USE_ITEM)) cullMode = (cullMode + 1) % 3;
-        if (roomCount > 0) {
-            if (inputHit(ACTION_LEAN_RIGHT)) {
-                roomIndex = (roomIndex + 1) % roomCount;
-                loadRoom(roomIndex);
-            }
-            if (inputHit(ACTION_LEAN_LEFT)) {
-                roomIndex = (roomIndex + roomCount - 1) % roomCount;
-                loadRoom(roomIndex);
-            }
+        if (inputHit(ACTION_INTERACT)) {
+            walkMode = !walkMode;
+            velY = 0.0f;
+        }
+        if (haveData && inputHit(ACTION_LEAN_RIGHT)) {
+            regenerateMap(mapSeed * 7919u + 17u);
         }
 
-        /* Camera: right stick looks, left stick moves on the view plane,
-         * sprint (L) doubles speed, crouch (Circle) moves down, blink (R)
-         * moves up. */
         StickState look = inputLook();
         StickState move = inputMove();
         camYaw += look.x * 0.04f;
@@ -536,14 +593,12 @@ int main(void) {
         if (camPitch > 1.5f) camPitch = 1.5f;
         if (camPitch < -1.5f) camPitch = -1.5f;
 
-        if (inputHit(ACTION_INTERACT)) {
-            walkMode = !walkMode;
-            velY = 0.0f;
+        if (haveData) {
+            updateActiveRooms(camPos);
         }
 
         float fwdX = sinf(camYaw), fwdZ = -cosf(camYaw);
-        if (walkMode && colWorld) {
-            /* Walk: game speeds, gravity, slide along geometry. */
+        if (walkMode && haveData) {
             int crouched = inputDown(ACTION_CROUCH);
             float eye = crouched ? CROUCH_EYE_HEIGHT : EYE_HEIGHT;
             float speed = WALK_SPEED;
@@ -559,19 +614,16 @@ int main(void) {
             if (velY < -TERMINAL_FALL) velY = -TERMINAL_FALL;
             camPos[1] += velY;
 
-            /* Body sphere keeps furniture from passing through the
-             * torso; only its horizontal correction is applied. */
             float body[3] = { camPos[0], camPos[1] - BODY_DROP, camPos[2] };
-            collisionSpherePush(colWorld, body, PLAYER_RADIUS, NULL);
+            pushWorld(body, PLAYER_RADIUS, NULL);
             camPos[0] = body[0];
             camPos[2] = body[2];
 
             int pushedUp = 0;
-            collisionSpherePush(colWorld, camPos, PLAYER_RADIUS, &pushedUp);
+            pushWorld(camPos, PLAYER_RADIUS, &pushedUp);
 
             float hitY;
-            if (collisionRayDown(colWorld, camPos, eye + STEP_SLACK,
-                                 &hitY)) {
+            if (rayDownWorld(camPos, eye + STEP_SLACK, &hitY)) {
                 float target = hitY + eye;
                 if (camPos[1] <= target) {
                     camPos[1] = target;
@@ -579,10 +631,10 @@ int main(void) {
                 }
             }
             if (pushedUp && velY < 0.0f) velY = 0.0f;
+            /* Fell out of the world: respawn. */
+            if (camPos[1] < -4000.0f) spawnPlayer();
         } else {
-            /* Fly: room-relative speed, vertical on R/Circle. */
-            float speed = moveSpeed
-                        * (inputDown(ACTION_SPRINT) ? 2.0f : 1.0f);
+            float speed = 30.0f * (inputDown(ACTION_SPRINT) ? 3.0f : 1.0f);
             camPos[0] += (fwdX * -move.y + cosf(camYaw) * move.x) * speed;
             camPos[2] += (fwdZ * -move.y + sinf(camYaw) * move.x) * speed;
             if (inputDown(ACTION_BLINK)) camPos[1] += speed;
@@ -591,7 +643,7 @@ int main(void) {
 
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
 
-        if (scene) {
+        if (haveData && activeCount > 0) {
             setPerspective();
             applyDebugState();
             glMatrixMode(GL_MODELVIEW);
@@ -601,25 +653,38 @@ int main(void) {
             glTranslatef(-camPos[0], -camPos[1], -camPos[2]);
 
             glColor4f(1, 1, 1, 1);
-            drawBatches(0); /* opaque */
-            /* The game flip-copies alpha surfaces (double-sided). */
+            for (int i = 0; i < activeCount; i++) {
+                drawRoomBatches(activeRooms[i], 0);
+            }
             glDisable(GL_CULL_FACE);
-            drawBatches(1); /* alpha-clipped */
+            for (int i = 0; i < activeCount; i++) {
+                drawRoomBatches(activeRooms[i], 1);
+            }
         }
 
-        static const char *cullNames[3] = { "off", "cw", "ccw" };
-        char controls[200];
-        snprintf(controls, sizeof(controls),
-                 "fps=%.0f  x: %s  dpad: room %u/%u  tri: fog=%s  sq: cull=%s"
+        char line1[320];
+        snprintf(line1, sizeof(line1), "%s   [%s]", statusLine,
+                 haveData ? roomNameAt(camPos) : "-");
+        char line2[200];
+        snprintf(line2, sizeof(line2),
+                 "fps=%.0f  x: %s  dpad>: new map  tri: fog=%s  sq: cull=%d"
                  "  start x3: exit", fps, walkMode ? "WALK" : "fly",
-                 roomCount ? roomIndex + 1 : 0, roomCount,
-                 fogOn ? "on" : "off", cullNames[cullMode]);
-        drawHud(statusLine, controls);
+                 fogOn ? "on" : "off", cullMode);
+        drawHud(line1, line2);
 
         vglSwapBuffers(GL_FALSE);
     }
 
-    unloadRoom();
+    if (haveData) {
+        for (uint32_t i = 0; i < tplList.count; i++) {
+            templateUnload(&tplRT[i]);
+        }
+        free(tplRT);
+        mapFree(&map);
+        templatesFree(&tplList);
+    }
+    textureCacheClear();
+    modelCacheClear();
     sceKernelExitProcess(0);
     return 0;
 }

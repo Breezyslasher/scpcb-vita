@@ -25,6 +25,7 @@ add_executable(${PROJECT_NAME}
   src/formats/texture.c
   src/render/scene.c
   src/game/collision.c
+  src/game/mapgen.c
 )
 
 # vitaGL contains C++ objects; link with the C++ runtime.
