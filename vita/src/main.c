@@ -660,6 +660,10 @@ static int inventory[MAX_INVENTORY];
 static unsigned inventoryCount;
 static int invOpen;
 static int invSel; /* selected slot index while the inventory is open */
+static int docOpen; /* reading a document full-screen */
+static GLuint docTex;
+static char docTexName[80];
+static float docW, docH;
 static ModelRT itemRT[sizeof(ITEM_TEMPLATES) / sizeof(ITEM_TEMPLATES[0])];
 static float itemSpin;
 
@@ -1000,10 +1004,64 @@ static void drawInventory(void) {
         drawText(ox * 0.5f, (oy + gridH + 16.0f) * 0.5f,
                  ITEM_TEMPLATES[inventory[invSel]].name);
         glColor4f(1, 1, 1, 1);
+        if (ITEM_TEMPLATES[inventory[invSel]].docImage[0]) {
+            drawText(ox * 0.5f, (oy + gridH + 30.0f) * 0.5f, "Cross: Read");
+        }
     } else if (inventoryCount == 0) {
         drawText(ox * 0.5f, (oy + gridH + 16.0f) * 0.5f, "(empty)");
     }
     glPopMatrix();
+}
+
+/* Documents render full-screen, so load them sharper than the world
+ * texture cap (581x819 native stays crisp at a 1024 cap). One doc is
+ * resident at a time. */
+static void openDocument(const char *imgName) {
+    if (!imgName || !imgName[0]) return;
+    if (strcmp(docTexName, imgName) != 0) {
+        if (docTex) {
+            glDeleteTextures(1, &docTex);
+            docTex = 0;
+        }
+        docTexName[0] = '\0';
+        const char *dirs[3] = { ITEMS_HUD_DIR, ITEMS_DIR, MAP_TEXTURES_DIR };
+        char path[1024];
+        if (textureResolve(imgName, dirs, 3, path, sizeof(path))) {
+            char err[128];
+            TextureImage *img = textureLoadFile(path, 1024, err, sizeof(err));
+            if (img) {
+                glGenTextures(1, &docTex);
+                glBindTexture(GL_TEXTURE_2D, docTex);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S,
+                                GL_CLAMP_TO_EDGE);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T,
+                                GL_CLAMP_TO_EDGE);
+                glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, (GLsizei)img->width,
+                             (GLsizei)img->height, 0, GL_RGBA,
+                             GL_UNSIGNED_BYTE, img->pixels);
+                docW = (float)img->width;
+                docH = (float)img->height;
+                textureFree(img);
+                snprintf(docTexName, sizeof(docTexName), "%s", imgName);
+            }
+        }
+    }
+    if (docTex) docOpen = 1;
+}
+
+static void drawDocument(void) {
+    drawQuad(0, 0, SCREEN_W, SCREEN_H, 0, 0.04f, 0.04f, 0.05f, 1.0f);
+    if (!docTex || docH <= 0.0f) return;
+    float h = SCREEN_H * 0.92f;
+    float w = h * (docW / docH);
+    if (w > SCREEN_W * 0.96f) {
+        w = SCREEN_W * 0.96f;
+        h = w * (docH / docW);
+    }
+    drawTexQuad((SCREEN_W - w) * 0.5f, (SCREEN_H - h) * 0.5f, w, h, docTex,
+                1.0f);
 }
 
 int main(void) {
@@ -1050,8 +1108,16 @@ int main(void) {
         if (inputHit(ACTION_MENU)) {
             if (++menuHits >= 3) running = 0;
         }
-        if (inputHit(ACTION_INVENTORY)) invOpen = !invOpen;
-        if (invOpen) {
+        if (inputHit(ACTION_INVENTORY)) {
+            invOpen = !invOpen;
+            if (!invOpen) docOpen = 0;
+        }
+        if (invOpen && docOpen) {
+            /* Reading a document: Cross or Circle closes it. */
+            if (inputHit(ACTION_INTERACT) || inputHit(ACTION_CROUCH)) {
+                docOpen = 0;
+            }
+        } else if (invOpen) {
             /* D-pad navigates the inventory grid while it is open. */
             if (inputHit(ACTION_LEAN_LEFT) && invSel > 0) invSel--;
             if (inputHit(ACTION_LEAN_RIGHT) && invSel < MAX_INVENTORY - 1) {
@@ -1060,6 +1126,11 @@ int main(void) {
             if (inputHit(ACTION_SAVE) && invSel >= 5) invSel -= 5; /* up */
             if (inputDpadDownHit() && invSel + 5 < MAX_INVENTORY) {
                 invSel += 5;
+            }
+            /* Cross reads the selected document, if any. */
+            if (inputHit(ACTION_INTERACT) && invSel < (int)inventoryCount) {
+                const char *doc = ITEM_TEMPLATES[inventory[invSel]].docImage;
+                if (doc[0]) openDocument(doc);
             }
         } else {
             if (inputHit(ACTION_LEAN_LEFT)) fogOn = !fogOn;
@@ -1277,6 +1348,9 @@ int main(void) {
         }
         if (invOpen) {
             drawInventory();
+            if (docOpen) {
+                drawDocument();
+            }
         }
         /* Eyes closed: solid black, not a tinted texture quad. */
         if (blinkFrames > 0) {

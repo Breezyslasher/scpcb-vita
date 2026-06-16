@@ -25,7 +25,7 @@ OUT = "vita/src/game/item_spawns.h"
 # argument (GetLocalString(...)) contains commas.
 tpl_re = re.compile(
     r'"([^"]+)"\s*,\s*\w+\s*,\s*"([^"]+\.b3d)"\s*,'
-    r'\s*"([^"]*)"\s*,\s*"[^"]*"\s*,\s*([0-9.eE-]+)\s*,\s*\w+\s*'
+    r'\s*"([^"]*)"\s*,\s*"([^"]*)"\s*,\s*([0-9.eE-]+)\s*,\s*\w+\s*'
     r'(?:,\s*"([^"]*)")?')
 
 templates = {}
@@ -35,9 +35,10 @@ for line in open(LOADING, encoding="latin-1"):
     m = tpl_re.search(line)
     if m:
         name, model, inv = m.group(1), m.group(2), m.group(3)
-        scale, tex = m.group(4), m.group(5)
+        doc, scale, tex = m.group(4), m.group(5), m.group(6)
         if name not in templates:
-            templates[name] = (model, tex or "", float(scale), inv or "")
+            templates[name] = (model, tex or "", float(scale), inv or "",
+                               doc or "")
 
 # ---- spawns ----
 case_re = re.compile(r'^\s*Case\s+(r_[\w, \t]+)')
@@ -93,6 +94,7 @@ with open(OUT, "w") as f:
             "    const char *model;\n"
             "    const char *texture; /* \"\" = model default */\n"
             "    const char *invIcon;\n"
+            "    const char *docImage; /* \"\" = not a readable document */\n"
             "    float worldScale;\n"
             "} ItemTemplateDef;\n\n"
             "typedef struct {\n"
@@ -109,9 +111,9 @@ with open(OUT, "w") as f:
     f.write("static const ItemTemplateDef ITEM_TEMPLATES[] = {\n")
     for name in used:
         if name in templates:
-            model, tex, scale, inv = templates[name]
-            f.write('    { "%s", "%s", "%s", "%s", %s },\n'
-                    % (name, model, tex, inv, cf(scale)))
+            model, tex, scale, inv, doc = templates[name]
+            f.write('    { "%s", "%s", "%s", "%s", "%s", %s },\n'
+                    % (name, model, tex, inv, doc, cf(scale)))
     f.write("};\n\n")
     f.write("static const ItemSpawnDef ITEM_SPAWNS[] = {\n")
     for room, name, x, y, z in spawns:
