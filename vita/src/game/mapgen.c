@@ -187,6 +187,109 @@ static int pickTemplate(const RoomTemplateList *list, int zone, int shape) {
     return -1;
 }
 
+/* ---- forced special rooms (Map_Core.bb SetRoom calls) ----
+ * zone: 0 = LCZ, 1 = HCZ, 2 = EZ; weight positions the room within
+ * that zone's per-shape queue. */
+typedef struct {
+    int zone;
+    int shape;
+    const char *name;
+    float weight;
+} ForcedRoom;
+
+static const ForcedRoom FORCED_ROOMS[] = {
+    { 0, SHAPE_ROOM1, "cont1_173", 0.0f },
+    { 0, SHAPE_ROOM1, "cont1_005", 0.15f },
+    { 0, SHAPE_ROOM1, "room1_storage", 0.35f },
+    { 0, SHAPE_ROOM1, "cont1_914", 0.5f },
+    { 0, SHAPE_ROOM1, "cont1_205", 0.65f },
+    { 0, SHAPE_ROOM2, "room2_closets", 0.0f },
+    { 0, SHAPE_ROOM2, "room2_test_lcz", 0.1f },
+    { 0, SHAPE_ROOM2, "cont2_427_714_860_1025", 0.2f },
+    { 0, SHAPE_ROOM2, "room2_storage", 0.3f },
+    { 0, SHAPE_ROOM2, "room2_gw_2", 0.4f },
+    { 0, SHAPE_ROOM2, "cont2_012", 0.5f },
+    { 0, SHAPE_ROOM2, "room2_sl", 0.55f },
+    { 0, SHAPE_ROOM2, "cont2_500_1499", 0.6f },
+    { 0, SHAPE_ROOM2, "cont2_1123", 0.75f },
+    { 0, SHAPE_ROOM2, "room2_js", 0.85f },
+    { 0, SHAPE_ROOM2, "room2_elevator", 0.9f },
+    { 0, SHAPE_ROOM2C, "room2c_gw_lcz", 0.0f },
+    { 0, SHAPE_ROOM2C, "cont2c_066_1162_arc", 0.5f },
+    { 0, SHAPE_ROOM3, "room3_storage", 0.4f }, /* Rnd(0.2,0.6) */
+    { 0, SHAPE_ROOM3, "cont3_372", 0.8f },
+    { 0, SHAPE_ROOM4, "room4_ic", 0.3f },
+    { 1, SHAPE_ROOM1, "cont1_079", 0.15f },
+    { 1, SHAPE_ROOM1, "cont1_106", 0.3f },
+    { 1, SHAPE_ROOM1, "cont1_035", 0.45f },
+    { 1, SHAPE_ROOM1, "cont1_895", 0.7f },
+    { 1, SHAPE_ROOM2, "room2_nuke", 0.1f },
+    { 1, SHAPE_ROOM2, "cont2_409", 0.15f },
+    { 1, SHAPE_ROOM2, "room2_mt", 0.25f },
+    { 1, SHAPE_ROOM2, "cont2_008", 0.4f },
+    { 1, SHAPE_ROOM2, "room2_shaft", 0.5f },
+    { 1, SHAPE_ROOM2, "cont2_049", 0.6f },
+    { 1, SHAPE_ROOM2, "room2_test_hcz", 0.7f },
+    { 1, SHAPE_ROOM2, "room2_servers_hcz", 0.9f },
+    { 1, SHAPE_ROOM2C, "cont2c_096", 0.5f },
+    { 1, SHAPE_ROOM3, "cont3_513", 0.5f },
+    { 1, SHAPE_ROOM3, "cont3_966", 0.8f },
+    { 2, SHAPE_ROOM1, "gate_b_entrance", 1.0f },
+    { 2, SHAPE_ROOM1, "gate_a_entrance", 1.0f },
+    { 2, SHAPE_ROOM1, "room1_o5", 1.0f },
+    { 2, SHAPE_ROOM1, "room1_lifts", 0.0f },
+    { 2, SHAPE_ROOM2, "room2_scientists", 0.1f },
+    { 2, SHAPE_ROOM2, "room2_cafeteria", 0.2f },
+    { 2, SHAPE_ROOM2, "room2_6_ez", 0.25f },
+    { 2, SHAPE_ROOM2, "room2_office_3", 0.3f },
+    { 2, SHAPE_ROOM2, "room2_servers_ez", 0.4f },
+    { 2, SHAPE_ROOM2, "room2_office", 0.5f },
+    { 2, SHAPE_ROOM2, "room2_office_2", 0.55f },
+    { 2, SHAPE_ROOM2, "cont2_860_1", 0.6f },
+    { 2, SHAPE_ROOM2, "room2_medibay", 0.7f },
+    { 2, SHAPE_ROOM2, "room2_scientists_2", 0.8f },
+    { 2, SHAPE_ROOM2, "room2_ic", 0.9f },
+    { 2, SHAPE_ROOM2C, "room2c_ec", 0.0f },
+    { 2, SHAPE_ROOM2C, "room2c_2_ez", 0.0f },
+    { 2, SHAPE_ROOM3, "room3_2_ez", 0.3f },
+    { 2, SHAPE_ROOM3, "room3_office", 0.5f },
+    { 2, SHAPE_ROOM3, "room3_3_ez", 0.7f },
+};
+
+#define MAX_FORCED 64
+
+/* SetRoom (Map_Core.bb 4990): place into the per-shape queue at the
+ * weighted position within the zone's slice, searching outward for a
+ * free slot. */
+static void setRoom(int mapRoom[SHAPE_COUNT][MAX_FORCED],
+                    const int roomAmount[SHAPE_COUNT][3],
+                    int zone, int shape, int tplIndex, float weight) {
+    if (tplIndex < 0) return;
+    int minPos = 0;
+    for (int z = 0; z < zone; z++) minPos += roomAmount[shape][z];
+    int maxPos = minPos + roomAmount[shape][zone] - 1;
+    if (maxPos < minPos || maxPos >= MAX_FORCED) return;
+    if (weight < 0) weight = 0;
+    if (weight > 1) weight = 1;
+    int pos = minPos + (int)(weight * (maxPos - minPos));
+    if (mapRoom[shape][pos] < 0) {
+        mapRoom[shape][pos] = tplIndex;
+        return;
+    }
+    int span = (maxPos - pos) > (pos - minPos) ? (maxPos - pos)
+                                               : (pos - minPos);
+    for (int off = 1; off <= span; off++) {
+        if (pos + off <= maxPos && mapRoom[shape][pos + off] < 0) {
+            mapRoom[shape][pos + off] = tplIndex;
+            return;
+        }
+        if (pos - off >= minPos && mapRoom[shape][pos - off] < 0) {
+            mapRoom[shape][pos - off] = tplIndex;
+            return;
+        }
+    }
+}
+
 static int addRoom(GeneratedMap *map, int tpl, int x, int y, int angle) {
     RoomPlacement *grown = (RoomPlacement *)realloc(
         map->rooms, (map->roomCount + 1) * sizeof(RoomPlacement));
@@ -282,6 +385,89 @@ int mapGenerate(const RoomTemplateList *templates, uint32_t seed,
         y = y - height;
     } while (y >= 2);
 
+    /* Force more ROOM1 (Map_Core.bb 5320..): each zone needs at least
+     * five dead-ends so the forced special rooms get slots; grow one
+     * from an empty cell whose single neighbor is a 2- or 3-connection
+     * room (which upgrades to a 3 or 4). */
+    {
+        int trans0 = (int)(GRID * (2.0 / 3.0)) + 1;
+        int trans1 = (int)(GRID * (1.0 / 3.0)) + 1;
+        for (int zi = 0; zi < 3; zi++) {
+            int ymin = (zi == 2) ? 1 : (zi == 0 ? trans0 : trans1);
+            int ymax = (zi == 0) ? GRID - 2
+                     : (zi == 1 ? trans0 - 1 : trans1 - 1);
+            int count = 0;
+            for (y = ymin; y <= ymax; y++) {
+                for (x = 1; x <= GRID - 2; x++) {
+                    if (AT(grid, x, y) == TILE_NONE
+                        || AT(grid, x, y) == TILE_CHECKPOINT) continue;
+                    int conn = OCC(grid, x + 1, y) + OCC(grid, x - 1, y)
+                             + OCC(grid, x, y + 1) + OCC(grid, x, y - 1);
+                    if (conn == 1) count++;
+                }
+            }
+            int need = 5 - count;
+            for (y = ymin; y <= ymax && need > 0; y++) {
+                for (x = 1; x <= GRID - 2 && need > 0; x++) {
+                    if (AT(grid, x, y) != TILE_NONE) continue;
+                    int conn = OCC(grid, x + 1, y) + OCC(grid, x - 1, y)
+                             + OCC(grid, x, y + 1) + OCC(grid, x, y - 1);
+                    if (conn != 1) continue;
+                    int nx = x, ny = y;
+                    if (OCC(grid, x + 1, y)) nx = x + 1;
+                    else if (OCC(grid, x - 1, y)) nx = x - 1;
+                    else if (OCC(grid, x, y + 1)) ny = y + 1;
+                    else ny = y - 1;
+                    if (AT(grid, nx, ny) == TILE_CHECKPOINT) continue;
+                    int nconn = OCC(grid, nx + 1, ny) + OCC(grid, nx - 1, ny)
+                              + OCC(grid, nx, ny + 1) + OCC(grid, nx, ny - 1);
+                    if (nconn < 2 || nconn > 3) continue;
+                    if (!(y < ymax || ny < y || zi == 0)) continue;
+                    AT(grid, x, y) = TILE_HALL;
+                    need--;
+                }
+            }
+        }
+    }
+
+    /* Count rooms per shape and zone slice (Map_Core.bb 5280..),
+     * LCZ first to match assignment order, then build the forced-room
+     * queues. Zone index: 0 = LCZ (high y), 1 = HCZ, 2 = EZ. */
+    int roomAmount[SHAPE_COUNT][3];
+    memset(roomAmount, 0, sizeof(roomAmount));
+    for (y = GRID - 1; y >= 1; y--) {
+        int zi = 3 - zoneOf(y);
+        for (x = 1; x <= GRID - 2; x++) {
+            if (AT(grid, x, y) == TILE_NONE
+                || AT(grid, x, y) == TILE_CHECKPOINT) {
+                continue;
+            }
+            int right = OCC(grid, x + 1, y), left = OCC(grid, x - 1, y);
+            int up = y + 1 < GRID ? OCC(grid, x, y + 1) : 0;
+            int down = y - 1 >= 0 ? OCC(grid, x, y - 1) : 0;
+            int conn = right + left + up + down;
+            if (conn == 1) roomAmount[SHAPE_ROOM1][zi]++;
+            else if (conn == 2 && ((left && right) || (up && down)))
+                roomAmount[SHAPE_ROOM2][zi]++;
+            else if (conn == 2) roomAmount[SHAPE_ROOM2C][zi]++;
+            else if (conn == 3) roomAmount[SHAPE_ROOM3][zi]++;
+            else if (conn == 4) roomAmount[SHAPE_ROOM4][zi]++;
+        }
+    }
+
+    int mapRoom[SHAPE_COUNT][MAX_FORCED];
+    for (int s = 0; s < SHAPE_COUNT; s++) {
+        for (int p = 0; p < MAX_FORCED; p++) mapRoom[s][p] = -1;
+    }
+    for (unsigned f = 0; f < sizeof(FORCED_ROOMS) / sizeof(FORCED_ROOMS[0]);
+         f++) {
+        const ForcedRoom *fr = &FORCED_ROOMS[f];
+        setRoom(mapRoom, roomAmount, fr->zone, fr->shape,
+                findByName(templates, fr->name), fr->weight);
+    }
+    int roomID[SHAPE_COUNT];
+    memset(roomID, 0, sizeof(roomID));
+
     /* Room typing + template assignment (Map_Core.bb 5620..5737). */
     int chkLczHcz = findByName(templates, "room2_checkpoint_lcz_hcz");
     int chkHczEz = findByName(templates, "room2_checkpoint_hcz_ez");
@@ -306,30 +492,44 @@ int mapGenerate(const RoomTemplateList *templates, uint32_t seed,
                 else if (left) angle = 3;
                 else if (right) angle = 1;
                 else angle = 0;
-                tpl = pickTemplate(templates, zone, SHAPE_ROOM1);
+                tpl = roomID[SHAPE_ROOM1] < MAX_FORCED ? mapRoom[SHAPE_ROOM1][roomID[SHAPE_ROOM1]] : -1;
+                if (tpl < 0) tpl = pickTemplate(templates, zone, SHAPE_ROOM1);
+                roomID[SHAPE_ROOM1]++;
             } else if (conn == 2) {
-                if (left && right) {
-                    angle = (rand1(2) == 1) ? 1 : 3;
-                    tpl = pickTemplate(templates, zone, SHAPE_ROOM2);
-                } else if (up && down) {
-                    angle = (rand1(2) == 1) ? 2 : 0;
-                    tpl = pickTemplate(templates, zone, SHAPE_ROOM2);
+                if ((left && right) || (up && down)) {
+                    if (left && right) {
+                        angle = (rand1(2) == 1) ? 1 : 3;
+                    } else {
+                        angle = (rand1(2) == 1) ? 2 : 0;
+                    }
+                    tpl = roomID[SHAPE_ROOM2] < MAX_FORCED
+                        ? mapRoom[SHAPE_ROOM2][roomID[SHAPE_ROOM2]] : -1;
+                    if (tpl < 0) {
+                        tpl = pickTemplate(templates, zone, SHAPE_ROOM2);
+                    }
+                    roomID[SHAPE_ROOM2]++;
                 } else {
                     if (left && up) angle = 2;
                     else if (right && up) angle = 1;
                     else if (left && down) angle = 3;
                     else angle = 0;
-                    tpl = pickTemplate(templates, zone, SHAPE_ROOM2C);
+                    tpl = roomID[SHAPE_ROOM2C] < MAX_FORCED ? mapRoom[SHAPE_ROOM2C][roomID[SHAPE_ROOM2C]] : -1;
+                if (tpl < 0) tpl = pickTemplate(templates, zone, SHAPE_ROOM2C);
+                roomID[SHAPE_ROOM2C]++;
                 }
             } else if (conn == 3) {
                 if (!down) angle = 2;
                 else if (!left) angle = 1;
                 else if (!right) angle = 3;
                 else angle = 0;
-                tpl = pickTemplate(templates, zone, SHAPE_ROOM3);
+                tpl = roomID[SHAPE_ROOM3] < MAX_FORCED ? mapRoom[SHAPE_ROOM3][roomID[SHAPE_ROOM3]] : -1;
+                if (tpl < 0) tpl = pickTemplate(templates, zone, SHAPE_ROOM3);
+                roomID[SHAPE_ROOM3]++;
             } else {
                 angle = rand1(4);
-                tpl = pickTemplate(templates, zone, SHAPE_ROOM4);
+                tpl = roomID[SHAPE_ROOM4] < MAX_FORCED ? mapRoom[SHAPE_ROOM4][roomID[SHAPE_ROOM4]] : -1;
+                if (tpl < 0) tpl = pickTemplate(templates, zone, SHAPE_ROOM4);
+                roomID[SHAPE_ROOM4]++;
             }
 
             if (tpl < 0 || !addRoom(out, tpl, x, y, angle)) {
