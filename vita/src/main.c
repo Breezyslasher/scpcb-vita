@@ -1057,8 +1057,8 @@ int main(void) {
             if (inputHit(ACTION_LEAN_RIGHT) && invSel < MAX_INVENTORY - 1) {
                 invSel++;
             }
-            if (inputHit(ACTION_SAVE) && invSel >= 5) invSel -= 5;
-            if (inputHit(ACTION_CROUCH) && invSel + 5 < MAX_INVENTORY) {
+            if (inputHit(ACTION_SAVE) && invSel >= 5) invSel -= 5; /* up */
+            if (inputDpadDownHit() && invSel + 5 < MAX_INVENTORY) {
                 invSel += 5;
             }
         } else {

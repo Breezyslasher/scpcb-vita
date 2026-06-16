@@ -95,6 +95,13 @@ bool inputHit(GameAction action) {
         && (ctrlPrev.buttons & actionButtons[action]) == 0;
 }
 
+bool inputDpadDownHit(void) {
+    /* D-pad down has no game action (crouch is Circle); menus use it
+     * raw. Edge-triggered. */
+    return (ctrl.buttons & SCE_CTRL_DOWN) != 0
+        && (ctrlPrev.buttons & SCE_CTRL_DOWN) == 0;
+}
+
 static StickState readStick(uint8_t rawX, uint8_t rawY) {
     StickState s;
     s.x = (rawX - 128) / 128.0f;

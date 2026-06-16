@@ -46,6 +46,10 @@ bool inputDown(GameAction action);
 /* Action was pressed this frame (edge-triggered). */
 bool inputHit(GameAction action);
 
+/* Raw D-pad down, edge-triggered. It maps to no game action (crouch is
+ * Circle), so menus read it directly. */
+bool inputDpadDownHit(void);
+
 /* Left stick (movement) and right stick (camera), deadzone applied,
  * components in -1..1. */
 StickState inputMove(void);
