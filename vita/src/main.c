@@ -1052,7 +1052,9 @@ static void openDocument(const char *imgName) {
 }
 
 static void drawDocument(void) {
-    drawQuad(0, 0, SCREEN_W, SCREEN_H, 0, 0.04f, 0.04f, 0.05f, 1.0f);
+    /* Dim the world rather than blacking it out, so the surroundings
+     * stay visible behind the page (as in the original). */
+    drawQuad(0, 0, SCREEN_W, SCREEN_H, 0, 0.0f, 0.0f, 0.0f, 0.6f);
     if (!docTex || docH <= 0.0f) return;
     float h = SCREEN_H * 0.92f;
     float w = h * (docW / docH);
@@ -1231,11 +1233,14 @@ int main(void) {
                 if (staminaBlocked && stamina > 25.0f) staminaBlocked = 0;
             }
 
-            /* Blink: meter drains; empty or R closes the eyes. */
-            blinkTimer -= 100.0f / 600.0f; /* ~10 s */
-            if (inputHit(ACTION_BLINK)) blinkTimer = 0.0f;
-            if (blinkTimer <= 0.0f && blinkFrames == 0) blinkFrames = 18;
-            if (blinkFrames > 0) {
+            /* Blink: meter drains; empty or R closes the eyes. Paused
+             * while a menu is open so it never blacks out the UI. */
+            if (!invOpen) blinkTimer -= 100.0f / 600.0f; /* ~10 s */
+            if (!invOpen && inputHit(ACTION_BLINK)) blinkTimer = 0.0f;
+            if (!invOpen && blinkTimer <= 0.0f && blinkFrames == 0) {
+                blinkFrames = 18;
+            }
+            if (!invOpen && blinkFrames > 0) {
                 blinkFrames--;
                 if (blinkFrames == 0) blinkTimer = 100.0f;
             }
@@ -1347,13 +1352,16 @@ int main(void) {
                       stamina / 100.0f);
         }
         if (invOpen) {
-            drawInventory();
+            /* Reading a document dims the world and shows the page;
+             * otherwise show the inventory grid. */
             if (docOpen) {
                 drawDocument();
+            } else {
+                drawInventory();
             }
         }
-        /* Eyes closed: solid black, not a tinted texture quad. */
-        if (blinkFrames > 0) {
+        /* Eyes closed: solid black, but never over an open menu. */
+        if (blinkFrames > 0 && !invOpen) {
             drawQuad(0, 0, SCREEN_W, SCREEN_H, 0, 0.0f, 0.0f, 0.0f, 1.0f);
         }
         glEnableClientState(GL_COLOR_ARRAY);
