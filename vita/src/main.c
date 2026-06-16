@@ -659,6 +659,7 @@ static unsigned worldItemCount;
 static int inventory[MAX_INVENTORY];
 static unsigned inventoryCount;
 static int invOpen;
+static int invSel; /* selected slot index while the inventory is open */
 static ModelRT itemRT[sizeof(ITEM_TEMPLATES) / sizeof(ITEM_TEMPLATES[0])];
 static float itemSpin;
 
@@ -843,15 +844,16 @@ static void loadHudTextures(void) {
     hudStaminaBar = textureGet("stamina_meter(1).png");
 }
 
-/* Textured 2D quad in HUD space (ortho already set, depth off). */
-static void drawTexQuad(float x, float y, float w, float h, GLuint tex,
-                        float alpha) {
+/* Tinted 2D quad in HUD space (ortho already set, depth off). With a
+ * texture the rgb multiplies it; without one it fills solid rgb. */
+static void drawQuad(float x, float y, float w, float h, GLuint tex,
+                     float r, float g, float b, float a) {
     GLfloat verts[12] = { x, y, x + w, y, x + w, y + h,
                           x, y, x + w, y + h, x, y + h };
     GLfloat uvs[12] = { 0, 0, 1, 0, 1, 1, 0, 0, 1, 1, 0, 1 };
     glBindBuffer(GL_ARRAY_BUFFER, 0);
     glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
-    glColor4f(1.0f, 1.0f, 1.0f, alpha);
+    glColor4f(r, g, b, a);
     if (tex) {
         glEnable(GL_TEXTURE_2D);
         glBindTexture(GL_TEXTURE_2D, tex);
@@ -869,6 +871,12 @@ static void drawTexQuad(float x, float y, float w, float h, GLuint tex,
     glColor4f(1, 1, 1, 1);
 }
 
+/* Convenience for white-tinted textured quads. */
+static void drawTexQuad(float x, float y, float w, float h, GLuint tex,
+                        float alpha) {
+    drawQuad(x, y, w, h, tex, 1.0f, 1.0f, 1.0f, alpha);
+}
+
 /* Icon plus a segmented bar like the game's blink/stamina meters. */
 static void drawMeter(float x, float y, GLuint icon, GLuint seg,
                       float fraction) {
@@ -880,6 +888,8 @@ static void drawMeter(float x, float y, GLuint icon, GLuint seg,
 }
 
 static void drawText(float x, float y, const char *text) {
+    /* Text is flat geometry; ensure no texture bleeds through. */
+    glDisable(GL_TEXTURE_2D);
     static char buf[64000];
     int quads = stb_easy_font_print(x, y, (char *)text, NULL, buf, sizeof(buf));
 
@@ -937,6 +947,65 @@ static void drawHud(const char *line1, const char *line2,
     glEnable(GL_DEPTH_TEST);
 }
 
+/* Full graphical inventory: dimmed backdrop, slot grid with item
+ * icons, a highlighted selection, and the selected item's name. Runs
+ * inside the HUD ortho/flat-2D state. */
+static void drawInventory(void) {
+    const int cols = 5;
+    const int rows = MAX_INVENTORY / 5;
+    const float slot = 96.0f, pad = 12.0f;
+    float gridW = cols * slot + (cols - 1) * pad;
+    float gridH = rows * slot + (rows - 1) * pad;
+    float ox = (SCREEN_W - gridW) * 0.5f;
+    float oy = (SCREEN_H - gridH) * 0.5f + 12.0f;
+
+    drawQuad(0, 0, SCREEN_W, SCREEN_H, 0, 0.0f, 0.0f, 0.0f, 0.72f);
+
+    glPushMatrix();
+    glScalef(2.0f, 2.0f, 1.0f);
+    glColor4f(0.85f, 0.92f, 0.85f, 1.0f);
+    drawText(ox * 0.5f, (oy - 28.0f) * 0.5f, "INVENTORY");
+    glColor4f(1, 1, 1, 1);
+    glPopMatrix();
+
+    for (int i = 0; i < MAX_INVENTORY; i++) {
+        int cx = i % cols, cy = i / cols;
+        float x = ox + cx * (slot + pad);
+        float y = oy + cy * (slot + pad);
+        int selected = (i == invSel);
+        drawQuad(x, y, slot, slot, 0,
+                 selected ? 0.30f : 0.12f, selected ? 0.34f : 0.14f,
+                 selected ? 0.30f : 0.12f, 0.85f);
+        float bc = selected ? 0.95f : 0.40f;
+        drawQuad(x, y, slot, 2, 0, bc, bc, bc, 1.0f);
+        drawQuad(x, y + slot - 2, slot, 2, 0, bc, bc, bc, 1.0f);
+        drawQuad(x, y, 2, slot, 0, bc, bc, bc, 1.0f);
+        drawQuad(x + slot - 2, y, 2, slot, 0, bc, bc, bc, 1.0f);
+        if (i < (int)inventoryCount) {
+            const char *icon = ITEM_TEMPLATES[inventory[i]].invIcon;
+            GLuint tex = icon[0] ? textureGet(icon) : 0;
+            if (tex) {
+                drawTexQuad(x + 10, y + 10, slot - 20, slot - 20, tex, 1.0f);
+            } else {
+                drawQuad(x + 26, y + 26, slot - 52, slot - 52, 0,
+                         0.6f, 0.6f, 0.25f, 1.0f);
+            }
+        }
+    }
+
+    glPushMatrix();
+    glScalef(2.0f, 2.0f, 1.0f);
+    if (invSel < (int)inventoryCount) {
+        glColor4f(1.0f, 1.0f, 0.85f, 1.0f);
+        drawText(ox * 0.5f, (oy + gridH + 16.0f) * 0.5f,
+                 ITEM_TEMPLATES[inventory[invSel]].name);
+        glColor4f(1, 1, 1, 1);
+    } else if (inventoryCount == 0) {
+        drawText(ox * 0.5f, (oy + gridH + 16.0f) * 0.5f, "(empty)");
+    }
+    glPopMatrix();
+}
+
 int main(void) {
     vglInit(0x800000);
 
@@ -982,13 +1051,25 @@ int main(void) {
             if (++menuHits >= 3) running = 0;
         }
         if (inputHit(ACTION_INVENTORY)) invOpen = !invOpen;
-        if (inputHit(ACTION_LEAN_LEFT)) fogOn = !fogOn;
-        if (inputHit(ACTION_USE_ITEM)) cullMode = (cullMode + 1) % 3;
-        if (inputHit(ACTION_SAVE)) { /* D-pad up: walk/fly */
-            walkMode = !walkMode;
-            velY = 0.0f;
+        if (invOpen) {
+            /* D-pad navigates the inventory grid while it is open. */
+            if (inputHit(ACTION_LEAN_LEFT) && invSel > 0) invSel--;
+            if (inputHit(ACTION_LEAN_RIGHT) && invSel < MAX_INVENTORY - 1) {
+                invSel++;
+            }
+            if (inputHit(ACTION_SAVE) && invSel >= 5) invSel -= 5;
+            if (inputHit(ACTION_CROUCH) && invSel + 5 < MAX_INVENTORY) {
+                invSel += 5;
+            }
+        } else {
+            if (inputHit(ACTION_LEAN_LEFT)) fogOn = !fogOn;
+            if (inputHit(ACTION_USE_ITEM)) cullMode = (cullMode + 1) % 3;
+            if (inputHit(ACTION_SAVE)) { /* D-pad up: walk/fly */
+                walkMode = !walkMode;
+                velY = 0.0f;
+            }
         }
-        if (haveData && inputHit(ACTION_INTERACT)) {
+        if (haveData && !invOpen && inputHit(ACTION_INTERACT)) {
             int picked = itemPickupNearest(camPos);
             if (picked >= 0) {
                 snprintf(toastMsg, sizeof(toastMsg), "PICKED UP %s",
@@ -1038,12 +1119,17 @@ int main(void) {
             if (itemSpin >= 360.0f) itemSpin -= 360.0f;
         }
         if (toastTimer > 0) toastTimer--;
-        if (haveData && inputHit(ACTION_LEAN_RIGHT)) {
+        if (haveData && !invOpen && inputHit(ACTION_LEAN_RIGHT)) {
             regenerateMap(mapSeed * 7919u + 17u);
         }
 
         StickState look = inputLook();
         StickState move = inputMove();
+        if (invOpen) {
+            /* Freeze the camera and player while the menu is open. */
+            look.x = look.y = 0.0f;
+            move.x = move.y = 0.0f;
+        }
         camYaw += look.x * 0.04f;
         camPitch += look.y * 0.03f;
         if (camPitch > 1.5f) camPitch = 1.5f;
@@ -1173,51 +1259,28 @@ int main(void) {
                  "  up: %s  start x3: exit", fps, audioStatus(),
                  audioSoundCount(), audioLoadFopenFails(),
                  audioLoadDecodeFails(), walkMode ? "WALK" : "fly");
-        char invText[512] = "";
-        if (invOpen) {
-            snprintf(invText, sizeof(invText), "INVENTORY (%u/%u)\n",
-                     inventoryCount, (unsigned)MAX_INVENTORY);
-            for (unsigned ii = 0; ii < inventoryCount; ii++) {
-                strncat(invText, ITEM_TEMPLATES[inventory[ii]].name,
-                        sizeof(invText) - strlen(invText) - 2);
-                strncat(invText, "\n", sizeof(invText) - strlen(invText) - 1);
-            }
-            if (inventoryCount == 0) {
-                strncat(invText, "(empty)",
-                        sizeof(invText) - strlen(invText) - 1);
-            }
-        }
-        drawHud(line1, line2, toastTimer > 0 ? toastMsg : NULL,
-                invOpen ? invText : NULL);
+        drawHud(line1, line2, toastTimer > 0 ? toastMsg : NULL, NULL);
 
-        /* Vitals meters, inventory icons and the blink blackout share
-         * the HUD's ortho matrices set up by drawHud, but need flat 2D
+        /* Vitals meters, the inventory and the blink blackout share the
+         * HUD's ortho matrices set up by drawHud, but need flat 2D
          * state again (drawHud restores arrays/depth on exit). */
         glDisable(GL_DEPTH_TEST);
         glDisable(GL_FOG);
         glDisable(GL_CULL_FACE);
         glDisableClientState(GL_COLOR_ARRAY);
         glDisableClientState(GL_TEXTURE_COORD_ARRAY);
-        if (haveData && walkMode) {
+        if (haveData && walkMode && !invOpen) {
             drawMeter(20, SCREEN_H - 60, hudBlinkIcon, hudBlinkBar,
                       blinkTimer / 100.0f);
             drawMeter(20, SCREEN_H - 110, hudSprintIcon, hudStaminaBar,
                       stamina / 100.0f);
         }
         if (invOpen) {
-            for (unsigned ii = 0; ii < inventoryCount; ii++) {
-                const char *icon = ITEM_TEMPLATES[inventory[ii]].invIcon;
-                float ix = 320.0f + (ii % 5) * 90.0f;
-                float iy = 140.0f + (ii / 5) * 90.0f;
-                drawTexQuad(ix, iy, 80, 80, 0, 0.5f);
-                if (icon[0]) {
-                    drawTexQuad(ix + 8, iy + 8, 64, 64, textureGet(icon),
-                                1.0f);
-                }
-            }
+            drawInventory();
         }
+        /* Eyes closed: solid black, not a tinted texture quad. */
         if (blinkFrames > 0) {
-            drawTexQuad(0, 0, SCREEN_W, SCREEN_H, 0, 1.0f);
+            drawQuad(0, 0, SCREEN_W, SCREEN_H, 0, 0.0f, 0.0f, 0.0f, 1.0f);
         }
         glEnableClientState(GL_COLOR_ARRAY);
         glEnableClientState(GL_TEXTURE_COORD_ARRAY);
