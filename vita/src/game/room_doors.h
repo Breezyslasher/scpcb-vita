@@ -2,7 +2,7 @@
  * Room-internal doors from FillRoom's literal-coordinate
  * CreateDoor calls in Rooms_Core.bb (room-local raw units;
  * type: 0 default 1 elevator 2 heavy 3 big 4 office 5 wooden
- * 6 one-sided). */
+ * 6 one-sided 7 SCP-914). */
 #ifndef VITA_GAME_ROOM_DOORS_H
 #define VITA_GAME_ROOM_DOORS_H
 
@@ -52,8 +52,8 @@ static const RoomDoorDef ROOM_DOORS[] = {
     { "cont3_372", 576.0f, 0.0f, 176.0f, 90.0f, 0, 3, 2, 0 },
     { "cont3_372", 101.0f, 0.0f, 380.0f, 90.0f, 1, 0, 2, 0 },
     { "cont3_372", -840.0f, 0.0f, 258.0f, 180.0f, 0, 0, 2, 1 },
-    { "cont1_914", -1037.0f, 0.0f, 528.0f, 180.0f, 1, 0, 0, 1 },
-    { "cont1_914", 404.0f, 0.0f, 528.0f, 180.0f, 1, 0, 0, 1 },
+    { "cont1_914", -1037.0f, 0.0f, 528.0f, 180.0f, 1, 7, 0, 1 },
+    { "cont1_914", 404.0f, 0.0f, 528.0f, 180.0f, 1, 7, 0, 1 },
     { "cont1_914", 0.0f, 0.0f, -368.0f, 0.0f, 0, 3, 2, 1 },
     { "cont1_914", -449.0f, 0.0f, -704.0f, 90.0f, 0, 0, 2, 0 },
     { "room2_2_lcz", 672.0f, 0.0f, 0.0f, 90.0f, 0, 0, 2, 1 },

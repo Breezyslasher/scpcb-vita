@@ -331,8 +331,7 @@ static void spawnRoomDoors(void) {
             localToWorld(p, local, w);
             int a = (int)(rd->angleDeg / 90.0f + 0.5f) * 90 + p->angle * 90;
             int span = ((a % 180) + 180) % 180; /* 0 or 90 */
-            int heavy = rd->type == 1 || rd->type == 2 || rd->type == 3;
-            doorsAddInternal(&doors, w[0], w[1], w[2], span, heavy,
+            doorsAddInternal(&doors, w[0], w[1], w[2], span, rd->type,
                              rd->open, rd->keycard, rd->locked);
         }
     }
@@ -671,6 +670,9 @@ static void loadSounds(void) {
 }
 
 static ModelRT doorFrameRT, doorPanelRT, heavy1RT, heavy2RT;
+static ModelRT elevatorRT, big1RT, big2RT, bigFrameRT;
+static ModelRT officeRT, officeFrameRT, woodenRT, woodenFrameRT;
+static ModelRT oneSidedRT, door914RT;
 static ModelRT buttonRT, buttonKeycardRT;
 static char toastMsg[128];
 static int toastTimer;
@@ -730,6 +732,26 @@ static void buildDoorAssets(void) {
     buildModelRT(&heavy1RT, "HeavyDoor1.b3d", 0, 0, 0, NULL);
     buildModelRT(&heavy2RT, "HeavyDoor2.b3d", 0, 0, 0, NULL);
     buildModelRT(&doorFrameRT, "DoorFrame.b3d", 0, 0, 0, NULL);
+    /* The remaining door types of Loading_Core.bb (scales follow
+     * CreateDoor: one-sided/914 use the 203x313x15 fit, elevator and
+     * office are RoomScale, big is 55x, wooden 46/44/46). */
+    buildModelRT(&oneSidedRT, "Door02.b3d", 203.0f, 313.0f, 15.0f, NULL);
+    buildModelRT(&door914RT, "Door02.b3d", 203.0f, 313.0f, 15.0f,
+                 "Door01_914.png");
+    buildModelRT(&elevatorRT, "ElevatorDoor.b3d", 0, 0, 0, NULL);
+    buildModelRT(&big1RT, "contdoorleft.b3d", 0, 0, 0, NULL);
+    big1RT.scale[0] = big1RT.scale[1] = big1RT.scale[2] = 55.0f;
+    buildModelRT(&big2RT, "contdoorright.b3d", 0, 0, 0, NULL);
+    big2RT.scale[0] = big2RT.scale[1] = big2RT.scale[2] = 55.0f;
+    buildModelRT(&bigFrameRT, "ContDoorFrame.b3d", 0, 0, 0, NULL);
+    bigFrameRT.scale[0] = bigFrameRT.scale[1] = bigFrameRT.scale[2] = 55.0f;
+    buildModelRT(&officeRT, "officedoor.b3d", 0, 0, 0, NULL);
+    buildModelRT(&officeFrameRT, "officedoorframe.b3d", 0, 0, 0, NULL);
+    buildModelRT(&woodenRT, "DoorWooden.b3d", 0, 0, 0, NULL);
+    woodenRT.scale[0] = 46.0f;
+    woodenRT.scale[1] = 44.0f;
+    woodenRT.scale[2] = 46.0f;
+    buildModelRT(&woodenFrameRT, "DoorWoodenFrame.b3d", 0, 0, 0, NULL);
     /* CreateButton scales to 0.03 world units = 7.68 raw. */
     buildModelRT(&buttonRT, "Button.b3d", 0, 0, 0, NULL);
     buttonRT.scale[0] = buttonRT.scale[1] = buttonRT.scale[2] = 7.68f;
@@ -1739,32 +1761,59 @@ static void drawDoors(const float viewPos[3]) {
         glTranslatef(d->x, d->y, d->z);
         glRotatef(-(float)d->angle, 0.0f, 1.0f, 0.0f);
 
-        drawModelRT(&doorFrameRT);
+        /* Frame and panels by door type (Loading_Core.bb models). */
+        const ModelRT *frame = &doorFrameRT;
+        const ModelRT *p1 = &doorPanelRT, *p2 = &doorPanelRT;
+        int hinged = 0, single = 0;
+        switch (d->type) {
+            case 1: p1 = p2 = &elevatorRT; break;
+            case 2: p1 = &heavy1RT; p2 = &heavy2RT; break;
+            case 3: frame = &bigFrameRT; p1 = &big1RT; p2 = &big2RT; break;
+            case 4: frame = &officeFrameRT; p1 = &officeRT; hinged = 1; break;
+            case 5: frame = &woodenFrameRT; p1 = &woodenRT; hinged = 1; break;
+            case 6: p1 = &oneSidedRT; single = 1; break;
+            case 7: p1 = &door914RT; single = 1; break;
+            default: break;
+        }
+        drawModelRT(frame);
 
         float slide = doorSlide(d);
-        const ModelRT *p1 = d->heavy ? &heavy1RT : &doorPanelRT;
-        const ModelRT *p2 = d->heavy ? &heavy2RT : &doorPanelRT;
+        if (hinged) {
+            /* Office/wooden doors swing on a hinge instead of sliding. */
+            glPushMatrix();
+            glTranslatef(-92.0f, 0.0f, 0.0f);
+            glRotatef(-d->openState * 0.5f, 0.0f, 1.0f, 0.0f);
+            glTranslatef(92.0f, 0.0f, 0.0f);
+            drawModelRT(p1);
+            glPopMatrix();
+        } else {
+            glPushMatrix();
+            glTranslatef(slide, 0.0f, 0.0f);
+            drawModelRT(p1);
+            glPopMatrix();
 
-        glPushMatrix();
-        glTranslatef(slide, 0.0f, 0.0f);
-        drawModelRT(p1);
-        glPopMatrix();
-
-        glPushMatrix();
-        glRotatef(180.0f, 0.0f, 1.0f, 0.0f);
-        glTranslatef(slide, 0.0f, 0.0f);
-        drawModelRT(p2);
-        glPopMatrix();
+            if (!single) {
+                glPushMatrix();
+                glRotatef(180.0f, 0.0f, 1.0f, 0.0f);
+                glTranslatef(slide, 0.0f, 0.0f);
+                drawModelRT(p2);
+                glPopMatrix();
+            }
+        }
 
         /* Buttons on both sides; the 180-degree side rotation mirrors
-         * the (+0.6, 0.7, -0.1) CreateDoor offset for side 1. */
-        const ModelRT *btn = d->keycard > 0 ? &buttonKeycardRT : &buttonRT;
-        for (int side = 0; side < 2; side++) {
-            glPushMatrix();
-            glRotatef((float)(side * 180), 0.0f, 1.0f, 0.0f);
-            glTranslatef(0.6f * 256.0f, 0.7f * 256.0f, -0.1f * 256.0f);
-            drawModelRT(btn);
-            glPopMatrix();
+         * the (+0.6, 0.7, -0.1) CreateDoor offset for side 1. The 914
+         * booth doors have their buttons removed in FillRoom. */
+        if (d->type != 7) {
+            const ModelRT *btn = d->keycard > 0 ? &buttonKeycardRT
+                                                : &buttonRT;
+            for (int side = 0; side < 2; side++) {
+                glPushMatrix();
+                glRotatef((float)(side * 180), 0.0f, 1.0f, 0.0f);
+                glTranslatef(0.6f * 256.0f, 0.7f * 256.0f, -0.1f * 256.0f);
+                drawModelRT(btn);
+                glPopMatrix();
+            }
         }
 
         glPopMatrix();

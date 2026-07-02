@@ -23,6 +23,7 @@ OUT = "vita/src/game/room_doors.h"
 DOOR_TYPES = {
     "DEFAULT_DOOR": 0, "ELEVATOR_DOOR": 1, "HEAVY_DOOR": 2, "BIG_DOOR": 3,
     "OFFICE_DOOR": 4, "WOODEN_DOOR": 5, "ONE_SIDED_DOOR": 6,
+    "SCP_914_DOOR": 7,
 }
 # Items_Core.bb: KEY_CARD_n constants; negative KEY_* are special
 # scanners the port cannot open, mapped to locked.
@@ -145,7 +146,7 @@ with open(OUT, "w") as f:
             " * Room-internal doors from FillRoom's literal-coordinate\n"
             " * CreateDoor calls in Rooms_Core.bb (room-local raw units;\n"
             " * type: 0 default 1 elevator 2 heavy 3 big 4 office 5 wooden\n"
-            " * 6 one-sided). */\n"
+            " * 6 one-sided 7 SCP-914). */\n"
             "#ifndef VITA_GAME_ROOM_DOORS_H\n"
             "#define VITA_GAME_ROOM_DOORS_H\n\n"
             "typedef struct {\n"

@@ -18,7 +18,9 @@ typedef struct {
     float x, z;        /* world center, raw mesh units */
     float y;           /* floor height (internal doors on catwalks) */
     int angle;         /* 0 = spans X (faces Z), 90 = spans Z (faces X) */
-    int heavy;         /* HCZ heavy door */
+    int heavy;         /* heavy/big/elevator: slower slide, big sounds */
+    int type;          /* 0 default 1 elevator 2 heavy 3 big 4 office
+                          5 wooden 6 one-sided 7 SCP-914 */
     int open;          /* target state */
     float openState;   /* 0..180, animated */
     int keycard;       /* 0 = none; >0 = required keycard level */
@@ -37,14 +39,15 @@ typedef struct {
 #define DOOR_PANEL_H 313.0f
 #define DOOR_SLIDE_DEFAULT 183.0f
 #define DOOR_SLIDE_HEAVY 90.0f
+#define DOOR_SLIDE_BIG 340.0f
 
 int doorsGenerate(const GeneratedMap *map, const RoomTemplateList *templates,
                   uint32_t seed, DoorList *out);
 
 /* Append a room-internal door (FillRoom's CreateDoor). angle is the
- * span axis (0 or 90); y is the door base height. */
+ * span axis (0 or 90); y is the door base height; type as in Door. */
 int doorsAddInternal(DoorList *list, float x, float y, float z, int angle,
-                     int heavy, int open, int keycard, int locked);
+                     int type, int open, int keycard, int locked);
 void doorsFree(DoorList *list);
 
 /* Advance the open/close animation one frame (UpdateDoors: 2 deg). */

@@ -29,6 +29,7 @@ static int addDoor(DoorList *list, float x, float z, int angle, int heavy,
     d->z = z;
     d->angle = angle;
     d->heavy = heavy;
+    d->type = heavy ? 2 : 0;
     d->open = open;
     d->openState = open ? 180.0f : 0.0f;
     d->keycard = keycard;
@@ -140,16 +141,19 @@ void doorsUpdate(DoorList *list) {
 }
 
 int doorsAddInternal(DoorList *list, float x, float y, float z, int angle,
-                     int heavy, int open, int keycard, int locked) {
+                     int type, int open, int keycard, int locked) {
+    int heavy = type == 1 || type == 2 || type == 3;
     if (!addDoor(list, x, z, angle, heavy, open, keycard)) return 0;
     Door *d = &list->items[list->count - 1];
     d->y = y;
+    d->type = type;
     d->locked = locked;
     return 1;
 }
 
 float doorSlide(const Door *d) {
-    float max = d->heavy ? DOOR_SLIDE_HEAVY : DOOR_SLIDE_DEFAULT;
+    float max = d->type == 3 ? DOOR_SLIDE_BIG
+              : (d->type == 2 ? DOOR_SLIDE_HEAVY : DOOR_SLIDE_DEFAULT);
     float t = d->openState * 3.14159265f / 180.0f;
     return max * (1.0f - cosf(t)) * 0.5f;
 }
