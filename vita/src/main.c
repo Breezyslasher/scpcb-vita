@@ -330,11 +330,56 @@ static void spawnRoomDoors(void) {
             float w[3];
             localToWorld(p, local, w);
             int a = (int)(rd->angleDeg / 90.0f + 0.5f) * 90 + p->angle * 90;
-            int span = ((a % 180) + 180) % 180; /* 0 or 90 */
-            doorsAddInternal(&doors, w[0], w[1], w[2], span, rd->type,
-                             rd->open, rd->keycard, rd->locked);
+            a = ((a % 360) + 360) % 360;
+            doorsAddInternal(&doors, w[0], w[1], w[2], a, rd->type,
+                             rd->open, rd->keycard, rd->locked,
+                             rd->nobuttons);
         }
     }
+}
+
+/* ---- intro sequence (cont1_173_intro, "placed automatically in all
+ * maps" per rooms.ini): the Class-D cell block and 173's chamber on
+ * an isolated off-grid cell. ---- */
+
+#define INTRO_GX -8
+#define INTRO_GY -8
+static int introRoomIdx = -1;   /* index in map.rooms, -1 = none */
+static int introPhase = -1;     /* -1 inactive, >=0 running */
+static int introTimer;
+static int introGateDoor = -1;
+
+/* The intro mesh spans several grid cells (local x -8736..2048,
+ * z -3896..1503); anything within these world bounds is "in the
+ * intro area". */
+static int inIntroBounds(float x, float z) {
+    if (introRoomIdx < 0) return 0;
+    float ox = INTRO_GX * ROOM_SPACING, oz = INTRO_GY * ROOM_SPACING;
+    return x > ox - 9000.0f && x < ox + 2300.0f
+        && z > oz - 4200.0f && z < oz + 1800.0f;
+}
+
+static void appendIntroRoom(void) {
+    introRoomIdx = -1;
+    int tplIdx = -1;
+    for (uint32_t i = 0; i < tplList.count; i++) {
+        if (strcmp(tplList.items[i].name, "cont1_173_intro") == 0) {
+            tplIdx = (int)i;
+            break;
+        }
+    }
+    if (tplIdx < 0) return;
+    RoomPlacement *grown = (RoomPlacement *)realloc(
+        map.rooms, (map.roomCount + 1) * sizeof(RoomPlacement));
+    if (!grown) return;
+    map.rooms = grown;
+    RoomPlacement *p = &map.rooms[map.roomCount];
+    p->templateIndex = tplIdx;
+    p->gridX = INTRO_GX;
+    p->gridY = INTRO_GY;
+    p->angle = 0;
+    introRoomIdx = (int)map.roomCount;
+    map.roomCount++;
 }
 
 /* Active set: placements within one cell of the player. */
@@ -348,8 +393,10 @@ static void updateActiveRooms(const float pos[3]) {
     for (uint32_t i = 0; i < map.roomCount; i++) {
         const RoomPlacement *p = &map.rooms[i];
         int dx = p->gridX - px, dy = p->gridY - py;
-        if (dx >= -1 && dx <= 1 && dy >= -1 && dy <= 1
-            && activeCount < 16) {
+        int near = dx >= -1 && dx <= 1 && dy >= -1 && dy <= 1;
+        /* The intro mesh spans several cells around its placement. */
+        if ((int)i == introRoomIdx) near = inIntroBounds(pos[0], pos[2]);
+        if (near && activeCount < 16) {
             templateEnsure(p->templateIndex);
             if (tplRT[p->templateIndex].state == 1) {
                 activeRooms[activeCount++] = p;
@@ -476,6 +523,7 @@ static void regenerateMap(uint32_t seed) {
     doorsFree(&doors);
     mapSeed = seed;
     if (mapGenerate(&tplList, mapSeed, &map)) {
+        appendIntroRoom();
         doorsGenerate(&map, &tplList, mapSeed ^ 0x9E3779B9u, &doors);
         spawnRoomDoors();
         spawnItems();
@@ -882,6 +930,7 @@ static void try173OpenDoor(void) {
 /* There is only world (and collision) where a room exists; the grid
  * gaps between rooms are void. */
 static int roomExistsAt(float x, float z) {
+    if (inIntroBounds(x, z)) return 1;
     int gx = (int)floorf(x / ROOM_SPACING + 0.5f);
     int gy = (int)floorf(z / ROOM_SPACING + 0.5f);
     for (uint32_t i = 0; i < map.roomCount; i++) {
@@ -1063,6 +1112,159 @@ static void update173(void) {
         audioPlay3D(sndRattle[rand() % 3], npc173Pos, camPos, camYaw, 2200.0f);
     }
     npc173WasMoving = moving;
+}
+
+/* ---- intro sequence logic ----
+ * Simplified port of the e_cont1_173_intro event: wake in the Class-D
+ * cell, get escorted over the PA, enter 173's chamber, containment
+ * breach, escape into the facility. No NPC actors; the guards exist
+ * as voice lines. */
+
+static void gameMusicStart(void);
+
+static int sndIntroAttention = -1, sndIntroExitCell = -1;
+static int sndIntroEscort = -1, sndIntroDone = -1;
+static int sndIntroOff = -1, sndIntroVent = -1, sndIntroHorror = -1;
+static int sndIntroBreach = -1;
+
+static void introLocal(float out[2]) {
+    out[0] = camPos[0] - INTRO_GX * ROOM_SPACING;
+    out[1] = camPos[2] - INTRO_GY * ROOM_SPACING;
+}
+
+static void introStart(void) {
+    /* Voice lines load lazily (they cache in the sound table). */
+    sndIntroAttention = audioLoad(SFX_DIR "/Room/Intro/IA/1/Attention0.ogg");
+    sndIntroExitCell = audioLoad(SFX_DIR
+                                 "/Room/Intro/Guard/Ulgrin/ExitCell.ogg");
+    sndIntroEscort = audioLoad(SFX_DIR
+                               "/Room/Intro/Guard/Ulgrin/Escort0.ogg");
+    sndIntroDone = audioLoad(SFX_DIR
+                             "/Room/Intro/Guard/Ulgrin/EscortDone0.ogg");
+    sndIntroOff = audioLoad(SFX_DIR "/Room/Intro/IA/Off.ogg");
+    sndIntroVent = audioLoad(SFX_DIR "/Room/Intro/173Vent.ogg");
+    sndIntroHorror = audioLoad(SFX_DIR "/Room/Intro/Horror.ogg");
+    sndIntroBreach = audioLoad(SFX_DIR
+                               "/Room/Intro/IA/Scripted/Announcement0.ogg");
+
+    /* The chamber gate (BIG door at local 576,383). */
+    introGateDoor = -1;
+    for (uint32_t i = 0; i < doors.count; i++) {
+        if (doors.items[i].type == 3
+            && inIntroBounds(doors.items[i].x, doors.items[i].z)) {
+            introGateDoor = (int)i;
+            break;
+        }
+    }
+
+    /* Wake up in the cell, facing its door. */
+    camPos[0] = INTRO_GX * ROOM_SPACING - 8064.0f;
+    camPos[1] = EYE_HEIGHT;
+    camPos[2] = INTRO_GY * ROOM_SPACING + 620.0f;
+    camYaw = 0.0f;
+    camPitch = 0.0f;
+    velY = 0.0f;
+    npc173Active = 0; /* nothing hunts until the breach */
+    introPhase = 0;
+    introTimer = 0;
+    audioStreamMusic(DATA_ROOT "/SFX/Music/173IntroChamber.ogg", 0.5f, 1);
+    snprintf(toastMsg, sizeof(toastMsg), "...");
+    toastTimer = 120;
+}
+
+static void introEnd(const char *msg) {
+    introPhase = -1;
+    npc173Active = npc173RT.ok;
+    spawnPlayer();
+    gameMusicStart();
+    snprintf(toastMsg, sizeof(toastMsg), "%s", msg);
+    toastTimer = 240;
+}
+
+static void introUpdate(void) {
+    if (introPhase < 0) return;
+    introTimer++;
+    float l[2];
+    introLocal(l);
+
+    /* Doors along the escort route slide open as the player nears
+     * (they are locked, so buttons cannot derail the sequence). */
+    if (introPhase >= 1) {
+        for (uint32_t i = 0; i < doors.count; i++) {
+            Door *d = &doors.items[i];
+            if ((int)i == introGateDoor || d->open) continue;
+            if (!inIntroBounds(d->x, d->z)) continue;
+            float dx = d->x - camPos[0], dz = d->z - camPos[2];
+            if (dx * dx + dz * dz < 400.0f * 400.0f) {
+                d->open = 1;
+                float dpos[3] = { d->x, camPos[1], d->z };
+                audioPlay3D(sndDoorOpen[rand() % 3], dpos, camPos, camYaw,
+                            2500.0f);
+            }
+        }
+    }
+
+    switch (introPhase) {
+        case 0: /* the PA wakes the block */
+            if (introTimer == 90) audioPlay(sndIntroAttention, 1.0f, 0.0f);
+            if (introTimer == 420) {
+                audioPlay(sndIntroExitCell, 1.0f, 0.0f);
+            }
+            if (introTimer == 540) {
+                introPhase = 1; /* cell door opens; route unlocks */
+                snprintf(toastMsg, sizeof(toastMsg),
+                         "EXIT YOUR CELL AND FOLLOW THE CORRIDOR");
+                toastTimer = 240;
+            }
+            break;
+        case 1: /* escorted through the block */
+            if (introTimer == 720) audioPlay(sndIntroEscort, 1.0f, 0.0f);
+            if (l[0] > -1500.0f) {
+                introPhase = 2;
+                introTimer = 0;
+                audioPlay(sndIntroDone, 1.0f, 0.0f);
+                if (introGateDoor >= 0) doors.items[introGateDoor].open = 1;
+                snprintf(toastMsg, sizeof(toastMsg),
+                         "ENTER THE CONTAINMENT CHAMBER");
+                toastTimer = 240;
+            }
+            break;
+        case 2: /* walk into the chamber */
+            if (l[0] > 1100.0f) {
+                introPhase = 3;
+                introTimer = 0;
+                if (introGateDoor >= 0) doors.items[introGateDoor].open = 0;
+            }
+            break;
+        case 3: /* sealed in with the statue */
+            if (introTimer == 150) {
+                audioPlay(sndIntroOff, 1.0f, 0.0f);
+                audioStopMusic();
+            }
+            if (introTimer == 300) audioPlay(sndIntroVent, 1.0f, 0.0f);
+            if (introTimer == 420) {
+                audioPlay(sndIntroHorror, 1.0f, 0.0f);
+                audioPlay(sndIntroBreach, 1.0f, 0.0f);
+                /* The breach: 173 is loose in the chamber, the gate
+                 * reopens, and the player runs. */
+                npc173Pos[0] = INTRO_GX * ROOM_SPACING + 1500.0f;
+                npc173Pos[1] = 0.0f;
+                npc173Pos[2] = INTRO_GY * ROOM_SPACING + 500.0f;
+                npc173Active = npc173RT.ok;
+                if (introGateDoor >= 0) doors.items[introGateDoor].open = 1;
+                introPhase = 4;
+                introTimer = 0;
+                snprintf(toastMsg, sizeof(toastMsg),
+                         "SCP-173 HAS BREACHED CONTAINMENT - RUN");
+                toastTimer = 300;
+            }
+            break;
+        case 4: /* escape back down the block */
+            if (l[0] < -2200.0f || introTimer > 3600) {
+                introEnd("YOU ESCAPED INTO THE FACILITY");
+            }
+            break;
+    }
 }
 
 static void draw173(const float viewPos[3]) {
@@ -1649,6 +1851,7 @@ static int loadGameFrom(const char *path) {
     npc173Pos[2] = nz;
     npc173YawDeg = nyaw;
     if (!nact) npc173Active = 0;
+    introPhase = -1; /* saves are never mid-intro */
     if (navLine[0]) equippedNav = itemTplFind(navLine);
     inventoryCount = 0;
     char *tok = strtok(invLine, "|\n");
@@ -1802,15 +2005,17 @@ static void drawDoors(const float viewPos[3]) {
         }
 
         /* Buttons on both sides; the 180-degree side rotation mirrors
-         * the (+0.6, 0.7, -0.1) CreateDoor offset for side 1. The 914
-         * booth doors have their buttons removed in FillRoom. */
-        if (d->type != 7) {
+         * the (+0.6, 0.7, -0.1) CreateDoor offset for side 1. FillRoom
+         * removes the buttons on some doors (914 booths, elevator
+         * covers, locked service doors). Big gates are wider. */
+        if (!d->nobuttons && d->type != 7) {
+            float bx = d->type == 3 ? 264.0f : 0.6f * 256.0f;
             const ModelRT *btn = d->keycard > 0 ? &buttonKeycardRT
                                                 : &buttonRT;
             for (int side = 0; side < 2; side++) {
                 glPushMatrix();
                 glRotatef((float)(side * 180), 0.0f, 1.0f, 0.0f);
-                glTranslatef(0.6f * 256.0f, 0.7f * 256.0f, -0.1f * 256.0f);
+                glTranslatef(bx, 0.7f * 256.0f, -0.1f * 256.0f);
                 drawModelRT(btn);
                 glPopMatrix();
             }
@@ -2360,7 +2565,12 @@ static int startNewGame(void) {
     gameState = 1;
     worldReady = 1;
     pauseOpen = 0;
-    gameMusicStart();
+    if (introEnabled) {
+        introStart();
+    } else {
+        introPhase = -1;
+        gameMusicStart();
+    }
     return 1;
 }
 
@@ -3042,7 +3252,11 @@ int main(void) {
                         pauseOpen = 0;
                         break;
                     case 1: /* SAVE GAME (gated by the difficulty) */
-                        if (DIFFICULTIES[gameDiff].saveType == NO_SAVES) {
+                        if (introPhase >= 0) {
+                            snprintf(toastMsg, sizeof(toastMsg),
+                                     "YOU CANNOT SAVE DURING THE INTRO");
+                        } else if (DIFFICULTIES[gameDiff].saveType
+                                   == NO_SAVES) {
                             snprintf(toastMsg, sizeof(toastMsg),
                                      "SAVING IS DISABLED ON THIS DIFFICULTY");
                         } else if (DIFFICULTIES[gameDiff].saveType
@@ -3170,6 +3384,7 @@ int main(void) {
         if (haveData && !pauseOpen) {
             doorsUpdate(&doors);
             update173();
+            introUpdate();
             itemSpin += 1.0f;
             if (itemSpin >= 360.0f) itemSpin -= 360.0f;
         }
@@ -3188,6 +3403,10 @@ int main(void) {
                              "YOU DIED - GAME OVER");
                     toastTimer = 240;
                     continue;
+                }
+                if (introPhase >= 0) {
+                    introPhase = -1;
+                    gameMusicStart();
                 }
                 spawnPlayer();
                 npc173Pos[0] = npc173SpawnX;
