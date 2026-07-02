@@ -479,6 +479,16 @@ static int fogOn = 1;
 
 /* Vitals (approximate Main_Core.bb rates). */
 static float blinkTimer = 100.0f;   /* 0..100, drains ~10s */
+static float health = 100.0f;
+static float damageFlash;           /* red flash on taking damage */
+static float fallPeakY;             /* apex of the current fall */
+static char deathCause[64] = "SCP-173";
+/* Wearables and hand items (used from the inventory). */
+static int wearGasMask;
+static int wearNVG;                 /* 0 none, 1 normal, 2 fine */
+static int wear268;                 /* SCP-268: unseen by NPCs */
+static int wearVest;
+static int radioChannel = -1;       /* -1 off, 0..3 = SCPRadio0-3 */
 static int blinkFrames;             /* >0 while eyes closed */
 static float stamina = 100.0f;      /* sprint resource */
 static int staminaBlocked;
@@ -516,6 +526,13 @@ static void regenerateMap(uint32_t seed) {
     memset(roomVisited, 0, sizeof(roomVisited));
     equippedNav = -1;
     navVisible = 1;
+    health = 100.0f;
+    damageFlash = 0.0f;
+    wearGasMask = 0;
+    wearNVG = 0;
+    wear268 = 0;
+    wearVest = 0;
+    if (radioChannel >= 0) radioChannel = -1;
     for (uint32_t i = 0; i < tplList.count; i++) {
         templateUnload(&tplRT[i]);
     }
@@ -660,6 +677,7 @@ static int sndBigOpen[3], sndBigClose[3];
 static int sndStep[8], sndRun[7];
 static int sndButton[2], sndKeycardUse[2], sndDoorLock;
 static int sndPick[4];
+static int sndDamage[4];
 static int sndAmbience;
 static int sndRattle[3], sndNeckSnap[3], sndStoneDrag;
 static int sndHorrorSpot[2], sndHorrorClose[5], sndDoor173;
@@ -692,6 +710,10 @@ static void loadSounds(void) {
         sndKeycardUse[i] = audioLoad(p);
     }
     sndDoorLock = audioLoad(SFX_DIR "/Interact/DoorLock.ogg");
+    for (int i = 0; i < 4; i++) {
+        snprintf(p, sizeof(p), SFX_DIR "/Character/D9341/Damage%d.ogg", i);
+        sndDamage[i] = audioLoad(p);
+    }
     for (int i = 0; i < 4; i++) {
         snprintf(p, sizeof(p), SFX_DIR "/Interact/PickItem%d.ogg", i);
         sndPick[i] = audioLoad(p);
@@ -999,8 +1021,9 @@ static void update173(void) {
     int sameLevel = feetDy < 220.0f;
 
     /* "Temp" in the original: the player is a reachable target
-     * (EntityVisible approximated by range + same floor). */
-    int hasTarget = dist < 2560.0f && sameLevel;
+     * (EntityVisible approximated by range + same floor). SCP-268
+     * makes the wearer unnoticeable (I_268\InvisibilityOn). */
+    int hasTarget = dist < 2560.0f && sameLevel && !wear268;
     int seen = playerSees173();
     int move = !(seen && dist < 3840.0f);
     int moving = 0;
@@ -1047,6 +1070,7 @@ static void update173(void) {
             npc173HeadYawDeg = 0.0f; /* body faces the player */
             if (dist < 166.0f) {
                 /* Kill: neck snap, camera wrenched around. */
+                snprintf(deathCause, sizeof(deathCause), "SCP-173");
                 audioPlay(sndNeckSnap[rand() % 3], 1.0f, 0.0f);
                 camYaw += ((rand() % 2) ? 1.0f : -1.0f)
                         * (80.0f + (float)(rand() % 21))
@@ -1346,6 +1370,9 @@ static const ModelRT *itemModel(int tpl) {
 static int playerKeycard(void) {
     int level = 0;
     for (unsigned i = 0; i < inventoryCount; i++) {
+        if (strcmp(ITEM_TEMPLATES[inventory[i]].name, "SCP-005") == 0) {
+            return 6; /* the skeleton key opens everything */
+        }
         int l = itemKeycardLevel(inventory[i]);
         if (l > level) level = l;
     }
@@ -1419,6 +1446,16 @@ static int itemPickupNearest(const float pos[3]) {
     return worldItems[best].tpl;
 }
 
+static void consumeSlot(int slot) {
+    for (unsigned i = (unsigned)slot; i + 1 < inventoryCount; i++) {
+        inventory[i] = inventory[i + 1];
+    }
+    inventoryCount--;
+    if (invSel >= (int)inventoryCount && invSel > 0) invSel--;
+}
+
+static void radioSetChannel(int ch);
+
 /* Use/equip the selected inventory item (the game's right-click).
  * Returns a toast string or NULL if the item has no use action. */
 static const char *useInventoryItem(int slot) {
@@ -1426,14 +1463,10 @@ static const char *useInventoryItem(int slot) {
     if (slot < 0 || slot >= (int)inventoryCount) return NULL;
     int tpl = inventory[slot];
     const char *name = ITEM_TEMPLATES[tpl].name;
+
     if (strstr(name, "Eyedrops")) {
-        /* ReVision Eyedrops: refills the blink meter, consumed. */
         blinkTimer = 100.0f;
-        for (unsigned i = (unsigned)slot; i + 1 < inventoryCount; i++) {
-            inventory[i] = inventory[i + 1];
-        }
-        inventoryCount--;
-        if (invSel >= (int)inventoryCount && invSel > 0) invSel--;
+        consumeSlot(slot);
         return "YOU USED THE EYEDROPS";
     }
     if (strstr(name, "S-NAV")) {
@@ -1446,6 +1479,80 @@ static const char *useInventoryItem(int slot) {
             snprintf(msg, sizeof(msg), "EQUIPPED THE %s", name);
         }
         return msg;
+    }
+    if (strstr(name, "First Aid Kit")) {
+        if (health >= 100.0f) return "YOU ARE NOT INJURED";
+        health = 100.0f;
+        consumeSlot(slot);
+        return "YOU BANDAGE YOUR WOUNDS";
+    }
+    if (strcmp(name, "SCP-500-01") == 0) {
+        health = 100.0f;
+        blinkTimer = 100.0f;
+        stamina = 100.0f;
+        staminaBlocked = 0;
+        consumeSlot(slot);
+        return "YOU SWALLOW THE PILL. YOU FEEL GREAT";
+    }
+    if (strcmp(name, "SCP-500") == 0) {
+        return "THE BOTTLE OF PILLS - USE ONE FROM YOUR INVENTORY";
+    }
+    if (strstr(name, "420-J")) {
+        health += 30.0f;
+        if (health > 100.0f) health = 100.0f;
+        consumeSlot(slot);
+        return "MAN, THIS IS SOME REALLY GOOD S***";
+    }
+    if (strcmp(name, "Gas Mask") == 0) {
+        wearGasMask = !wearGasMask;
+        return wearGasMask ? "YOU PUT ON THE GAS MASK"
+                           : "YOU TAKE OFF THE GAS MASK";
+    }
+    if (strstr(name, "Night Vision Goggles")) {
+        int fine = strstr(name, "Fine") != NULL ? 2 : 1;
+        wearNVG = (wearNVG == fine) ? 0 : fine;
+        return wearNVG ? "YOU PUT ON THE NIGHT VISION GOGGLES"
+                       : "YOU TAKE OFF THE NIGHT VISION GOGGLES";
+    }
+    if (strcmp(name, "SCP-268") == 0) {
+        wear268 = !wear268;
+        return wear268 ? "YOU PUT ON THE CAP. YOU FEEL... UNNOTICEABLE"
+                       : "YOU TAKE OFF THE CAP";
+    }
+    if (strcmp(name, "Ballistic Vest") == 0) {
+        wearVest = !wearVest;
+        return wearVest ? "YOU PUT ON THE BALLISTIC VEST"
+                        : "YOU TAKE OFF THE BALLISTIC VEST";
+    }
+    if (strcmp(name, "Radio Transceiver") == 0) {
+        radioSetChannel(radioChannel >= 3 ? -1 : radioChannel + 1);
+        if (radioChannel < 0) return "YOU SWITCH OFF THE RADIO";
+        snprintf(msg, sizeof(msg), "RADIO: CHANNEL %d", radioChannel + 1);
+        return msg;
+    }
+    if (strcmp(name, "Pizza Slice") == 0) {
+        health += 10.0f;
+        if (health > 100.0f) health = 100.0f;
+        consumeSlot(slot);
+        return "YOU EAT THE PIZZA SLICE. IT'S COLD";
+    }
+    if (strcmp(name, "Cup") == 0) {
+        consumeSlot(slot);
+        return "YOU DRINK THE LIQUID. IT TASTES LIKE NOTHING";
+    }
+    if (strcmp(name, "SCP-005") == 0) {
+        return "A KEY THAT SEEMS TO FIT ANY LOCK";
+    }
+    if (strcmp(name, "Quarter") == 0) return "A QUARTER. HEADS";
+    if (strcmp(name, "Origami") == 0) return "A PAPER CRANE";
+    if (strcmp(name, "Playing Card") == 0) {
+        return "THE ACE OF SPADES";
+    }
+    if (strcmp(name, "Wallet") == 0) {
+        return "SOMEONE'S WALLET. IT'S EMPTY";
+    }
+    if (strcmp(name, "SCP-714") == 0) {
+        return "THE JADE RING IS TOO SMALL FOR YOUR FINGERS";
     }
     return NULL;
 }
@@ -1702,8 +1809,23 @@ static void menuMusicStart(void) {
 /* Zone music while playing; the generated facility is the Light
  * Containment Zone (Music[0] in Loading_Core.bb). */
 static void gameMusicStart(void) {
+    if (radioChannel >= 0) return; /* the radio owns the music path */
     audioStreamMusic(DATA_ROOT "/SFX/Music/LightContainmentZone.ogg",
                      0.55f, 1);
+}
+
+/* Radio Transceiver: SCPRadio stations stream where the zone music
+ * normally plays; switching it off restores the music. */
+static void radioSetChannel(int ch) {
+    radioChannel = ch;
+    if (ch < 0) {
+        audioStopMusic();
+        gameMusicStart();
+        return;
+    }
+    char path[256];
+    snprintf(path, sizeof(path), DATA_ROOT "/SFX/Radio/SCPRadio%d.ogg", ch);
+    audioStreamMusic(path, 0.75f, 1);
 }
 
 /* ---- named saves ---- */
@@ -1733,6 +1855,8 @@ static int saveGame(void) {
     fprintf(f, "player=%f %f %f %f %f\n", camPos[0], camPos[1], camPos[2],
             camYaw, camPitch);
     fprintf(f, "vitals=%f %f\n", blinkTimer, stamina);
+    fprintf(f, "cond=%f %d %d %d %d %d\n", health, wearGasMask, wearNVG,
+            wear268, wearVest, radioChannel);
     fprintf(f, "npc173=%f %f %f %f %d\n", npc173Pos[0], npc173Pos[1],
             npc173Pos[2], npc173YawDeg, npc173Active);
     fprintf(f, "nav=%s\n",
@@ -1770,6 +1894,9 @@ static int loadGameFrom(const char *path) {
     uint32_t seed = 0;
     float px = 0, py = 0, pz = 0, yaw = 0, pitch = 0, bt = 100, st = 100;
     float nx = 0, ny = 0, nz = 0, nyaw = 0;
+    float condHealth = 100.0f;
+    int condWear[4] = { 0, 0, 0, 0 };
+    int condRadio = -1;
     int nact = 1;
     int diff = 1;
     char name[16] = "save";
@@ -1803,6 +1930,14 @@ static int loadGameFrom(const char *path) {
             p = line + 7;
             bt = strtof(p, &p);
             st = strtof(p, &p);
+        } else if (strncmp(line, "cond=", 5) == 0) {
+            p = line + 5;
+            condHealth = strtof(p, &p);
+            condWear[0] = (int)strtol(p, &p, 10);
+            condWear[1] = (int)strtol(p, &p, 10);
+            condWear[2] = (int)strtol(p, &p, 10);
+            condWear[3] = (int)strtol(p, &p, 10);
+            condRadio = (int)strtol(p, &p, 10);
         } else if (strncmp(line, "npc173=", 7) == 0) {
             p = line + 7;
             nx = strtof(p, &p);
@@ -1846,6 +1981,12 @@ static int loadGameFrom(const char *path) {
     velY = 0.0f;
     blinkTimer = bt;
     stamina = st;
+    health = condHealth;
+    wearGasMask = condWear[0];
+    wearNVG = condWear[1];
+    wear268 = condWear[2];
+    wearVest = condWear[3];
+    radioSetChannel(condRadio);
     npc173Pos[0] = nx;
     npc173Pos[1] = ny;
     npc173Pos[2] = nz;
@@ -3414,8 +3555,9 @@ int main(void) {
                 npc173WasMoving = 0;
                 npc173EnemyX = npc173EnemyZ = 0.0f;
                 npc173LastDist = 1e9f;
+                health = 100.0f;
                 snprintf(toastMsg, sizeof(toastMsg),
-                         "YOU WERE KILLED BY SCP-173");
+                         "YOU WERE KILLED BY %s", deathCause);
                 toastTimer = 240;
             }
         }
@@ -3455,14 +3597,17 @@ int main(void) {
                     staminaBlocked = 1;
                 }
             } else {
-                stamina += 0.25f;
+                /* The gas mask steadies your breathing. */
+                stamina += wearGasMask ? 0.5f : 0.25f;
                 if (stamina > 100.0f) stamina = 100.0f;
                 if (staminaBlocked && stamina > 25.0f) staminaBlocked = 0;
             }
 
             /* Blink: meter drains; empty or R closes the eyes. New
              * blinks don't start while a menu is open. */
-            if (!invOpen && !pauseOpen) blinkTimer -= 100.0f / 600.0f;
+            if (!invOpen && !pauseOpen && wearNVG != 2) {
+                blinkTimer -= 100.0f / 600.0f;
+            }
             if (!invOpen && !pauseOpen && inputHit(ACTION_BLINK)) {
                 blinkTimer = 0.0f;
             }
@@ -3500,6 +3645,9 @@ int main(void) {
             velY -= GRAVITY;
             if (velY < -TERMINAL_FALL) velY = -TERMINAL_FALL;
             camPos[1] += velY;
+            if (velY >= 0.0f || camPos[1] > fallPeakY) {
+                fallPeakY = camPos[1];
+            }
 
             float body[3] = { camPos[0], camPos[1] - BODY_DROP, camPos[2] };
             pushWorld(body, PLAYER_RADIUS, NULL);
@@ -3514,8 +3662,26 @@ int main(void) {
             if (rayDownWorld(camPos, eye + STEP_SLACK, &hitY)) {
                 float target = hitY + eye;
                 if (camPos[1] <= target) {
+                    /* Landing after a long drop hurts (the game's
+                     * falling damage); the ballistic vest absorbs
+                     * some of it. ~2.7 units is safe, ~8 is lethal. */
+                    float drop = fallPeakY - target;
+                    if (drop > 700.0f && deathTimer == 0) {
+                        float dmg = (drop - 700.0f) * 0.08f;
+                        if (wearVest) dmg *= 0.6f;
+                        health -= dmg;
+                        damageFlash = 0.6f;
+                        audioPlay(sndDamage[rand() % 4], 1.0f, 0.0f);
+                        if (health <= 0.0f) {
+                            health = 0.0f;
+                            snprintf(deathCause, sizeof(deathCause),
+                                     "THE FALL");
+                            deathTimer = 180;
+                        }
+                    }
                     camPos[1] = target;
                     velY = 0.0f;
+                    fallPeakY = camPos[1];
                 }
             }
             if (pushedUp && velY < 0.0f) velY = 0.0f;
@@ -3586,6 +3752,30 @@ int main(void) {
         glDisable(GL_CULL_FACE);
         glDisableClientState(GL_COLOR_ARRAY);
         glDisableClientState(GL_TEXTURE_COORD_ARRAY);
+        /* Night vision: brighten the scene green (additive). */
+        if (haveData && wearNVG && !invOpen && !pauseOpen
+            && deathTimer == 0) {
+            glBlendFunc(GL_SRC_ALPHA, GL_ONE);
+            glEnable(GL_BLEND);
+            GLfloat nvVerts[12] = { 0, 0, SCREEN_W, 0, SCREEN_W, SCREEN_H,
+                                    0, 0, SCREEN_W, SCREEN_H, 0, SCREEN_H };
+            glDisable(GL_TEXTURE_2D);
+            glColor4f(0.05f, 0.5f, 0.08f, wearNVG == 2 ? 0.4f : 0.28f);
+            glVertexPointer(2, GL_FLOAT, 0, nvVerts);
+            glDrawArrays(GL_TRIANGLES, 0, 6);
+            glDisable(GL_BLEND);
+            glColor4f(1, 1, 1, 1);
+        }
+        /* Injuries: a red vignette that deepens as health drops, plus
+         * a flash when damage lands. */
+        if (haveData && deathTimer == 0) {
+            float hurt = (100.0f - health) / 100.0f * 0.30f + damageFlash;
+            if (damageFlash > 0.0f) damageFlash -= 0.02f;
+            if (hurt > 0.01f) {
+                drawQuad(0, 0, SCREEN_W, SCREEN_H, 0, 0.6f, 0.0f, 0.0f,
+                         hurt > 0.8f ? 0.8f : hurt);
+            }
+        }
         if (haveData && walkMode && !invOpen && !pauseOpen) {
             drawMeter(20, SCREEN_H - 60, hudBlinkIcon, hudBlinkBar,
                       blinkTimer / 100.0f);
