@@ -405,7 +405,10 @@ static void updateActiveRooms(const float pos[3]) {
     }
 }
 
+static int inIntroBounds(float x, float z);
+
 static const char *roomNameAt(const float pos[3]) {
+    if (inIntroBounds(pos[0], pos[2])) return "cont1_173_intro";
     int px = (int)floorf(pos[0] / ROOM_SPACING + 0.5f);
     int py = (int)floorf(pos[2] / ROOM_SPACING + 0.5f);
     for (uint32_t i = 0; i < map.roomCount; i++) {
@@ -1199,12 +1202,14 @@ static void introStart(void) {
         }
     }
 
-    /* Wake up in the Class-D cell (the recessed pocket off the block
-     * corridor; the escort guards stand just outside it). */
-    camPos[0] = INTRO_GX * ROOM_SPACING - 4250.0f;
-    camPos[1] = EYE_HEIGHT;
-    camPos[2] = INTRO_GY * ROOM_SPACING + 730.0f;
-    camYaw = 3.14159265f; /* face the corridor */
+    /* Wake up in the Class-D cell: the cells sit north of the block
+     * corridor (corridor floor y=384, cells y=320; the middle cell is
+     * at local x~-4050, z~1050 - the escort guards stand right
+     * outside it on the corridor). */
+    camPos[0] = INTRO_GX * ROOM_SPACING - 4050.0f;
+    camPos[1] = 320.0f + EYE_HEIGHT;
+    camPos[2] = INTRO_GY * ROOM_SPACING + 1060.0f;
+    camYaw = 0.0f; /* face the corridor (south) */
     camPitch = 0.0f;
     velY = 0.0f;
     npc173Active = 0; /* nothing hunts until the breach */
@@ -1325,14 +1330,15 @@ static int introHumanCount;
 
 static void introPlaceHumans(void) {
     IntroHuman defs[8] = {
-        { &introGuardRT, -4205.0f, 0.0f, 870.0f, 180.0f },  /* Ulgrin */
-        { &introGuardRT, -3985.0f, 0.0f, 786.0f, 135.0f },
-        { &introGuardRT, -8064.0f, 0.0f, 1096.0f, 180.0f }, /* radio guy */
-        { &introClassDRT, -3700.0f, 0.0f, 750.0f, 90.0f },  /* inmate */
-        { &introGuardRT, 328.0f, 480.0f, 1072.0f, 180.0f }, /* balcony */
+        /* The block corridor floor is at y=384, the cells at 320. */
+        { &introGuardRT, -4205.0f, 384.0f, 870.0f, 180.0f }, /* Ulgrin */
+        { &introGuardRT, -3985.0f, 384.0f, 786.0f, 135.0f },
+        { &introGuardRT, -8064.0f, 0.0f, 1096.0f, 180.0f },  /* radio guy */
+        { &introClassDRT, -3550.0f, 320.0f, 1060.0f, 0.0f }, /* inmate */
+        { &introGuardRT, 328.0f, 480.0f, 1072.0f, 180.0f },  /* balcony */
         { &introFranklinRT, -3424.0f, -100.0f, -2208.0f, 0.0f },
         { &introScientistRT, -3073.0f, -315.0f, -2165.0f, 45.0f },
-        { &introGuardRT, -4000.0f, 0.0f, 950.0f, 160.0f },
+        { &introGuardRT, -4000.0f, 384.0f, 950.0f, 160.0f },
     };
     introHumanCount = 0;
     for (int i = 0; i < 8; i++) {
