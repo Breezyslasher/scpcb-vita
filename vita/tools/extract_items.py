@@ -36,6 +36,11 @@ for line in open(LOADING, encoding="latin-1"):
     if m:
         name, model, inv = m.group(1), m.group(2), m.group(3)
         doc, scale, tex = m.group(4), m.group(5), m.group(6)
+        # ImgPath$ is only a readable page for paper-class items; for
+        # equipment (radio, navigator, e-reader...) it is the equipped
+        # HUD overlay sprite and must not become a document.
+        if model.lower() not in ("paper.b3d", "note.b3d", "badge.b3d"):
+            doc = ""
         if name not in templates:
             templates[name] = (model, tex or "", float(scale), inv or "",
                                doc or "")

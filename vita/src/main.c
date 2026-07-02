@@ -1214,7 +1214,7 @@ int main(void) {
 
         float fwdX = sinf(camYaw), fwdZ = -cosf(camYaw);
         if (walkMode && haveData) {
-            int crouched = inputDown(ACTION_CROUCH);
+            int crouched = inputDown(ACTION_CROUCH) && !invOpen;
             float eye = crouched ? CROUCH_EYE_HEIGHT : EYE_HEIGHT;
             /* Stamina: drains while sprinting, blocks at empty until
              * partially recovered. */
@@ -1233,16 +1233,12 @@ int main(void) {
                 if (staminaBlocked && stamina > 25.0f) staminaBlocked = 0;
             }
 
-            /* Blink: meter drains; empty or R closes the eyes. Paused
-             * while a menu is open so it never blacks out the UI. */
+            /* Blink: meter drains; empty or R closes the eyes. New
+             * blinks don't start while a menu is open. */
             if (!invOpen) blinkTimer -= 100.0f / 600.0f; /* ~10 s */
             if (!invOpen && inputHit(ACTION_BLINK)) blinkTimer = 0.0f;
             if (!invOpen && blinkTimer <= 0.0f && blinkFrames == 0) {
                 blinkFrames = 18;
-            }
-            if (!invOpen && blinkFrames > 0) {
-                blinkFrames--;
-                if (blinkFrames == 0) blinkTimer = 100.0f;
             }
 
             float speed = WALK_SPEED;
@@ -1296,11 +1292,21 @@ int main(void) {
             /* Fell out of the world: respawn. */
             if (camPos[1] < -4000.0f) spawnPlayer();
         } else {
+            /* Fly: no vertical movement while a menu is open (Circle
+             * closes the reader, R is the manual blink). */
             float speed = 30.0f * (inputDown(ACTION_SPRINT) ? 3.0f : 1.0f);
             camPos[0] += (fwdX * -move.y + cosf(camYaw) * move.x) * speed;
             camPos[2] += (fwdZ * -move.y + sinf(camYaw) * move.x) * speed;
-            if (inputDown(ACTION_BLINK)) camPos[1] += speed;
-            if (inputDown(ACTION_CROUCH)) camPos[1] -= speed;
+            if (!invOpen && inputDown(ACTION_BLINK)) camPos[1] += speed;
+            if (!invOpen && inputDown(ACTION_CROUCH)) camPos[1] -= speed;
+        }
+
+        /* A started blink always finishes counting down, whatever mode
+         * or menu the player switches to (the quad itself is hidden
+         * while a menu is open). */
+        if (blinkFrames > 0) {
+            blinkFrames--;
+            if (blinkFrames == 0) blinkTimer = 100.0f;
         }
 
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
