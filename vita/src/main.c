@@ -49,6 +49,7 @@ unsigned int _newlib_heap_size_user = 220 * 1024 * 1024;
 #define ITEMS_HUD_DIR DATA_ROOT "/GFX/Items/HUD Textures"
 #define HUD_DIR DATA_ROOT "/GFX/HUD"
 #define INV_ICONS_DIR DATA_ROOT "/GFX/Items/Inventory Icons"
+#define NPCS_DIR DATA_ROOT "/GFX/NPCs"
 #define ROOMS_INI DATA_ROOT "/Data/rooms.ini"
 
 /* RoomSpacing is 8 world units = 2048 raw mesh units. */
@@ -86,10 +87,10 @@ static GLuint textureGet(const char *name) {
     }
 
     GLuint handle = 0;
-    const char *dirs[7] = { MAP_DIR, MAP_TEXTURES_DIR, PROPS_DIR, ITEMS_DIR,
-                            ITEMS_HUD_DIR, HUD_DIR, INV_ICONS_DIR };
+    const char *dirs[8] = { MAP_DIR, MAP_TEXTURES_DIR, PROPS_DIR, ITEMS_DIR,
+                            ITEMS_HUD_DIR, HUD_DIR, INV_ICONS_DIR, NPCS_DIR };
     char path[1024];
-    if (textureResolve(name, dirs, 7, path, sizeof(path))) {
+    if (textureResolve(name, dirs, 8, path, sizeof(path))) {
         char err[128];
         TextureImage *img = textureLoadFile(path, TEXTURE_CAP, err, sizeof(err));
         if (img) {
@@ -156,9 +157,9 @@ static B3DModel *propModelGet(const char *rawName) {
     }
 
     B3DModel *model = NULL;
-    const char *dirs[2] = { PROPS_DIR, ITEMS_DIR };
+    const char *dirs[3] = { PROPS_DIR, ITEMS_DIR, NPCS_DIR };
     char path[1024];
-    if (textureResolve(name, dirs, 2, path, sizeof(path))) {
+    if (textureResolve(name, dirs, 3, path, sizeof(path))) {
         char err[128];
         model = b3dLoadFile(path, err, sizeof(err));
     }
@@ -390,6 +391,18 @@ static float stamina = 100.0f;      /* sprint resource */
 static int staminaBlocked;
 static char statusLine[256];
 
+/* ---------------- SCP-173 state ---------------- */
+
+static int npc173Active;
+static float npc173Pos[3];      /* floor position, raw units */
+static float npc173SpawnX, npc173SpawnZ;
+static float npc173YawDeg;
+static int npc173DragCooldown;
+static int npc173WasMoving;
+static int deathTimer;          /* >0: death screen counting down */
+
+static void reset173(void);
+
 static void spawnItems(void);
 
 static void spawnPlayer(void) {
@@ -411,6 +424,7 @@ static void regenerateMap(uint32_t seed) {
     if (mapGenerate(&tplList, mapSeed, &map)) {
         doorsGenerate(&map, &tplList, mapSeed ^ 0x9E3779B9u, &doors);
         spawnItems();
+        reset173();
         snprintf(statusLine, sizeof(statusLine), "map seed %u: %u rooms %u doors",
                  mapSeed, map.roomCount, doors.count);
     } else {
@@ -531,6 +545,7 @@ static int sndStep[8], sndRun[7];
 static int sndButton[2], sndKeycardUse[2], sndDoorLock;
 static int sndPick[4];
 static int sndAmbience;
+static int sndRattle[3], sndNeckSnap[3], sndStoneDrag;
 static float stepAccum;
 
 static void loadSounds(void) {
@@ -564,6 +579,13 @@ static void loadSounds(void) {
         snprintf(p, sizeof(p), SFX_DIR "/Interact/PickItem%d.ogg", i);
         sndPick[i] = audioLoad(p);
     }
+    for (int i = 0; i < 3; i++) {
+        snprintf(p, sizeof(p), SFX_DIR "/SCP/173/Rattle%d.ogg", i);
+        sndRattle[i] = audioLoad(p);
+        snprintf(p, sizeof(p), SFX_DIR "/SCP/173/NeckSnap%d.ogg", i);
+        sndNeckSnap[i] = audioLoad(p);
+    }
+    sndStoneDrag = audioLoad(SFX_DIR "/SCP/173/StoneDrag.ogg");
     sndAmbience = audioLoad(SFX_DIR "/Ambient/Room ambience/rumble.ogg");
     audioLoopAmbience(sndAmbience, 0.30f);
 }
@@ -637,6 +659,127 @@ static void buildDoorAssets(void) {
 }
 
 static void drawModelRT(const ModelRT *rt);
+
+/* ---------------- SCP-173 behavior ---------------- */
+
+static ModelRT npc173RT;
+static float npc173YOff; /* lifts the model so its base sits on the floor */
+
+static void buildNpcAssets(void) {
+    buildModelRT(&npc173RT, "scp_173_body.b3d", 0, 0, 0, NULL);
+    if (npc173RT.scene) {
+        /* NPCs.ini: Scale = 0.3 world units of mesh depth (z). */
+        float extZ = npc173RT.scene->boundsMax[2] - npc173RT.scene->boundsMin[2];
+        float k = extZ > 0.0f ? (0.3f * 256.0f) / extZ : 1.0f;
+        npc173RT.scale[0] = npc173RT.scale[1] = npc173RT.scale[2] = k;
+        npc173YOff = -npc173RT.scene->boundsMin[1] * k;
+    }
+}
+
+static void reset173(void) {
+    npc173Active = 0;
+    for (uint32_t i = 0; i < map.roomCount; i++) {
+        const char *nm = tplList.items[map.rooms[i].templateIndex].name;
+        if (strcmp(nm, "cont1_173") == 0) {
+            npc173SpawnX = map.rooms[i].gridX * ROOM_SPACING;
+            npc173SpawnZ = map.rooms[i].gridY * ROOM_SPACING;
+            npc173Pos[0] = npc173SpawnX;
+            npc173Pos[1] = 0.0f;
+            npc173Pos[2] = npc173SpawnZ;
+            npc173YawDeg = 0.0f;
+            npc173Active = npc173RT.ok;
+            break;
+        }
+    }
+    npc173WasMoving = 0;
+    npc173DragCooldown = 0;
+    deathTimer = 0;
+}
+
+/* PlayerSees173 (NPCs_Core.bb 1166): frustum + blink only, no wall
+ * occlusion. Approximated as a horizontal view cone. */
+static int playerSees173(void) {
+    if (blinkFrames > 0) return 0;
+    float dx = npc173Pos[0] - camPos[0];
+    float dz = npc173Pos[2] - camPos[2];
+    float dist = sqrtf(dx * dx + dz * dz);
+    if (dist < 60.0f) return 1;
+    float fwdX = sinf(camYaw), fwdZ = -cosf(camYaw);
+    float dot = (dx * fwdX + dz * fwdZ) / dist;
+    return dot > 0.55f; /* ~57-degree half-angle (bbox partially on screen) */
+}
+
+static void update173(void) {
+    if (!npc173Active || deathTimer > 0 || !walkMode) return;
+    float dx = camPos[0] - npc173Pos[0];
+    float dz = camPos[2] - npc173Pos[2];
+    float dist = sqrtf(dx * dx + dz * dz);
+    if (dist > ROOM_SPACING * 3.5f) return; /* dormant when far away */
+
+    int seen = playerSees173();
+    int moving = 0;
+
+    if (!seen) {
+        /* Kill on contact while unobserved. */
+        if (dist < 110.0f) {
+            audioPlay(sndNeckSnap[rand() % 3], 1.0f, 0.0f);
+            deathTimer = 180;
+            return;
+        }
+
+        /* NPCs.ini Speed = 38 -> 0.38 world units/frame = ~97 raw.
+         * Substep so it cannot tunnel through walls or closed doors. */
+        float speed = 97.0f;
+        if (speed > dist - 80.0f) speed = dist - 80.0f;
+        if (speed > 0.0f) {
+            int steps = (int)(speed / 25.0f) + 1;
+            float sx = dx / dist * (speed / steps);
+            float sz = dz / dist * (speed / steps);
+            for (int s = 0; s < steps; s++) {
+                npc173Pos[0] += sx;
+                npc173Pos[2] += sz;
+                float body[3] = { npc173Pos[0], npc173Pos[1] + 110.0f,
+                                  npc173Pos[2] };
+                pushWorld(body, 48.0f, NULL);
+                doorsCollide(&doors, body, 48.0f);
+                npc173Pos[0] = body[0];
+                npc173Pos[2] = body[2];
+            }
+            npc173YawDeg = atan2f(dx, dz) * 180.0f / 3.14159265f;
+            moving = 1;
+        }
+
+        /* Keep it on the floor. */
+        float origin[3] = { npc173Pos[0], npc173Pos[1] + 250.0f,
+                            npc173Pos[2] };
+        float hitY;
+        if (rayDownWorld(origin, 600.0f, &hitY)) {
+            npc173Pos[1] = hitY;
+        }
+    }
+
+    /* Stone drag while moving; a rattle when it halts nearby. */
+    if (moving) {
+        if (npc173DragCooldown-- <= 0) {
+            audioPlay3D(sndStoneDrag, npc173Pos, camPos, camYaw, 2200.0f);
+            npc173DragCooldown = 40;
+        }
+    } else if (npc173WasMoving && dist < 1200.0f) {
+        audioPlay3D(sndRattle[rand() % 3], npc173Pos, camPos, camYaw, 2200.0f);
+    }
+    npc173WasMoving = moving;
+}
+
+static void draw173(const float viewPos[3]) {
+    if (!npc173Active || !npc173RT.ok) return;
+    float dx = npc173Pos[0] - viewPos[0], dz = npc173Pos[2] - viewPos[2];
+    if (dx * dx + dz * dz > VIEW_RANGE * VIEW_RANGE) return;
+    glPushMatrix();
+    glTranslatef(npc173Pos[0], npc173Pos[1] + npc173YOff, npc173Pos[2]);
+    glRotatef(npc173YawDeg, 0.0f, 1.0f, 0.0f);
+    drawModelRT(&npc173RT);
+    glPopMatrix();
+}
 
 /* ---------------- items and inventory ---------------- */
 
@@ -1083,6 +1226,7 @@ int main(void) {
     if (haveData) {
         tplRT = (TemplateRT *)calloc(tplList.count, sizeof(TemplateRT));
         buildDoorAssets();
+        buildNpcAssets();
         loadHudTextures();
         if (audioInit()) loadSounds();
         regenerateMap((uint32_t)(sceKernelGetProcessTimeWide() & 0xFFFFFF) | 1u);
@@ -1188,8 +1332,21 @@ int main(void) {
         }
         if (haveData) {
             doorsUpdate(&doors);
+            update173();
             itemSpin += 1.0f;
             if (itemSpin >= 360.0f) itemSpin -= 360.0f;
+        }
+        if (deathTimer > 0) {
+            deathTimer--;
+            if (deathTimer == 0) {
+                spawnPlayer();
+                npc173Pos[0] = npc173SpawnX;
+                npc173Pos[2] = npc173SpawnZ;
+                npc173WasMoving = 0;
+                snprintf(toastMsg, sizeof(toastMsg),
+                         "YOU WERE KILLED BY SCP-173");
+                toastTimer = 240;
+            }
         }
         if (toastTimer > 0) toastTimer--;
         if (haveData && !invOpen && inputHit(ACTION_LEAN_RIGHT)) {
@@ -1198,8 +1355,9 @@ int main(void) {
 
         StickState look = inputLook();
         StickState move = inputMove();
-        if (invOpen) {
-            /* Freeze the camera and player while the menu is open. */
+        if (invOpen || deathTimer > 0) {
+            /* Freeze the camera and player while a menu is open or the
+             * death screen is playing. */
             look.x = look.y = 0.0f;
             move.x = move.y = 0.0f;
         }
@@ -1326,6 +1484,7 @@ int main(void) {
             }
             drawDoors(camPos);
             drawItems(camPos);
+            draw173(camPos);
             glDisable(GL_CULL_FACE);
             for (int i = 0; i < activeCount; i++) {
                 drawRoomBatches(activeRooms[i], 1);
@@ -1366,6 +1525,20 @@ int main(void) {
                 drawInventory();
             }
         }
+        /* Death: fade to black with a red flash and a message. */
+        if (deathTimer > 0) {
+            float t = 1.0f - deathTimer / 180.0f; /* 0 -> 1 */
+            float red = t < 0.2f ? (0.2f - t) * 2.5f : 0.0f;
+            drawQuad(0, 0, SCREEN_W, SCREEN_H, 0, red, 0.0f, 0.0f,
+                     0.35f + 0.65f * t);
+            glPushMatrix();
+            glScalef(3.0f, 3.0f, 1.0f);
+            glColor4f(0.8f, 0.1f, 0.1f, 1.0f);
+            drawText(SCREEN_W / 6.0f - 34.0f, SCREEN_H / 6.0f, "YOU DIED");
+            glColor4f(1, 1, 1, 1);
+            glPopMatrix();
+        }
+
         /* Eyes closed: solid black, but never over an open menu. */
         if (blinkFrames > 0 && !invOpen) {
             drawQuad(0, 0, SCREEN_W, SCREEN_H, 0, 0.0f, 0.0f, 0.0f, 1.0f);
