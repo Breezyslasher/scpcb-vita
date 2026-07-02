@@ -786,11 +786,25 @@ static void teleport173Closer(void) {
         if (rand() % count == 0) best = (int)i;
     }
     if (best < 0) return;
+    float ox = npc173Pos[0], oy = npc173Pos[1], oz = npc173Pos[2];
     npc173Pos[0] = map.rooms[best].gridX * ROOM_SPACING;
     npc173Pos[2] = map.rooms[best].gridY * ROOM_SPACING;
+    /* Target rooms are usually unloaded, so there may be no collision
+     * to ray against; park it at the player's floor level and let the
+     * floor snap correct it once the room loads. */
     float origin[3] = { npc173Pos[0], camPos[1] + 200.0f, npc173Pos[2] };
     float hitY;
-    npc173Pos[1] = rayDownWorld(origin, 3000.0f, &hitY) ? hitY : 0.0f;
+    if (rayDownWorld(origin, 3000.0f, &hitY)) {
+        npc173Pos[1] = hitY;
+    } else {
+        npc173Pos[1] = camPos[1] - EYE_HEIGHT;
+    }
+    if (!roomExistsAt(npc173Pos[0], npc173Pos[2])) {
+        npc173Pos[0] = ox;
+        npc173Pos[1] = oy;
+        npc173Pos[2] = oz;
+        return;
+    }
     npc173EnemyX = npc173EnemyZ = 0.0f;
 }
 
@@ -812,12 +826,37 @@ static void try173OpenDoor(void) {
     }
 }
 
+/* There is only world (and collision) where a room exists; the grid
+ * gaps between rooms are void. */
+static int roomExistsAt(float x, float z) {
+    int gx = (int)floorf(x / ROOM_SPACING + 0.5f);
+    int gy = (int)floorf(z / ROOM_SPACING + 0.5f);
+    for (uint32_t i = 0; i < map.roomCount; i++) {
+        if (map.rooms[i].gridX == gx && map.rooms[i].gridY == gy) return 1;
+    }
+    return 0;
+}
+
+/* Room collision only exists while a room is loaded (the 3x3 grid
+ * cells around the player's cell); 173 must not walk where nothing
+ * can stop it. */
+static int npc173OnLoadedGround(void) {
+    int pgx = (int)floorf(camPos[0] / ROOM_SPACING + 0.5f);
+    int pgy = (int)floorf(camPos[2] / ROOM_SPACING + 0.5f);
+    int ngx = (int)floorf(npc173Pos[0] / ROOM_SPACING + 0.5f);
+    int ngy = (int)floorf(npc173Pos[2] / ROOM_SPACING + 0.5f);
+    return abs(ngx - pgx) <= 1 && abs(ngy - pgy) <= 1
+        && roomExistsAt(npc173Pos[0], npc173Pos[2]);
+}
+
 /* Substepped move so 173 cannot tunnel through walls or closed
- * doors; returns how far it actually got. */
+ * doors; returns how far it actually got. A substep that would leave
+ * the map (into a grid cell with no room) is undone. */
 static float move173(float dirX, float dirZ, float speed) {
     float sx0 = npc173Pos[0], sz0 = npc173Pos[2];
     int steps = (int)(speed / 25.0f) + 1;
     for (int i = 0; i < steps; i++) {
+        float px = npc173Pos[0], pz = npc173Pos[2];
         npc173Pos[0] += dirX * (speed / steps);
         npc173Pos[2] += dirZ * (speed / steps);
         float body[3] = { npc173Pos[0], npc173Pos[1] + 110.0f, npc173Pos[2] };
@@ -825,6 +864,11 @@ static float move173(float dirX, float dirZ, float speed) {
         doorsCollide(&doors, body, 48.0f);
         npc173Pos[0] = body[0];
         npc173Pos[2] = body[2];
+        if (!roomExistsAt(npc173Pos[0], npc173Pos[2])) {
+            npc173Pos[0] = px;
+            npc173Pos[2] = pz;
+            break;
+        }
     }
     float mx = npc173Pos[0] - sx0, mz = npc173Pos[2] - sz0;
     return sqrtf(mx * mx + mz * mz);
@@ -884,6 +928,11 @@ static void update173(void) {
     } else if (dist > 3482.0f) {
         /* Beyond ~0.8x the hide distance: hop between rooms toward
          * the player instead of pathing the whole facility. */
+        if (rand() % 70 == 0) teleport173Closer();
+        npc173LastDist = dist;
+    } else if (!npc173OnLoadedGround()) {
+        /* Its room is not loaded (or it ended up off-grid): there is
+         * no collision there, so it must not walk. Hop instead. */
         if (rand() % 70 == 0) teleport173Closer();
         npc173LastDist = dist;
     } else {
@@ -1389,15 +1438,17 @@ static void loadMenuTextures(void) {
     menu173Tex = loadMenuTexture("scp_173_back.png");
 }
 
-/* ---- menu music ---- */
-
-static int menuMusic = -1;
+/* ---- music (streamed from disk) ---- */
 
 static void menuMusicStart(void) {
-    if (menuMusic < 0) {
-        menuMusic = audioLoad(DATA_ROOT "/SFX/Music/Menu.ogg");
-    }
-    audioLoopMusic(menuMusic, 0.8f);
+    audioStreamMusic(DATA_ROOT "/SFX/Music/Menu.ogg", 0.8f, 1);
+}
+
+/* Zone music while playing; the generated facility is the Light
+ * Containment Zone (Music[0] in Loading_Core.bb). */
+static void gameMusicStart(void) {
+    audioStreamMusic(DATA_ROOT "/SFX/Music/LightContainmentZone.ogg",
+                     0.55f, 1);
 }
 
 /* ---- named saves ---- */
@@ -2229,7 +2280,7 @@ static int startNewGame(void) {
     gameState = 1;
     worldReady = 1;
     pauseOpen = 0;
-    audioStopMusic();
+    gameMusicStart();
     return 1;
 }
 
@@ -2474,7 +2525,7 @@ static void loadGameTab(void) {
                 gameState = 1;
                 worldReady = 1;
                 pauseOpen = 0;
-                audioStopMusic();
+                gameMusicStart();
                 return;
             }
             snprintf(toastMsg, sizeof(toastMsg), "LOAD FAILED");
@@ -2685,7 +2736,7 @@ static void mainButtonsTab(int *running) {
     /* Start returns to a game in progress (after QUIT TO MENU). */
     if (worldReady && inputHit(ACTION_MENU)) {
         gameState = 1;
-        audioStopMusic();
+        gameMusicStart();
         return;
     }
 

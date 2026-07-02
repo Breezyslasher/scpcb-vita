@@ -25,8 +25,9 @@ void audioPlay3D(int sound, const float pos[3], const float listener[3],
 /* Loop a sound on the dedicated ambience channel (replaces previous). */
 void audioLoopAmbience(int sound, float vol);
 
-/* Loop a sound on the dedicated music channel (menu/zone music). */
-void audioLoopMusic(int sound, float vol);
+/* Stream an OGG from disk on the dedicated music path (decoded on
+ * the mixer thread, so a 3-minute track costs no PCM memory). */
+void audioStreamMusic(const char *path, float vol, int loop);
 void audioStopMusic(void);
 
 /* Master volumes (0..1) applied on top of per-play volumes; the music
