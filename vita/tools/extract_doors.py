@@ -121,17 +121,24 @@ for li, line in enumerate(lines):
             locked = 1
         else:
             keycard = KEYCARDS.get(k, 0)
-    # `d\Locked = 1` on the assigned door within the next few lines.
+    # Keypad-code doors (8th arg nonzero) cannot be opened without the
+    # code; the port treats them as locked until a keypad UI exists.
+    if len(args) > 7 and args[7].strip() not in ("0", ""):
+        locked = 1
+    # Follow-up lines on the assigned door: `d\Locked = 1` locks it,
+    # FreeEntity(d\Buttons[..]) removes its buttons.
+    nobuttons = 0
     if "=" in line.split("CreateDoor")[0]:
-        for follow in lines[li + 1:li + 5]:
+        for follow in lines[li + 1:li + 7]:
             if case_re.match(follow) or "CreateDoor" in follow:
                 break
             if re.search(r'\\Locked\s*=\s*1', follow):
                 locked = 1
-                break
+            if re.search(r'FreeEntity\(d\\Buttons', follow):
+                nobuttons = 1
     for room in active:
         doors.append((room, x, y, z, ang % 360.0, is_open, dtype,
-                      keycard, locked))
+                      keycard, locked, nobuttons))
 
 
 def cf(v):
@@ -153,13 +160,13 @@ with open(OUT, "w") as f:
             "    const char *room;\n"
             "    float x, y, z;    /* room-local raw units */\n"
             "    float angleDeg;   /* Blitz yaw within the room */\n"
-            "    unsigned char open, type, keycard, locked;\n"
+            "    unsigned char open, type, keycard, locked, nobuttons;\n"
             "} RoomDoorDef;\n\n"
             "static const RoomDoorDef ROOM_DOORS[] = {\n")
-    for room, x, y, z, ang, is_open, dtype, keycard, locked in doors:
-        f.write('    { "%s", %s, %s, %s, %s, %d, %d, %d, %d },\n'
+    for room, x, y, z, ang, is_open, dtype, keycard, locked, nob in doors:
+        f.write('    { "%s", %s, %s, %s, %s, %d, %d, %d, %d, %d },\n'
                 % (room, cf(x), cf(y), cf(z), cf(ang), 1 if is_open else 0,
-                   dtype, keycard, locked))
+                   dtype, keycard, locked, nob))
     f.write("};\n\n#endif\n")
 
 print("room doors:", len(doors))

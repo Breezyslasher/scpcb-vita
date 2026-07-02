@@ -34,6 +34,7 @@ static int addDoor(DoorList *list, float x, float z, int angle, int heavy,
     d->openState = open ? 180.0f : 0.0f;
     d->keycard = keycard;
     d->locked = 0;
+    d->nobuttons = 0;
     d->denials = 0;
     return 1;
 }
@@ -141,13 +142,15 @@ void doorsUpdate(DoorList *list) {
 }
 
 int doorsAddInternal(DoorList *list, float x, float y, float z, int angle,
-                     int type, int open, int keycard, int locked) {
+                     int type, int open, int keycard, int locked,
+                     int nobuttons) {
     int heavy = type == 1 || type == 2 || type == 3;
     if (!addDoor(list, x, z, angle, heavy, open, keycard)) return 0;
     Door *d = &list->items[list->count - 1];
     d->y = y;
     d->type = type;
     d->locked = locked;
+    d->nobuttons = nobuttons;
     return 1;
 }
 
@@ -161,17 +164,18 @@ float doorSlide(const Door *d) {
 /* Button local offsets (CreateDoor): x 0.6 - i*1.2, y 0.7,
  * z -0.1 + i*0.2 world units -> raw. */
 void doorButtonWorldPos(const Door *d, int side, float out[3]) {
-    float lx = (0.6f - side * 1.2f) * 256.0f;
+    /* Big gates are wider than the default doorway. */
+    float span = d->type == 3 ? 264.0f : 153.6f; /* 0.6 world units */
+    float lx = span - side * span * 2.0f;
     float ly = 0.7f * 256.0f;
     float lz = (-0.1f + side * 0.2f) * 256.0f;
-    /* Same quarter-turn convention as room placement (render rotates
-     * by -angle). */
-    if (d->angle == 90) {
-        out[0] = d->x + lz;
-        out[2] = d->z - lx;
-    } else {
-        out[0] = d->x + lx;
-        out[2] = d->z + lz;
+    /* Same quarter-turn convention as the renderer (rotates by
+     * -angle). */
+    switch (((d->angle % 360) + 360) % 360) {
+        default:  out[0] = d->x + lx; out[2] = d->z + lz; break;
+        case 90:  out[0] = d->x + lz; out[2] = d->z - lx; break;
+        case 180: out[0] = d->x - lx; out[2] = d->z - lz; break;
+        case 270: out[0] = d->x - lz; out[2] = d->z + lx; break;
     }
     out[1] = d->y + ly;
 }
@@ -183,6 +187,7 @@ DoorPressResult doorsPressButton(DoorList *list, const float pos[3],
     float bestD2 = 1e30f;
     for (uint32_t i = 0; i < list->count; i++) {
         Door *d = &list->items[i];
+        if (d->nobuttons) continue;
         float cdx = pos[0] - d->x, cdz = pos[2] - d->z;
         if (cdx * cdx + cdz * cdz > 1024.0f * 1024.0f) continue;
         for (int side = 0; side < 2; side++) {
@@ -231,9 +236,10 @@ void doorsCollide(const DoorList *list, float pos[3], float radius) {
         if (pos[1] > d->y + DOOR_PANEL_H + 200.0f) continue;
         if (pos[1] < d->y - 100.0f) continue;
 
-        /* Door-local frame: lx spans the doorway, lz is through it. */
+        /* Door-local frame: lx spans the doorway, lz is through it
+         * (the sign convention cancels out for the symmetric box). */
         float lx, lz;
-        if (d->angle == 90) {
+        if (((d->angle % 180) + 180) % 180 == 90) {
             lx = dz;
             lz = dx;
         } else {
@@ -247,7 +253,7 @@ void doorsCollide(const DoorList *list, float pos[3], float radius) {
         float push = (DOOR_PANEL_HALF_D + radius - fabsf(lz))
                    * (lz >= 0.0f ? 1.0f : -1.0f);
         lz += push;
-        if (d->angle == 90) {
+        if (((d->angle % 180) + 180) % 180 == 90) {
             pos[0] = d->x + lz;
         } else {
             pos[2] = d->z + lz;
