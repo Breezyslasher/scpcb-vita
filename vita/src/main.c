@@ -27,6 +27,7 @@
 #include "game/collision.h"
 #include "game/doors.h"
 #include "game/item_spawns.h"
+#include "game/room_doors.h"
 #include "game/mapgen.h"
 #include "input.h"
 #include "render/scene.h"
@@ -310,6 +311,29 @@ static void localToWorld(const RoomPlacement *p, const float l[3],
     w[2] = z + p->gridY * ROOM_SPACING;
 }
 
+/* FillRoom's room-internal doors (containment chambers, elevator
+ * covers, locked service doors) from room_doors.h, placed with the
+ * same transform as item spawns. */
+static void spawnRoomDoors(void) {
+    const int N = (int)(sizeof(ROOM_DOORS) / sizeof(ROOM_DOORS[0]));
+    for (uint32_t r = 0; r < map.roomCount; r++) {
+        const RoomPlacement *p = &map.rooms[r];
+        const char *nm = tplList.items[p->templateIndex].name;
+        for (int i = 0; i < N; i++) {
+            const RoomDoorDef *rd = &ROOM_DOORS[i];
+            if (strcmp(rd->room, nm) != 0) continue;
+            float local[3] = { rd->x, rd->y, rd->z };
+            float w[3];
+            localToWorld(p, local, w);
+            int a = (int)(rd->angleDeg / 90.0f + 0.5f) * 90 + p->angle * 90;
+            int span = ((a % 180) + 180) % 180; /* 0 or 90 */
+            int heavy = rd->type == 1 || rd->type == 2 || rd->type == 3;
+            doorsAddInternal(&doors, w[0], w[1], w[2], span, heavy,
+                             rd->open, rd->keycard, rd->locked);
+        }
+    }
+}
+
 /* Active set: placements within one cell of the player. */
 static const RoomPlacement *activeRooms[16];
 static int activeCount;
@@ -450,6 +474,7 @@ static void regenerateMap(uint32_t seed) {
     mapSeed = seed;
     if (mapGenerate(&tplList, mapSeed, &map)) {
         doorsGenerate(&map, &tplList, mapSeed ^ 0x9E3779B9u, &doors);
+        spawnRoomDoors();
         spawnItems();
         reset173();
         snprintf(statusLine, sizeof(statusLine), "map seed %u: %u rooms %u doors",
@@ -1707,7 +1732,7 @@ static void drawDoors(const float viewPos[3]) {
         if (dx * dx + dz * dz > VIEW_RANGE * VIEW_RANGE) continue;
 
         glPushMatrix();
-        glTranslatef(d->x, 0.0f, d->z);
+        glTranslatef(d->x, d->y, d->z);
         glRotatef(-(float)d->angle, 0.0f, 1.0f, 0.0f);
 
         drawModelRT(&doorFrameRT);

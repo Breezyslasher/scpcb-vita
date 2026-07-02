@@ -16,6 +16,7 @@
 
 typedef struct {
     float x, z;        /* world center, raw mesh units */
+    float y;           /* floor height (internal doors on catwalks) */
     int angle;         /* 0 = spans X (faces Z), 90 = spans Z (faces X) */
     int heavy;         /* HCZ heavy door */
     int open;          /* target state */
@@ -39,6 +40,11 @@ typedef struct {
 
 int doorsGenerate(const GeneratedMap *map, const RoomTemplateList *templates,
                   uint32_t seed, DoorList *out);
+
+/* Append a room-internal door (FillRoom's CreateDoor). angle is the
+ * span axis (0 or 90); y is the door base height. */
+int doorsAddInternal(DoorList *list, float x, float y, float z, int angle,
+                     int heavy, int open, int keycard, int locked);
 void doorsFree(DoorList *list);
 
 /* Advance the open/close animation one frame (UpdateDoors: 2 deg). */
