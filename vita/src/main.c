@@ -10,6 +10,7 @@
 
 #include <dirent.h>
 #include <math.h>
+#include <sys/stat.h>
 #include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -538,6 +539,11 @@ typedef struct {
 
 /* ---------------- sounds ---------------- */
 
+/* Active difficulty effects, set when a game starts or loads (the
+ * difficulty table itself lives with the menu code below). */
+static int invSlotCap = 10;
+static int npcAggressive = 0;
+
 #define SFX_DIR DATA_ROOT "/SFX"
 
 static int sndDoorOpen[3], sndDoorClose[3];
@@ -746,7 +752,7 @@ static void update173(void) {
 
         /* NPCs.ini Speed = 38 -> 0.38 world units/frame = ~97 raw.
          * Substep so it cannot tunnel through walls or closed doors. */
-        float speed = 97.0f;
+        float speed = npcAggressive ? 121.0f : 97.0f;
         if (speed > dist - 80.0f) speed = dist - 80.0f;
         if (speed > 0.0f) {
             int steps = (int)(speed / 25.0f) + 1;
@@ -930,7 +936,7 @@ static int itemPickupNearest(const float pos[3]) {
             best = (int)i;
         }
     }
-    if (best < 0 || inventoryCount >= MAX_INVENTORY) return -1;
+    if (best < 0 || inventoryCount >= (unsigned)invSlotCap) return -1;
     worldItems[best].taken = 1;
     inventory[inventoryCount++] = worldItems[best].tpl;
     return worldItems[best].tpl;
@@ -950,19 +956,204 @@ static void drawItems(const float viewPos[3]) {
     }
 }
 
-/* ---------------- pause menu and save/load ---------------- */
+/* ---------------- menus, difficulties, options, save/load ---------------- */
 
 static int pauseOpen;
 static int pauseSel;
 static uint32_t pendingSeed;
 
-/* 0 = title menu, 1 = playing. The world only exists after the first
+/* 0 = main menu, 1 = playing. The world only exists after the first
  * NEW GAME / LOAD GAME. */
 static int gameState;
 static int titleSel;
 static int worldReady;
 
-static GLuint menuBackTex, menuTitleTex, pausePanelTex;
+/* Menu tab, mirroring Menu_Core.bb's MainMenuTab: 0 = button column,
+ * 1 = NEW GAME, 2 = LOAD GAME, 3 = OPTIONS. */
+static int menuTab;
+
+/* ---- difficulties (Difficulty_Core.bb) ---- */
+
+enum { SAVE_ANYWHERE = 0, SAVE_ON_SCREENS, SAVE_ON_QUIT, NO_SAVES };
+enum { FACT_EASY = 0, FACT_NORMAL, FACT_HARD, FACT_EXTREME };
+
+typedef struct {
+    const char *name;
+    const char *desc;
+    int aggressiveNPCs;
+    int slots;
+    int saveType;
+    int factors;
+    int customizable;
+    unsigned char r, g, b;
+} DifficultyDef;
+
+/* Names/colors/settings from Difficulty_Core.bb, descriptions from
+ * Data/local.ini [msg]. Esoteric is player-customizable, so the table
+ * is mutable. */
+static DifficultyDef DIFFICULTIES[5] = {
+    { "Safe",
+      "The game can be saved any time. However, as in the case of SCP "
+      "Objects, a Safe classification doesn't mean that handling it "
+      "doesn't pose a threat.",
+      0, 10, SAVE_ANYWHERE, FACT_EASY, 0, 120, 150, 50 },
+    { "Euclid",
+      "In Euclid difficulty, saving is only allowed at specific "
+      "locations marked by lit up computer screens. Euclid-class "
+      "objects are inherently unpredictable, so that reliable "
+      "containment is not always possible.",
+      0, 8, SAVE_ON_SCREENS, FACT_NORMAL, 0, 200, 200, 50 },
+    { "Keter",
+      "Keter-class objects are considered the most dangerous ones in "
+      "Foundation containment. The same can be said for this "
+      "difficulty level: the SCPs are more aggressive, and you have "
+      "only one life - when you die, the game is over.",
+      1, 6, SAVE_ON_QUIT, FACT_HARD, 0, 200, 50, 50 },
+    { "Apollyon",
+      "Apollyon-class object is either completely impossible to "
+      "contain or about to irrevocably breach containment, resulting "
+      "in unimaginable consequences. God help the humble subject "
+      "attempting this difficulty.",
+      1, 2, NO_SAVES, FACT_EXTREME, 0, 150, 150, 150 },
+    { "Esoteric", "", 0, 10, SAVE_ANYWHERE, FACT_EASY, 1, 200, 50, 200 },
+};
+
+static const char *SAVE_TYPE_NAMES[4] = {
+    "Save anywhere", "Save on screens", "Save on quit", "No saves",
+};
+static const char *FACTOR_NAMES[4] = { "Easy", "Normal", "Hard", "Extreme" };
+
+static int selDiff = 1;  /* menu selection; the game defaults to Euclid */
+static int gameDiff = 1; /* difficulty of the running game */
+
+static void applyDifficulty(int d) {
+    gameDiff = d;
+    invSlotCap = DIFFICULTIES[d].slots;
+    npcAggressive = DIFFICULTIES[d].aggressiveNPCs;
+}
+
+/* ---- new game form state ---- */
+
+static char newName[16];
+static char newSeedStr[16];
+static int introEnabled = 1;
+static int newSel; /* focused row */
+
+static char curSaveName[16] = "untitled";
+
+/* Blitz GenerateSeedNumber (Math_Core.bb): xor of chars at a rolling
+ * bit shift. Text seeds hash to the same numbers as the game. */
+static uint32_t seedFromString(const char *str) {
+    uint32_t t = 0;
+    int shift = 0;
+    for (; *str; str++) {
+        t ^= ((uint32_t)(unsigned char)*str) << shift;
+        shift = (shift + 1) % 24;
+    }
+    return t ? t : 1; /* mapgen treats 0 as "no seed" */
+}
+
+/* Random seed string exactly like Menu_Core.bb: a 1-in-15 chance of an
+ * easter-egg seed, otherwise 4-8 random digits/letters. */
+static void randomSeedString(char *out, size_t cap) {
+    static const char *EGGS[13] = {
+        "NIL", "NO", "d9341", "5CP_I73", "DONTBLINK", "CRUNCH", "die",
+        "HTAED", "rustledjim", "larry", "JORGE", "dirtymetal",
+        "whatpumpkin",
+    };
+    if (rand() % 15 == 0) {
+        snprintf(out, cap, "%s", EGGS[rand() % 13]);
+        return;
+    }
+    int n = 4 + rand() % 5;
+    size_t o = 0;
+    for (int i = 0; i < n && o + 1 < cap; i++) {
+        if (rand() % 3 == 0) {
+            out[o++] = (char)('0' + rand() % 10);
+        } else {
+            out[o++] = (char)('a' + rand() % 26);
+        }
+    }
+    out[o] = '\0';
+}
+
+/* ---- on-screen keyboard for the text fields ---- */
+
+static int oskOpen;
+static int oskRow, oskCol;
+static char *oskTarget;
+static int oskCap;
+static char oskTitle[24];
+
+static const char *OSK_ROWS[4] = {
+    "ABCDEFGHIJKLM",
+    "NOPQRSTUVWXYZ",
+    "abcdefghijklm",
+    "nopqrstuvwxyz",
+};
+static const char *OSK_DIGITS = "0123456789-_ ";
+#define OSK_NROWS 5 /* 4 letter rows + digits row */
+
+static const char *oskRowChars(int row) {
+    return row < 4 ? OSK_ROWS[row] : OSK_DIGITS;
+}
+
+static void oskStart(char *target, int cap, const char *title) {
+    oskOpen = 1;
+    oskTarget = target;
+    oskCap = cap;
+    oskRow = 0;
+    oskCol = 0;
+    snprintf(oskTitle, sizeof(oskTitle), "%s", title);
+}
+
+/* ---- options (persisted like the game's options.ini) ---- */
+
+#define OPTIONS_PATH DATA_ROOT "/options.ini"
+
+static float optMusicVol = 1.0f;
+static float optSfxVol = 1.0f;
+static float optLookSens = 1.0f;
+static int optInvertY = 0;
+static int optSel;
+
+static void optionsApply(void) {
+    audioSetMusicVolume(optMusicVol);
+    audioSetSfxVolume(optSfxVol);
+}
+
+static void optionsSave(void) {
+    FILE *f = fopen(OPTIONS_PATH, "w");
+    if (!f) return;
+    fprintf(f, "music=%f\nsfx=%f\nsens=%f\ninverty=%d\nintro=%d\n",
+            optMusicVol, optSfxVol, optLookSens, optInvertY, introEnabled);
+    fclose(f);
+}
+
+static void optionsLoad(void) {
+    FILE *f = fopen(OPTIONS_PATH, "r");
+    if (!f) return;
+    char line[128];
+    while (fgets(line, sizeof(line), f)) {
+        if (strncmp(line, "music=", 6) == 0) {
+            optMusicVol = strtof(line + 6, NULL);
+        } else if (strncmp(line, "sfx=", 4) == 0) {
+            optSfxVol = strtof(line + 4, NULL);
+        } else if (strncmp(line, "sens=", 5) == 0) {
+            optLookSens = strtof(line + 5, NULL);
+        } else if (strncmp(line, "inverty=", 8) == 0) {
+            optInvertY = (int)strtol(line + 8, NULL, 10);
+        } else if (strncmp(line, "intro=", 6) == 0) {
+            introEnabled = (int)strtol(line + 6, NULL, 10);
+        }
+    }
+    fclose(f);
+    if (optMusicVol < 0.0f || optMusicVol > 1.0f) optMusicVol = 1.0f;
+    if (optSfxVol < 0.0f || optSfxVol > 1.0f) optSfxVol = 1.0f;
+    if (optLookSens < 0.25f || optLookSens > 3.0f) optLookSens = 1.0f;
+}
+
+static GLuint menuBackTex, menuTitleTex, pausePanelTex, menu173Tex;
 
 /* Menu art needs to stay sharp at fullscreen, so it loads at a 1024
  * cap instead of the world texture cap. */
@@ -991,17 +1182,44 @@ static void loadMenuTextures(void) {
     menuBackTex = loadMenuTexture("back.png");
     menuTitleTex = loadMenuTexture("SCP_text.png");
     pausePanelTex = loadMenuTexture("pause_menu.png");
+    menu173Tex = loadMenuTexture("scp_173_back.png");
 }
 
-#define SAVE_PATH DATA_ROOT "/save.dat"
+/* ---- menu music ---- */
+
+static int menuMusic = -1;
+
+static void menuMusicStart(void) {
+    if (menuMusic < 0) {
+        menuMusic = audioLoad(DATA_ROOT "/SFX/Music/Menu.ogg");
+    }
+    audioLoopMusic(menuMusic, 0.8f);
+}
+
+/* ---- named saves ---- */
+
+#define SAVES_DIR DATA_ROOT "/saves"
+#define SAVE_PATH DATA_ROOT "/save.dat" /* legacy single-slot save */
+
+static void currentSavePath(char *out, size_t cap) {
+    snprintf(out, cap, SAVES_DIR "/%s.dat", curSaveName);
+}
 
 /* The map, doors, item spawns and 173 placement are all deterministic
  * from the seed, so a save only records the seed plus mutable state. */
 static int saveGame(void) {
-    FILE *f = fopen(SAVE_PATH, "w");
+    mkdir(SAVES_DIR, 0777);
+    char path[256];
+    currentSavePath(path, sizeof(path));
+    FILE *f = fopen(path, "w");
     if (!f) return 0;
-    fprintf(f, "SCPVITA1\n");
+    fprintf(f, "SCPVITA2\n");
+    fprintf(f, "name=%s\n", curSaveName);
     fprintf(f, "seed=%u\n", mapSeed);
+    fprintf(f, "difficulty=%d\n", gameDiff);
+    fprintf(f, "diffcfg=%d %d %d %d\n", DIFFICULTIES[gameDiff].aggressiveNPCs,
+            DIFFICULTIES[gameDiff].slots, DIFFICULTIES[gameDiff].saveType,
+            DIFFICULTIES[gameDiff].factors);
     fprintf(f, "player=%f %f %f %f %f\n", camPos[0], camPos[1], camPos[2],
             camYaw, camPitch);
     fprintf(f, "vitals=%f %f\n", blinkTimer, stamina);
@@ -1024,12 +1242,16 @@ static int saveGame(void) {
     return 1;
 }
 
-static int loadGame(void) {
-    FILE *f = fopen(SAVE_PATH, "r");
+static int loadGameFrom(const char *path) {
+    FILE *f = fopen(path, "r");
     if (!f) return 0;
     char line[1024];
-    if (!fgets(line, sizeof(line), f)
-        || strncmp(line, "SCPVITA1", 8) != 0) {
+    int version = 0;
+    if (fgets(line, sizeof(line), f)) {
+        if (strncmp(line, "SCPVITA2", 8) == 0) version = 2;
+        else if (strncmp(line, "SCPVITA1", 8) == 0) version = 1;
+    }
+    if (!version) {
         fclose(f);
         return 0;
     }
@@ -1037,6 +1259,9 @@ static int loadGame(void) {
     float px = 0, py = 0, pz = 0, yaw = 0, pitch = 0, bt = 100, st = 100;
     float nx = 0, ny = 0, nz = 0, nyaw = 0;
     int nact = 1;
+    int diff = 1;
+    char name[16] = "save";
+    int cfg[4] = { -1, -1, -1, -1 };
     static char invLine[640], takenLine[640], doorLine[640];
     invLine[0] = takenLine[0] = doorLine[0] = '\0';
     /* Parsed with strtof/strtoul: vitasdk newlib faults on scanf
@@ -1045,6 +1270,15 @@ static int loadGame(void) {
         char *p;
         if (strncmp(line, "seed=", 5) == 0) {
             seed = (uint32_t)strtoul(line + 5, NULL, 10);
+        } else if (strncmp(line, "name=", 5) == 0) {
+            snprintf(name, sizeof(name), "%s", line + 5);
+            name[strcspn(name, "\r\n")] = '\0';
+        } else if (strncmp(line, "difficulty=", 11) == 0) {
+            diff = (int)strtol(line + 11, NULL, 10);
+            if (diff < 0 || diff > 4) diff = 1;
+        } else if (strncmp(line, "diffcfg=", 8) == 0) {
+            p = line + 8;
+            for (int i = 0; i < 4; i++) cfg[i] = (int)strtol(p, &p, 10);
         } else if (strncmp(line, "player=", 7) == 0) {
             p = line + 7;
             px = strtof(p, &p);
@@ -1073,6 +1307,19 @@ static int loadGame(void) {
     }
     fclose(f);
     if (seed == 0) return 0;
+
+    if (version == 2) {
+        snprintf(curSaveName, sizeof(curSaveName), "%s", name);
+    } else {
+        snprintf(curSaveName, sizeof(curSaveName), "save");
+    }
+    if (DIFFICULTIES[diff].customizable && cfg[1] > 0) {
+        DIFFICULTIES[diff].aggressiveNPCs = cfg[0];
+        DIFFICULTIES[diff].slots = cfg[1];
+        DIFFICULTIES[diff].saveType = cfg[2];
+        DIFFICULTIES[diff].factors = cfg[3];
+    }
+    applyDifficulty(diff);
 
     regenerateMap(seed);
     camPos[0] = px;
@@ -1105,6 +1352,80 @@ static int loadGame(void) {
         doors.items[i].openState = doors.items[i].open ? 180.0f : 0.0f;
     }
     return 1;
+}
+
+static int loadGame(void) {
+    char path[256];
+    currentSavePath(path, sizeof(path));
+    if (loadGameFrom(path)) return 1;
+    return loadGameFrom(SAVE_PATH); /* legacy single-slot save */
+}
+
+/* ---- save list for the LOAD GAME tab ---- */
+
+#define MAX_SAVELIST 32
+#define SAVES_PER_PAGE 5
+
+typedef struct {
+    char path[256];
+    char name[16];
+    uint32_t seed;
+    int diff;
+} SaveEntry;
+
+static SaveEntry saveList[MAX_SAVELIST];
+static int saveCount;
+static int savePage, saveSel;
+static int saveConfirmDel = -1;
+
+static int saveReadHeader(const char *path, SaveEntry *e) {
+    FILE *f = fopen(path, "r");
+    if (!f) return 0;
+    char line[256];
+    int ok = 0;
+    e->seed = 0;
+    e->diff = 1;
+    snprintf(e->name, sizeof(e->name), "save");
+    for (int i = 0; i < 8 && fgets(line, sizeof(line), f); i++) {
+        if (i == 0) {
+            if (strncmp(line, "SCPVITA", 7) != 0) break;
+            ok = 1;
+        } else if (strncmp(line, "name=", 5) == 0) {
+            snprintf(e->name, sizeof(e->name), "%s", line + 5);
+            e->name[strcspn(e->name, "\r\n")] = '\0';
+        } else if (strncmp(line, "seed=", 5) == 0) {
+            e->seed = (uint32_t)strtoul(line + 5, NULL, 10);
+        } else if (strncmp(line, "difficulty=", 11) == 0) {
+            e->diff = (int)strtol(line + 11, NULL, 10);
+            if (e->diff < 0 || e->diff > 4) e->diff = 1;
+        }
+    }
+    fclose(f);
+    snprintf(e->path, sizeof(e->path), "%s", path);
+    return ok;
+}
+
+static void scanSaves(void) {
+    saveCount = 0;
+    savePage = 0;
+    saveSel = 0;
+    saveConfirmDel = -1;
+    DIR *d = opendir(SAVES_DIR);
+    if (d) {
+        struct dirent *ent;
+        while ((ent = readdir(d)) && saveCount < MAX_SAVELIST) {
+            size_t n = strlen(ent->d_name);
+            if (n < 5 || strcmp(ent->d_name + n - 4, ".dat") != 0) continue;
+            char path[256];
+            snprintf(path, sizeof(path), SAVES_DIR "/%s", ent->d_name);
+            if (saveReadHeader(path, &saveList[saveCount])) saveCount++;
+        }
+        closedir(d);
+    }
+    if (saveCount < MAX_SAVELIST
+        && saveReadHeader(SAVE_PATH, &saveList[saveCount])) {
+        saveCount++; /* legacy single-slot save */
+    }
 }
 
 static void drawModelRT(const ModelRT *rt) {
@@ -1273,8 +1594,8 @@ static void drawHud(const char *line1, const char *line2,
  * icons, a highlighted selection, and the selected item's name. Runs
  * inside the HUD ortho/flat-2D state. */
 static void drawInventory(void) {
-    const int cols = 5;
-    const int rows = MAX_INVENTORY / 5;
+    const int cols = invSlotCap < 5 ? invSlotCap : 5;
+    const int rows = (invSlotCap + 4) / 5;
     const float slot = 96.0f, pad = 12.0f;
     float gridW = cols * slot + (cols - 1) * pad;
     float gridH = rows * slot + (rows - 1) * pad;
@@ -1290,7 +1611,7 @@ static void drawInventory(void) {
     glColor4f(1, 1, 1, 1);
     glPopMatrix();
 
-    for (int i = 0; i < MAX_INVENTORY; i++) {
+    for (int i = 0; i < invSlotCap; i++) {
         int cx = i % cols, cy = i / cols;
         float x = ox + cx * (slot + pad);
         float y = oy + cy * (slot + pad);
@@ -1410,69 +1731,649 @@ static void endHud2D(void) {
     glEnable(GL_DEPTH_TEST);
 }
 
-/* A menu button in the game's style: black box, light border, caps
- * label; the selection brightens the border like the mouse-hover. */
-static void drawMenuButton(float x, float y, float w, float h,
-                           const char *label, int selected) {
-    drawQuad(x, y, w, h, 0, 0.02f, 0.02f, 0.02f, 0.92f);
-    float bc = selected ? 1.0f : 0.5f;
-    drawQuad(x, y, w, 2, 0, bc, bc, bc, 1.0f);
-    drawQuad(x, y + h - 2, w, 2, 0, bc, bc, bc, 1.0f);
-    drawQuad(x, y, 2, h, 0, bc, bc, bc, 1.0f);
-    drawQuad(x + w - 2, y, 2, h, 0, bc, bc, bc, 1.0f);
+/* Design-space mapping: Menu_Core.bb lays the menu out in 1280x960. */
+#define MENU_SX (SCREEN_W / 1280.0f)
+#define MENU_SY (SCREEN_H / 960.0f)
+
+/* Text at an arbitrary scale and color, screen coordinates. */
+static void mtext(float x, float y, float sc, float r, float g, float b,
+                  const char *t) {
     glPushMatrix();
-    glScalef(2.0f, 2.0f, 1.0f);
-    float g = selected ? 1.0f : 0.78f;
-    glColor4f(g, g, g, 1.0f);
-    drawText((x + 18.0f) * 0.5f, (y + h * 0.5f - 7.0f) * 0.5f, label);
+    glScalef(sc, sc, 1.0f);
+    glColor4f(r, g, b, 1.0f);
+    drawText(x / sc, y / sc, t);
     glColor4f(1, 1, 1, 1);
     glPopMatrix();
 }
 
-/* Title screen: back.png fullscreen, the SCP text logo, and the
- * button column at Menu_Core.bb's design coordinates (1280x960
- * design space mapped onto 960x544). */
-static void drawTitleMenu(void) {
-    const float SX = SCREEN_W / 1280.0f, SY = SCREEN_H / 960.0f;
+static float mtextWidth(const char *t, float sc) {
+    return stb_easy_font_width((char *)t) * sc;
+}
+
+/* Centered text (the game's TextEx with centering flags). */
+static void mtextC(float cx, float cy, float sc, float r, float g, float b,
+                   const char *t) {
+    mtext(cx - mtextWidth(t, sc) * 0.5f, cy - 4.5f * sc, sc, r, g, b, t);
+}
+
+/* Word-wrapped text in a box (the game's RowText). */
+static void mtextWrap(float x, float y, float w, float sc, const char *t) {
+    char line[128] = "";
+    size_t ll = 0;
+    float cy = y;
+    const char *p = t;
+    while (*p) {
+        const char *sp = strchr(p, ' ');
+        size_t wl = sp ? (size_t)(sp - p) : strlen(p);
+        char word[64];
+        if (wl >= sizeof(word)) wl = sizeof(word) - 1;
+        memcpy(word, p, wl);
+        word[wl] = '\0';
+        char test[192];
+        snprintf(test, sizeof(test), "%s%s%s", line, ll ? " " : "", word);
+        if (ll && mtextWidth(test, sc) > w) {
+            mtext(x, cy, sc, 1, 1, 1, line);
+            cy += 11.0f * sc;
+            snprintf(line, sizeof(line), "%s", word);
+            ll = strlen(line);
+        } else {
+            snprintf(line, sizeof(line), "%s", test);
+            ll = strlen(line);
+        }
+        p += wl;
+        while (*p == ' ') p++;
+    }
+    if (ll) mtext(x, cy, sc, 1, 1, 1, line);
+}
+
+/* A bordered box in the game's frame style; focus brightens the
+ * border like the mouse-hover. */
+static void drawFrame(float x, float y, float w, float h, int focused) {
+    drawQuad(x, y, w, h, 0, 0.02f, 0.02f, 0.02f, 0.92f);
+    float bc = focused ? 1.0f : 0.5f;
+    drawQuad(x, y, w, 2, 0, bc, bc, bc, 1.0f);
+    drawQuad(x, y + h - 2, w, 2, 0, bc, bc, bc, 1.0f);
+    drawQuad(x, y, 2, h, 0, bc, bc, bc, 1.0f);
+    drawQuad(x + w - 2, y, 2, h, 0, bc, bc, bc, 1.0f);
+}
+
+/* A menu button in the game's style: black box, light border, caps
+ * label; the selection brightens the border like the mouse-hover. */
+static void drawMenuButton(float x, float y, float w, float h,
+                           const char *label, int selected) {
+    drawFrame(x, y, w, h, selected);
+    float g = selected ? 1.0f : 0.78f;
+    mtextC(x + w * 0.5f, y + h * 0.5f, 2.0f, g, g, g, label);
+}
+
+/* The game's UpdateMenuTick checkbox. */
+static void drawTick(float x, float y, float size, int on, int focused) {
+    drawFrame(x, y, size, size, focused);
+    if (on) {
+        drawQuad(x + 5, y + 5, size - 10, size - 10, 0, 0.85f, 0.85f, 0.85f,
+                 1.0f);
+    }
+}
+
+/* ---- main menu decorations: flickering 173 and creepy strings ---- */
+
+static int flicker173Frames, flicker173Cooldown = 240;
+static const char *creepStr;
+static int creepFrames, creepCooldown = 500;
+static float creepX, creepY;
+
+static const char *CREEP_STRINGS[16] = {
+    "DON'T BLINK",
+    "Secure. Contain. Protect.",
+    "You want happy endings? Fuck you.",
+    "Sometimes we would have had time to scream.",
+    "NIL",
+    "NO",
+    "black white black white black white gray",
+    "Stone doesn't care",
+    "9341",
+    "It controls the doors",
+    "e8m106]af173o+079m895w914",
+    "It has taken over everything",
+    "The spiral is growing",
+    "\"Some kind of gestalt effect due to massive reality damage.\"",
+    "Does the Black Moon howl? Yes. No. Yes. No.",
+    "NIL",
+};
+
+/* Background, bottom-center logo, and the flicker effects; drawn under
+ * every menu tab (the game's RenderMainMenu). */
+static void drawMenuChrome(void) {
     if (menuBackTex) {
         drawTexQuad(0, 0, SCREEN_W, SCREEN_H, menuBackTex, 1.0f);
     } else {
         drawQuad(0, 0, SCREEN_W, SCREEN_H, 0, 0, 0, 0, 1.0f);
     }
-    if (menuTitleTex) {
-        drawTexQuad(159.0f * SX, 170.0f * SY, 550.0f * SX, 60.0f * SY,
-                    menuTitleTex, 1.0f);
+
+    /* SCP-173 fades in at the bottom-right for a blink. */
+    if (--flicker173Cooldown <= 0) {
+        flicker173Frames = 10 + rand() % 25;
+        flicker173Cooldown = 240 + rand() % 700;
+    }
+    if (flicker173Frames > 0) {
+        flicker173Frames--;
+        if (menu173Tex) {
+            float w = 420.0f * MENU_SX, h = 750.0f * MENU_SY;
+            drawTexQuad(SCREEN_W - w, SCREEN_H - h, w, h, menu173Tex, 1.0f);
+        }
     }
 
-    char seedRow[48];
-    snprintf(seedRow, sizeof(seedRow), "SEED: %u", pendingSeed);
-    const char *rows[4] = { "NEW GAME", "LOAD GAME", seedRow, "QUIT" };
+    /* Creepy strings jitter in dark gray at random positions. */
+    if (--creepCooldown <= 0) {
+        creepFrames = 6 + rand() % 22;
+        creepCooldown = 400 + rand() % 500;
+        creepStr = CREEP_STRINGS[rand() % 16];
+        creepX = (float)(700 + rand() % 300) * MENU_SX;
+        creepY = (float)(100 + rand() % 500) * MENU_SY;
+    }
+    if (creepFrames > 0 && creepStr) {
+        creepFrames--;
+        float jx = (float)(rand() % 7 - 3), jy = (float)(rand() % 7 - 3);
+        float w = mtextWidth(creepStr, 1.5f);
+        float x = creepX + jx;
+        if (x + w > SCREEN_W - 8.0f) x = SCREEN_W - 8.0f - w;
+        mtext(x, creepY + jy, 1.5f, 0.2f, 0.2f, 0.2f, creepStr);
+    }
+
+    /* SECURE. CONTAIN. PROTECT. logo, bottom-center like the game. */
+    if (menuTitleTex) {
+        float w = 550.0f * MENU_SX, h = 60.0f * MENU_SY;
+        drawTexQuad((SCREEN_W - w) * 0.5f, SCREEN_H - 20.0f * MENU_SY - h,
+                    w, h, menuTitleTex, 1.0f);
+    }
+}
+
+/* Tab header frame + BACK button (top row of every sub-tab). */
+static void drawTabHeader(const char *title, int backFocused) {
+    float x = 159.0f * MENU_SX, y = 286.0f * MENU_SY;
+    float w = 400.0f * MENU_SX, h = 70.0f * MENU_SY;
+    drawFrame(x, y, w, h, 0);
+    mtextC(x + w * 0.5f, y + h * 0.5f, 2.0f, 1, 1, 1, title);
+    drawMenuButton(x + w + 20.0f * MENU_SX, y, 160.0f * MENU_SX, h, "BACK",
+                   backFocused);
+}
+
+/* ---- on-screen keyboard ---- */
+
+static void drawOsk(void) {
+    float w = 560.0f, h = 300.0f;
+    float x = (SCREEN_W - w) * 0.5f, y = (SCREEN_H - h) * 0.5f;
+    drawQuad(0, 0, SCREEN_W, SCREEN_H, 0, 0, 0, 0, 0.6f);
+    drawFrame(x, y, w, h, 1);
+    mtext(x + 20, y + 16, 2.0f, 1, 1, 1, oskTitle);
+
+    char buf[32];
+    snprintf(buf, sizeof(buf), "%s_", oskTarget);
+    drawFrame(x + 20, y + 44, w - 40, 34, 0);
+    mtext(x + 30, y + 54, 2.0f, 1, 1, 0.8f, buf);
+
+    for (int r = 0; r < OSK_NROWS; r++) {
+        const char *row = oskRowChars(r);
+        for (int c = 0; row[c]; c++) {
+            float cx = x + 26 + c * 39.0f, cy = y + 96 + r * 34.0f;
+            int foc = (r == oskRow && c == oskCol);
+            if (foc) drawQuad(cx - 4, cy - 4, 30, 26, 0, 0.35f, 0.35f, 0.2f,
+                              1.0f);
+            char ch[2] = { row[c] == ' ' ? '_' : row[c], 0 };
+            float g = foc ? 1.0f : 0.75f;
+            mtext(cx, cy, 2.0f, g, g, row[c] == ' ' ? 0.4f : g, ch);
+        }
+    }
+    mtext(x + 20, y + h - 26, 1.5f, 0.6f, 0.6f, 0.6f,
+          "X: type   Square: delete   Circle/Start: done");
+}
+
+/* Returns 1 while the keyboard is open and consuming input. */
+static int oskUpdate(void) {
+    if (!oskOpen) return 0;
+    const char *row = oskRowChars(oskRow);
+    int rowLen = (int)strlen(row);
+    if (inputHit(ACTION_SAVE) && oskRow > 0) oskRow--;          /* up */
+    if (inputDpadDownHit() && oskRow < OSK_NROWS - 1) oskRow++; /* down */
+    row = oskRowChars(oskRow);
+    rowLen = (int)strlen(row);
+    if (oskCol >= rowLen) oskCol = rowLen - 1;
+    if (inputHit(ACTION_LEAN_LEFT) && oskCol > 0) oskCol--;
+    if (inputHit(ACTION_LEAN_RIGHT) && oskCol < rowLen - 1) oskCol++;
+    if (inputHit(ACTION_INTERACT)) {
+        size_t len = strlen(oskTarget);
+        if ((int)len < oskCap - 1) {
+            oskTarget[len] = row[oskCol];
+            oskTarget[len + 1] = '\0';
+        }
+    }
+    if (inputHit(ACTION_USE_ITEM)) { /* Square: backspace */
+        size_t len = strlen(oskTarget);
+        if (len) oskTarget[len - 1] = '\0';
+    }
+    if (inputHit(ACTION_CROUCH) || inputHit(ACTION_MENU)) { /* done */
+        oskOpen = 0;
+    }
+    return 1;
+}
+
+/* ---- NEW GAME tab (update + draw) ---- */
+
+static int startNewGame(void) {
+    /* Trim, default the name like the game ("untitled"). */
+    char *e = newName + strlen(newName);
+    while (e > newName && e[-1] == ' ') *--e = '\0';
+    if (!newName[0]) snprintf(newName, sizeof(newName), "untitled");
+    char *b = newSeedStr + strlen(newSeedStr);
+    while (b > newSeedStr && b[-1] == ' ') *--b = '\0';
+    if (!newSeedStr[0]) {
+        snprintf(newSeedStr, sizeof(newSeedStr), "%u",
+                 (unsigned)(sceKernelGetProcessTimeWide() % 1000000000ull));
+    }
+    snprintf(curSaveName, sizeof(curSaveName), "%s", newName);
+    applyDifficulty(selDiff);
+    optionsSave(); /* persists the intro toggle like the game */
+    regenerateMap(seedFromString(newSeedStr));
+    pendingSeed = mapSeed;
+    gameState = 1;
+    worldReady = 1;
+    pauseOpen = 0;
+    audioStopMusic();
+    return 1;
+}
+
+static void newGameTab(void) {
+    const float SX = MENU_SX, SY = MENU_SY;
+    DifficultyDef *df = &DIFFICULTIES[selDiff];
+    int extra = df->customizable ? 4 : 0;
+    int startIdx = 8 + extra;
+    int backIdx = startIdx + 1;
+    /* Switching off Esoteric removes its rows; keep the focus valid. */
+    if (newSel > backIdx) newSel = backIdx;
+
+    /* --- input --- */
+    if (!oskUpdate()) {
+        if (inputHit(ACTION_SAVE) && newSel > 0) newSel--;
+        if (inputDpadDownHit() && newSel < backIdx) newSel++;
+        int esoRow = (newSel >= 8 && newSel < 8 + extra) ? newSel - 8 : -1;
+        int lft = inputHit(ACTION_LEAN_LEFT), rgt = inputHit(ACTION_LEAN_RIGHT);
+        if (esoRow == 0 && (lft || rgt)) {
+            df->saveType = (df->saveType + (rgt ? 1 : 3)) % 4;
+        } else if (esoRow == 1 && (lft || rgt)) {
+            df->aggressiveNPCs = !df->aggressiveNPCs;
+        } else if (esoRow == 2 && (lft || rgt)) {
+            df->slots += rgt ? 2 : -2;
+            if (df->slots > 10) df->slots = 2;
+            if (df->slots < 2) df->slots = 10;
+        } else if (esoRow == 3 && (lft || rgt)) {
+            df->factors = (df->factors + (rgt ? 1 : 3)) % 4;
+        } else if (newSel == 2 && (lft || rgt)) {
+            introEnabled = !introEnabled;
+        }
+        if (inputHit(ACTION_INTERACT)) {
+            if (newSel == 0) {
+                oskStart(newName, (int)sizeof(newName), "NAME");
+            } else if (newSel == 1) {
+                oskStart(newSeedStr, (int)sizeof(newSeedStr), "MAP SEED");
+            } else if (newSel == 2) {
+                introEnabled = !introEnabled;
+            } else if (newSel >= 3 && newSel <= 7) {
+                selDiff = newSel - 3;
+            } else if (esoRow == 1) {
+                df->aggressiveNPCs = !df->aggressiveNPCs;
+            } else if (newSel == startIdx) {
+                if (startNewGame()) return;
+            } else if (newSel == backIdx) {
+                optionsSave();
+                menuTab = 0;
+                return;
+            }
+        }
+        if (inputHit(ACTION_CROUCH)) { /* Circle backs out */
+            optionsSave();
+            menuTab = 0;
+            return;
+        }
+    }
+
+    /* --- draw (Menu_Core.bb's New Game layout) --- */
+    df = &DIFFICULTIES[selDiff];
+    drawTabHeader("NEW GAME", newSel == backIdx);
+    float x = 159.0f * SX, y = 376.0f * SY;
+    drawFrame(x, y, 580.0f * SX, 345.0f * SY, 0);
+
+    mtext(x + 20.0f * SX, y + 19.0f * SY, 1.5f, 1, 1, 1, "Name:");
+    drawFrame(x + 150.0f * SX, y + 12.0f * SY, 200.0f * SX, 32.0f * SY,
+              newSel == 0);
+    mtext(x + 158.0f * SX, y + 21.0f * SY, 1.5f, 1, 1, 1, newName);
+
+    mtext(x + 20.0f * SX, y + 59.0f * SY, 1.5f, 1, 1, 1, "Map seed:");
+    drawFrame(x + 150.0f * SX, y + 52.0f * SY, 200.0f * SX, 32.0f * SY,
+              newSel == 1);
+    mtext(x + 158.0f * SX, y + 61.0f * SY, 1.5f, 1, 1, 1, newSeedStr);
+
+    mtext(x + 20.0f * SX, y + 111.0f * SY, 1.5f, 1, 1, 1, "Intro sequence:");
+    drawTick(x + 280.0f * SX, y + 102.0f * SY, 34.0f * SY, introEnabled,
+             newSel == 2);
+
+    mtext(x + 20.0f * SX, y + 151.0f * SY, 1.5f, 1, 1, 1, "Difficulty:");
+    for (int i = 0; i < 5; i++) {
+        const DifficultyDef *d2 = &DIFFICULTIES[i];
+        drawTick(x + 20.0f * SX, y + (180.0f + 30.0f * i) * SY, 26.0f * SY,
+                 selDiff == i, newSel == 3 + i);
+        mtext(x + 50.0f * SX, y + (185.0f + 30.0f * i) * SY, 1.5f,
+              d2->r / 255.0f, d2->g / 255.0f, d2->b / 255.0f, d2->name);
+    }
+
+    /* Description / customization frame. */
+    drawFrame(x + 150.0f * SX, y + 170.0f * SY, 410.0f * SX, 160.0f * SY, 0);
+    if (df->customizable) {
+        char row[64];
+        float rx = x + 170.0f * SX;
+        snprintf(row, sizeof(row), "< Save type: %s >",
+                 SAVE_TYPE_NAMES[df->saveType]);
+        mtext(rx, y + 186.0f * SY, 1.5f, 1, 1, newSel == 8 ? 0.5f : 1.0f, row);
+        snprintf(row, sizeof(row), "< Aggressive NPCs: %s >",
+                 df->aggressiveNPCs ? "YES" : "NO");
+        mtext(rx, y + 216.0f * SY, 1.5f, 1, 1, newSel == 9 ? 0.5f : 1.0f, row);
+        snprintf(row, sizeof(row), "< Inventory slots: %d >", df->slots);
+        mtext(rx, y + 246.0f * SY, 1.5f, 1, 1, newSel == 10 ? 0.5f : 1.0f,
+              row);
+        snprintf(row, sizeof(row), "< Other difficulty factors: %s >",
+                 FACTOR_NAMES[df->factors]);
+        mtext(rx, y + 276.0f * SY, 1.5f, 1, 1, newSel == 11 ? 0.5f : 1.0f,
+              row);
+    } else {
+        mtextWrap(x + 160.0f * SX, y + 180.0f * SY, 390.0f * SX, 1.5f,
+                  df->desc);
+        /* Stats frame to the right (the game's x+590 box). */
+        drawFrame(x + 590.0f * SX, y + 50.0f * SY, 350.0f * SX, 110.0f * SY,
+                  0);
+        char row[64];
+        float rx = x + 600.0f * SX;
+        snprintf(row, sizeof(row), "Save type: %s",
+                 SAVE_TYPE_NAMES[df->saveType]);
+        mtext(rx, y + 58.0f * SY, 1.5f, 1, 1, 1, row);
+        snprintf(row, sizeof(row), "Aggressive NPCs: %s",
+                 df->aggressiveNPCs ? "YES" : "NO");
+        mtext(rx, y + 78.0f * SY, 1.5f, 1, 1, 1, row);
+        snprintf(row, sizeof(row), "Inventory slots: %d", df->slots);
+        mtext(rx, y + 98.0f * SY, 1.5f, 1, 1, 1, row);
+        snprintf(row, sizeof(row), "Other difficulty factors: %s",
+                 FACTOR_NAMES[df->factors]);
+        mtext(rx, y + 118.0f * SY, 1.5f, 1, 1, 1, row);
+        if (df->saveType == NO_SAVES) {
+            mtext(rx, y + 138.0f * SY, 1.5f, 1, 0.6f, 0.6f, "No HUD");
+        }
+    }
+
+    drawMenuButton(x + 420.0f * SX, y + 365.0f * SY + 20.0f * SY,
+                   160.0f * SX, 75.0f * SY, "START", newSel == startIdx);
+
+    if (oskOpen) drawOsk();
+}
+
+/* ---- LOAD GAME tab ---- */
+
+static void loadGameTab(void) {
+    const float SX = MENU_SX, SY = MENU_SY;
+    int pages = (saveCount + SAVES_PER_PAGE - 1) / SAVES_PER_PAGE;
+    if (pages < 1) pages = 1;
+    int base = savePage * SAVES_PER_PAGE;
+    int onPage = saveCount - base;
+    if (onPage > SAVES_PER_PAGE) onPage = SAVES_PER_PAGE;
+
+    /* --- input --- */
+    if (saveConfirmDel >= 0) {
+        if (inputHit(ACTION_INTERACT)) {
+            remove(saveList[saveConfirmDel].path);
+            scanSaves();
+        } else if (inputHit(ACTION_CROUCH)) {
+            saveConfirmDel = -1;
+        }
+    } else {
+        if (inputHit(ACTION_SAVE) && saveSel > 0) saveSel--;
+        if (inputDpadDownHit() && saveSel < onPage - 1) saveSel++;
+        if (inputHit(ACTION_LEAN_LEFT) && savePage > 0) {
+            savePage--;
+            saveSel = 0;
+        }
+        if (inputHit(ACTION_LEAN_RIGHT) && savePage < pages - 1) {
+            savePage++;
+            saveSel = 0;
+            base = savePage * SAVES_PER_PAGE;
+            onPage = saveCount - base;
+            if (onPage > SAVES_PER_PAGE) onPage = SAVES_PER_PAGE;
+        }
+        if (inputHit(ACTION_INTERACT) && onPage > 0) {
+            if (loadGameFrom(saveList[base + saveSel].path)) {
+                snprintf(toastMsg, sizeof(toastMsg), "GAME LOADED");
+                toastTimer = 150;
+                gameState = 1;
+                worldReady = 1;
+                pauseOpen = 0;
+                audioStopMusic();
+                return;
+            }
+            snprintf(toastMsg, sizeof(toastMsg), "LOAD FAILED");
+            toastTimer = 150;
+        }
+        if (inputHit(ACTION_USE_ITEM) && onPage > 0) { /* Square deletes */
+            saveConfirmDel = base + saveSel;
+        }
+        if (inputHit(ACTION_CROUCH)) {
+            menuTab = 0;
+            return;
+        }
+    }
+
+    /* --- draw --- */
+    drawTabHeader("LOAD GAME", 0);
+    float x = 159.0f * SX, y = 376.0f * SY;
+    drawFrame(x, y, 580.0f * SX, 430.0f * SY, 0);
+
+    if (saveCount == 0) {
+        mtext(x + 20.0f * SX, y + 20.0f * SY, 1.5f, 1, 1, 1,
+              "No saved games.");
+    } else {
+        for (int i = 0; i < onPage; i++) {
+            const SaveEntry *e2 = &saveList[base + i];
+            float ry = y + (20.0f + i * 78.0f) * SY;
+            drawFrame(x + 20.0f * SX, ry, 540.0f * SX, 66.0f * SY,
+                      i == saveSel);
+            mtext(x + 36.0f * SX, ry + 10.0f * SY, 2.0f, 1, 1, 1, e2->name);
+            char info[96];
+            const DifficultyDef *d2 = &DIFFICULTIES[e2->diff];
+            snprintf(info, sizeof(info), "Seed: %u", e2->seed);
+            mtext(x + 36.0f * SX, ry + 40.0f * SY, 1.5f, 0.7f, 0.7f, 0.7f,
+                  info);
+            mtext(x + 400.0f * SX, ry + 40.0f * SY, 1.5f, d2->r / 255.0f,
+                  d2->g / 255.0f, d2->b / 255.0f, d2->name);
+        }
+    }
+
+    /* Page indicator frame (the game's PAGE x/y). */
+    drawFrame(x + 60.0f * SX, y + 440.0f * SY, 460.0f * SX, 50.0f * SY, 0);
+    char page[32];
+    snprintf(page, sizeof(page), "PAGE %d/%d", savePage + 1, pages);
+    mtextC(x + 290.0f * SX, y + 465.0f * SY, 2.0f, 1, 1, 1, page);
+    mtext(x + 20.0f * SX, y + 500.0f * SY, 1.5f, 0.5f, 0.5f, 0.5f,
+          "X: load   Square: delete   O: back   left/right: page");
+
+    if (saveConfirmDel >= 0) {
+        float w = 620.0f, h = 130.0f;
+        float cx = (SCREEN_W - w) * 0.5f, cy = (SCREEN_H - h) * 0.5f;
+        drawQuad(0, 0, SCREEN_W, SCREEN_H, 0, 0, 0, 0, 0.6f);
+        drawFrame(cx, cy, w, h, 1);
+        mtextC(SCREEN_W * 0.5f, cy + 40, 1.5f, 1, 1, 1,
+               "Are you sure you want to delete this save?");
+        mtextC(SCREEN_W * 0.5f, cy + 84, 1.5f, 0.8f, 0.8f, 0.8f,
+               "X: YES     O: NO");
+    }
+}
+
+/* ---- OPTIONS tab ---- */
+
+#define OPT_ROWS 4
+
+static void optionsTab(void) {
+    const float SX = MENU_SX, SY = MENU_SY;
+    int backIdx = OPT_ROWS;
+
+    if (inputHit(ACTION_SAVE) && optSel > 0) optSel--;
+    if (inputDpadDownHit() && optSel < backIdx) optSel++;
+    int lft = inputHit(ACTION_LEAN_LEFT), rgt = inputHit(ACTION_LEAN_RIGHT);
+    float d = rgt ? 1.0f : (lft ? -1.0f : 0.0f);
+    if (d != 0.0f) {
+        switch (optSel) {
+            case 0:
+                optMusicVol += d * 0.1f;
+                if (optMusicVol < 0.0f) optMusicVol = 0.0f;
+                if (optMusicVol > 1.0f) optMusicVol = 1.0f;
+                optionsApply();
+                break;
+            case 1:
+                optSfxVol += d * 0.1f;
+                if (optSfxVol < 0.0f) optSfxVol = 0.0f;
+                if (optSfxVol > 1.0f) optSfxVol = 1.0f;
+                optionsApply();
+                break;
+            case 2:
+                optLookSens += d * 0.25f;
+                if (optLookSens < 0.25f) optLookSens = 0.25f;
+                if (optLookSens > 3.0f) optLookSens = 3.0f;
+                break;
+            case 3:
+                optInvertY = !optInvertY;
+                break;
+        }
+    }
+    if (inputHit(ACTION_INTERACT)) {
+        if (optSel == 3) optInvertY = !optInvertY;
+        if (optSel == backIdx) {
+            optionsSave();
+            menuTab = 0;
+            return;
+        }
+    }
+    if (inputHit(ACTION_CROUCH)) {
+        optionsSave();
+        menuTab = 0;
+        return;
+    }
+
+    drawTabHeader("OPTIONS", optSel == backIdx);
+    float x = 159.0f * SX, y = 376.0f * SY;
+    drawFrame(x, y, 580.0f * SX, 260.0f * SY, 0);
+
+    const char *labels[OPT_ROWS] = {
+        "Music volume", "Sound volume", "Look sensitivity", "Invert Y axis",
+    };
+    for (int i = 0; i < OPT_ROWS; i++) {
+        float ry = y + (30.0f + i * 55.0f) * SY;
+        float g = optSel == i ? 1.0f : 0.75f;
+        mtext(x + 24.0f * SX, ry, 1.5f, g, g, g, labels[i]);
+        char val[32];
+        if (i == 0) {
+            snprintf(val, sizeof(val), "< %d%% >",
+                     (int)(optMusicVol * 100.0f + 0.5f));
+        } else if (i == 1) {
+            snprintf(val, sizeof(val), "< %d%% >",
+                     (int)(optSfxVol * 100.0f + 0.5f));
+        } else if (i == 2) {
+            snprintf(val, sizeof(val), "< %.2fx >", optLookSens);
+        } else {
+            snprintf(val, sizeof(val), "< %s >", optInvertY ? "ON" : "OFF");
+        }
+        mtext(x + 330.0f * SX, ry, 1.5f, g, g, g, val);
+        /* Volume sliders like the game's option bars. */
+        if (i < 2) {
+            float frac = i == 0 ? optMusicVol : optSfxVol;
+            drawQuad(x + 330.0f * SX, ry + 16.0f, 150.0f * SX, 6, 0, 0.25f,
+                     0.25f, 0.25f, 1.0f);
+            drawQuad(x + 330.0f * SX, ry + 16.0f, 150.0f * SX * frac, 6, 0,
+                     0.85f, 0.85f, 0.85f, 1.0f);
+        }
+    }
+    mtext(x + 24.0f * SX, y + 260.0f * SY + 10.0f, 1.5f, 0.5f, 0.5f, 0.5f,
+          "left/right: adjust   O: back");
+}
+
+/* ---- main button column ---- */
+
+static void mainButtonsTab(int *running) {
+    const float SX = MENU_SX, SY = MENU_SY;
+    if (inputHit(ACTION_SAVE) && titleSel > 0) titleSel--;
+    if (inputDpadDownHit() && titleSel < 3) titleSel++;
+    if (inputHit(ACTION_INTERACT)) {
+        switch (titleSel) {
+            case 0: /* NEW GAME */
+                newName[0] = '\0';
+                randomSeedString(newSeedStr, sizeof(newSeedStr));
+                newSel = 0;
+                oskOpen = 0;
+                menuTab = 1;
+                return;
+            case 1: /* LOAD GAME */
+                scanSaves();
+                menuTab = 2;
+                return;
+            case 2: /* OPTIONS */
+                optSel = 0;
+                menuTab = 3;
+                return;
+            case 3: /* QUIT */
+                *running = 0;
+                return;
+        }
+    }
+    /* Start returns to a game in progress (after QUIT TO MENU). */
+    if (worldReady && inputHit(ACTION_MENU)) {
+        gameState = 1;
+        audioStopMusic();
+        return;
+    }
+
+    static const char *rows[4] = { "NEW GAME", "LOAD GAME", "OPTIONS",
+                                   "QUIT" };
     float bx = 159.0f * SX, bw = 400.0f * SX, bh = 70.0f * SY;
     for (int i = 0; i < 4; i++) {
-        float by = (286.0f + i * 95.0f) * SY;
-        drawMenuButton(bx, by, bw, bh, rows[i], i == titleSel);
+        drawMenuButton(bx, (286.0f + i * 100.0f) * SY, bw, bh, rows[i],
+                       i == titleSel);
     }
+    if (worldReady) {
+        mtext(bx, (286.0f + 4 * 100.0f) * SY, 1.5f, 0.6f, 0.6f, 0.6f,
+              "Start: return to game");
+    }
+}
 
-    glPushMatrix();
-    glScalef(2.0f, 2.0f, 1.0f);
-    glColor4f(0.45f, 0.45f, 0.45f, 1.0f);
-    drawText(10, (SCREEN_H - 24.0f) * 0.5f,
-             "PS Vita port   dpad: select  X: confirm"
-             "  seed: left/right (hold L x1000)");
-    if (toastTimer > 0) {
-        glColor4f(1.0f, 1.0f, 0.8f, 1.0f);
-        drawText(240, 200, toastMsg);
+/* One full menu frame: input + draw. Draws inside HUD 2D state. */
+static void menuFrame(int *running) {
+    drawMenuChrome();
+    switch (menuTab) {
+        case 1: newGameTab(); break;
+        case 2: loadGameTab(); break;
+        case 3: optionsTab(); break;
+        default: mainButtonsTab(running); break;
     }
-    glColor4f(1, 1, 1, 1);
-    glPopMatrix();
+    if (toastTimer > 0) {
+        mtextC(SCREEN_W * 0.5f, 200.0f, 2.0f, 1.0f, 1.0f, 0.8f, toastMsg);
+    }
+}
+
+/* Back to the main menu (boot, QUIT TO MENU, permadeath). */
+static void enterMenu(void) {
+    gameState = 0;
+    menuTab = 0;
+    titleSel = 0;
+    pauseOpen = 0;
+    invOpen = 0;
+    docOpen = 0;
+    menuMusicStart();
 }
 
 /* Pause menu: the game's pause_menu.png panel with its button column
  * (PAUSED / RESUME / QUIT TO MENU labels from local.ini). */
-static const char *PAUSE_ITEMS[4] = {
-    "RESUME", "SAVE GAME", "LOAD GAME", "QUIT TO MENU",
-};
-
 static void drawPauseMenu(void) {
     drawQuad(0, 0, SCREEN_W, SCREEN_H, 0, 0.0f, 0.0f, 0.0f, 0.55f);
 
@@ -1485,15 +2386,20 @@ static void drawPauseMenu(void) {
         drawQuad(px, py, pw, ph, 0, 0.05f, 0.05f, 0.05f, 0.95f);
     }
 
-    glPushMatrix();
-    glScalef(2.0f, 2.0f, 1.0f);
-    glColor4f(1, 1, 1, 1);
-    drawText((px + 36.0f) * 0.5f, (py + 30.0f) * 0.5f, "PAUSED");
-    glPopMatrix();
+    mtext(px + 36.0f, py + 24.0f, 2.0f, 1, 1, 1, "PAUSED");
 
+    int saveType = DIFFICULTIES[gameDiff].saveType;
+    const char *items[4] = {
+        "RESUME",
+        saveType == SAVE_ON_QUIT ? "SAVE & QUIT"
+                                 : (saveType == NO_SAVES ? "SAVING DISABLED"
+                                                         : "SAVE GAME"),
+        "LOAD GAME",
+        "QUIT TO MENU",
+    };
     for (int i = 0; i < 4; i++) {
         drawMenuButton(px + 36.0f, py + 84.0f + i * 78.0f, pw - 72.0f,
-                       54.0f, PAUSE_ITEMS[i], i == pauseSel);
+                       54.0f, items[i], i == pauseSel);
     }
 }
 
@@ -1517,12 +2423,17 @@ int main(void) {
         buildNpcAssets();
         loadHudTextures();
         loadMenuTextures();
-        if (audioInit()) loadSounds();
+        optionsLoad();
+        mkdir(SAVES_DIR, 0777);
+        if (audioInit()) {
+            loadSounds();
+            optionsApply();
+        }
         /* Boot to the title menu; the world is generated when the
          * player starts or loads a game. */
+        srand((unsigned)sceKernelGetProcessTimeWide());
         pendingSeed = (uint32_t)(sceKernelGetProcessTimeWide() & 0xFFFFFF) | 1u;
-        gameState = 0;
-        titleSel = 0;
+        enterMenu();
     } else {
         snprintf(statusLine, sizeof(statusLine),
                  "Data not found. Install the data package to " DATA_ROOT "/");
@@ -1544,50 +2455,12 @@ int main(void) {
 
         inputUpdate();
 
-        /* ---- title menu state: no world simulation, just the menu ---- */
+        /* ---- main menu state: no world simulation, just the menu ---- */
         if (haveData && gameState == 0) {
-            if (inputHit(ACTION_SAVE) && titleSel > 0) titleSel--;
-            if (inputDpadDownHit() && titleSel < 3) titleSel++;
-            if (titleSel == 2) {
-                uint32_t step = inputDown(ACTION_SPRINT) ? 1000u : 1u;
-                if (inputHit(ACTION_LEAN_LEFT)) pendingSeed -= step;
-                if (inputHit(ACTION_LEAN_RIGHT)) pendingSeed += step;
-                if (pendingSeed == 0) pendingSeed = 1;
-            }
-            if (inputHit(ACTION_INTERACT)) {
-                switch (titleSel) {
-                    case 0: /* NEW GAME */
-                    case 2: /* SEED row confirms too */
-                        regenerateMap(pendingSeed);
-                        gameState = 1;
-                        worldReady = 1;
-                        pauseOpen = 0;
-                        break;
-                    case 1: /* LOAD GAME */
-                        if (loadGame()) {
-                            snprintf(toastMsg, sizeof(toastMsg),
-                                     "GAME LOADED");
-                            gameState = 1;
-                            worldReady = 1;
-                            pauseOpen = 0;
-                        } else {
-                            snprintf(toastMsg, sizeof(toastMsg),
-                                     "NO SAVE FOUND");
-                        }
-                        toastTimer = 150;
-                        break;
-                    case 3: /* QUIT */
-                        running = 0;
-                        break;
-                }
-            }
-            /* Start returns to a game in progress (after QUIT TO MENU). */
-            if (worldReady && inputHit(ACTION_MENU)) gameState = 1;
-
             if (toastTimer > 0) toastTimer--;
             glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
             beginHud2D();
-            drawTitleMenu();
+            menuFrame(&running);
             endHud2D();
             vglSwapBuffers(GL_FALSE);
             continue;
@@ -1612,9 +2485,23 @@ int main(void) {
                     case 0: /* RESUME */
                         pauseOpen = 0;
                         break;
-                    case 1: /* SAVE GAME */
-                        snprintf(toastMsg, sizeof(toastMsg), "%s",
-                                 saveGame() ? "GAME SAVED" : "SAVE FAILED");
+                    case 1: /* SAVE GAME (gated by the difficulty) */
+                        if (DIFFICULTIES[gameDiff].saveType == NO_SAVES) {
+                            snprintf(toastMsg, sizeof(toastMsg),
+                                     "SAVING IS DISABLED ON THIS DIFFICULTY");
+                        } else if (DIFFICULTIES[gameDiff].saveType
+                                   == SAVE_ON_QUIT) {
+                            if (saveGame()) {
+                                enterMenu();
+                            } else {
+                                snprintf(toastMsg, sizeof(toastMsg),
+                                         "SAVE FAILED");
+                            }
+                        } else {
+                            snprintf(toastMsg, sizeof(toastMsg), "%s",
+                                     saveGame() ? "GAME SAVED"
+                                                : "SAVE FAILED");
+                        }
                         toastTimer = 150;
                         break;
                     case 2: /* LOAD GAME */
@@ -1629,10 +2516,8 @@ int main(void) {
                         toastTimer = 150;
                         break;
                     case 3: /* QUIT TO MENU */
-                        pauseOpen = 0;
-                        gameState = 0;
-                        titleSel = 0;
                         pendingSeed = mapSeed;
+                        enterMenu();
                         break;
                 }
             }
@@ -1649,11 +2534,11 @@ int main(void) {
         } else if (invOpen) {
             /* D-pad navigates the inventory grid while it is open. */
             if (inputHit(ACTION_LEAN_LEFT) && invSel > 0) invSel--;
-            if (inputHit(ACTION_LEAN_RIGHT) && invSel < MAX_INVENTORY - 1) {
+            if (inputHit(ACTION_LEAN_RIGHT) && invSel < invSlotCap - 1) {
                 invSel++;
             }
             if (inputHit(ACTION_SAVE) && invSel >= 5) invSel -= 5; /* up */
-            if (inputDpadDownHit() && invSel + 5 < MAX_INVENTORY) {
+            if (inputDpadDownHit() && invSel + 5 < invSlotCap) {
                 invSel += 5;
             }
             /* Cross reads the selected document, if any. */
@@ -1725,6 +2610,19 @@ int main(void) {
         if (deathTimer > 0) {
             deathTimer--;
             if (deathTimer == 0) {
+                if (DIFFICULTIES[gameDiff].saveType >= SAVE_ON_QUIT) {
+                    /* One life (Keter and up): the run and its save are
+                     * gone; back to the main menu. */
+                    char sp[256];
+                    currentSavePath(sp, sizeof(sp));
+                    remove(sp);
+                    worldReady = 0;
+                    enterMenu();
+                    snprintf(toastMsg, sizeof(toastMsg),
+                             "YOU DIED - GAME OVER");
+                    toastTimer = 240;
+                    continue;
+                }
                 spawnPlayer();
                 npc173Pos[0] = npc173SpawnX;
                 npc173Pos[2] = npc173SpawnZ;
@@ -1744,8 +2642,8 @@ int main(void) {
             look.x = look.y = 0.0f;
             move.x = move.y = 0.0f;
         }
-        camYaw += look.x * 0.04f;
-        camPitch += look.y * 0.03f;
+        camYaw += look.x * 0.04f * optLookSens;
+        camPitch += look.y * 0.03f * optLookSens * (optInvertY ? -1.0f : 1.0f);
         if (camPitch > 1.5f) camPitch = 1.5f;
         if (camPitch < -1.5f) camPitch = -1.5f;
 

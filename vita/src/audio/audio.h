@@ -25,6 +25,15 @@ void audioPlay3D(int sound, const float pos[3], const float listener[3],
 /* Loop a sound on the dedicated ambience channel (replaces previous). */
 void audioLoopAmbience(int sound, float vol);
 
+/* Loop a sound on the dedicated music channel (menu/zone music). */
+void audioLoopMusic(int sound, float vol);
+void audioStopMusic(void);
+
+/* Master volumes (0..1) applied on top of per-play volumes; the music
+ * volume also updates a playing music channel live. */
+void audioSetSfxVolume(float vol);
+void audioSetMusicVolume(float vol);
+
 /* Diagnostics: init state (1 ok, -1 port failed, -2 thread failed,
  * 0 not initialized) and number of sounds successfully decoded. */
 int audioStatus(void);
