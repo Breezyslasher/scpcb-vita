@@ -50,6 +50,7 @@ unsigned int _newlib_heap_size_user = 220 * 1024 * 1024;
 #define HUD_DIR DATA_ROOT "/GFX/HUD"
 #define INV_ICONS_DIR DATA_ROOT "/GFX/Items/Inventory Icons"
 #define NPCS_DIR DATA_ROOT "/GFX/NPCs"
+#define MENU_DIR DATA_ROOT "/GFX/Menu"
 #define ROOMS_INI DATA_ROOT "/Data/rooms.ini"
 
 /* RoomSpacing is 8 world units = 2048 raw mesh units. */
@@ -838,10 +839,9 @@ static int itemTplFind(const char *name) {
 /* "Level N Key Card" / "Level N key Card" grants keycard level N. */
 static int itemKeycardLevel(int tpl) {
     const char *n = ITEM_TEMPLATES[tpl].name;
-    int level = 0;
-    if (sscanf(n, "Level %d", &level) == 1
+    if (strncmp(n, "Level ", 6) == 0
         && (strstr(n, "Key Card") || strstr(n, "key Card"))) {
-        return level;
+        return (int)strtol(n + 6, NULL, 10);
     }
     return 0;
 }
@@ -956,6 +956,43 @@ static int pauseOpen;
 static int pauseSel;
 static uint32_t pendingSeed;
 
+/* 0 = title menu, 1 = playing. The world only exists after the first
+ * NEW GAME / LOAD GAME. */
+static int gameState;
+static int titleSel;
+static int worldReady;
+
+static GLuint menuBackTex, menuTitleTex, pausePanelTex;
+
+/* Menu art needs to stay sharp at fullscreen, so it loads at a 1024
+ * cap instead of the world texture cap. */
+static GLuint loadMenuTexture(const char *name) {
+    const char *dirs[1] = { MENU_DIR };
+    char path[1024];
+    if (!textureResolve(name, dirs, 1, path, sizeof(path))) return 0;
+    char err[128];
+    TextureImage *img = textureLoadFile(path, 1024, err, sizeof(err));
+    if (!img) return 0;
+    GLuint handle = 0;
+    glGenTextures(1, &handle);
+    glBindTexture(GL_TEXTURE_2D, handle);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, (GLsizei)img->width,
+                 (GLsizei)img->height, 0, GL_RGBA, GL_UNSIGNED_BYTE,
+                 img->pixels);
+    textureFree(img);
+    return handle;
+}
+
+static void loadMenuTextures(void) {
+    menuBackTex = loadMenuTexture("back.png");
+    menuTitleTex = loadMenuTexture("SCP_text.png");
+    pausePanelTex = loadMenuTexture("pause_menu.png");
+}
+
 #define SAVE_PATH DATA_ROOT "/save.dat"
 
 /* The map, doors, item spawns and 173 placement are all deterministic
@@ -1002,14 +1039,31 @@ static int loadGame(void) {
     int nact = 1;
     static char invLine[640], takenLine[640], doorLine[640];
     invLine[0] = takenLine[0] = doorLine[0] = '\0';
+    /* Parsed with strtof/strtoul: vitasdk newlib faults on scanf
+     * float conversions. */
     while (fgets(line, sizeof(line), f)) {
-        if (sscanf(line, "seed=%u", &seed) == 1) continue;
-        if (sscanf(line, "player=%f %f %f %f %f", &px, &py, &pz, &yaw,
-                   &pitch) == 5) continue;
-        if (sscanf(line, "vitals=%f %f", &bt, &st) == 2) continue;
-        if (sscanf(line, "npc173=%f %f %f %f %d", &nx, &ny, &nz, &nyaw,
-                   &nact) == 5) continue;
-        if (strncmp(line, "inv=", 4) == 0) {
+        char *p;
+        if (strncmp(line, "seed=", 5) == 0) {
+            seed = (uint32_t)strtoul(line + 5, NULL, 10);
+        } else if (strncmp(line, "player=", 7) == 0) {
+            p = line + 7;
+            px = strtof(p, &p);
+            py = strtof(p, &p);
+            pz = strtof(p, &p);
+            yaw = strtof(p, &p);
+            pitch = strtof(p, &p);
+        } else if (strncmp(line, "vitals=", 7) == 0) {
+            p = line + 7;
+            bt = strtof(p, &p);
+            st = strtof(p, &p);
+        } else if (strncmp(line, "npc173=", 7) == 0) {
+            p = line + 7;
+            nx = strtof(p, &p);
+            ny = strtof(p, &p);
+            nz = strtof(p, &p);
+            nyaw = strtof(p, &p);
+            nact = (int)strtol(p, &p, 10);
+        } else if (strncmp(line, "inv=", 4) == 0) {
             snprintf(invLine, sizeof(invLine), "%s", line + 4);
         } else if (strncmp(line, "taken=", 6) == 0) {
             snprintf(takenLine, sizeof(takenLine), "%s", line + 6);
@@ -1330,38 +1384,117 @@ static void drawDocument(void) {
                 1.0f);
 }
 
-/* Pause menu: runs inside the HUD ortho/flat-2D state. */
-static void drawPauseMenu(void) {
-    static const char *items[6] = {
-        "Resume", "Save Game", "Load Game", "New Game (new seed)",
-        "", "Exit",
-    };
-    drawQuad(0, 0, SCREEN_W, SCREEN_H, 0, 0.0f, 0.0f, 0.0f, 0.78f);
+/* ---------------- menus (game-styled) ---------------- */
+
+/* Flat-2D state, same setup drawHud uses. */
+static void beginHud2D(void) {
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
+    glMatrixMode(GL_PROJECTION);
+    glLoadIdentity();
+    glOrtho(0, SCREEN_W, SCREEN_H, 0, -1, 1);
+    glMatrixMode(GL_MODELVIEW);
+    glLoadIdentity();
+    glDisable(GL_DEPTH_TEST);
+    glDisable(GL_TEXTURE_2D);
+    glDisable(GL_FOG);
+    glDisable(GL_CULL_FACE);
+    glDisableClientState(GL_COLOR_ARRAY);
+    glDisableClientState(GL_TEXTURE_COORD_ARRAY);
+    glColor4f(1, 1, 1, 1);
+}
+
+static void endHud2D(void) {
+    glEnableClientState(GL_COLOR_ARRAY);
+    glEnableClientState(GL_TEXTURE_COORD_ARRAY);
+    glEnable(GL_DEPTH_TEST);
+}
+
+/* A menu button in the game's style: black box, light border, caps
+ * label; the selection brightens the border like the mouse-hover. */
+static void drawMenuButton(float x, float y, float w, float h,
+                           const char *label, int selected) {
+    drawQuad(x, y, w, h, 0, 0.02f, 0.02f, 0.02f, 0.92f);
+    float bc = selected ? 1.0f : 0.5f;
+    drawQuad(x, y, w, 2, 0, bc, bc, bc, 1.0f);
+    drawQuad(x, y + h - 2, w, 2, 0, bc, bc, bc, 1.0f);
+    drawQuad(x, y, 2, h, 0, bc, bc, bc, 1.0f);
+    drawQuad(x + w - 2, y, 2, h, 0, bc, bc, bc, 1.0f);
+    glPushMatrix();
+    glScalef(2.0f, 2.0f, 1.0f);
+    float g = selected ? 1.0f : 0.78f;
+    glColor4f(g, g, g, 1.0f);
+    drawText((x + 18.0f) * 0.5f, (y + h * 0.5f - 7.0f) * 0.5f, label);
+    glColor4f(1, 1, 1, 1);
+    glPopMatrix();
+}
+
+/* Title screen: back.png fullscreen, the SCP text logo, and the
+ * button column at Menu_Core.bb's design coordinates (1280x960
+ * design space mapped onto 960x544). */
+static void drawTitleMenu(void) {
+    const float SX = SCREEN_W / 1280.0f, SY = SCREEN_H / 960.0f;
+    if (menuBackTex) {
+        drawTexQuad(0, 0, SCREEN_W, SCREEN_H, menuBackTex, 1.0f);
+    } else {
+        drawQuad(0, 0, SCREEN_W, SCREEN_H, 0, 0, 0, 0, 1.0f);
+    }
+    if (menuTitleTex) {
+        drawTexQuad(159.0f * SX, 170.0f * SY, 550.0f * SX, 60.0f * SY,
+                    menuTitleTex, 1.0f);
+    }
+
+    char seedRow[48];
+    snprintf(seedRow, sizeof(seedRow), "SEED: %u", pendingSeed);
+    const char *rows[4] = { "NEW GAME", "LOAD GAME", seedRow, "QUIT" };
+    float bx = 159.0f * SX, bw = 400.0f * SX, bh = 70.0f * SY;
+    for (int i = 0; i < 4; i++) {
+        float by = (286.0f + i * 95.0f) * SY;
+        drawMenuButton(bx, by, bw, bh, rows[i], i == titleSel);
+    }
 
     glPushMatrix();
     glScalef(2.0f, 2.0f, 1.0f);
-    glColor4f(0.85f, 0.92f, 0.85f, 1.0f);
-    drawText(170, 60, "PAUSED");
-    for (int i = 0; i < 6; i++) {
-        char row[64];
-        if (i == 4) {
-            snprintf(row, sizeof(row), "Seed: %u  (start new: X)",
-                     pendingSeed);
-        } else {
-            snprintf(row, sizeof(row), "%s", items[i]);
-        }
-        if (i == pauseSel) {
-            glColor4f(1.0f, 1.0f, 0.6f, 1.0f);
-            drawText(160, 90.0f + i * 16.0f, ">");
-        } else {
-            glColor4f(0.75f, 0.75f, 0.75f, 1.0f);
-        }
-        drawText(170, 90.0f + i * 16.0f, row);
+    glColor4f(0.45f, 0.45f, 0.45f, 1.0f);
+    drawText(10, (SCREEN_H - 24.0f) * 0.5f,
+             "PS Vita port   dpad: select  X: confirm"
+             "  seed: left/right (hold L x1000)");
+    if (toastTimer > 0) {
+        glColor4f(1.0f, 1.0f, 0.8f, 1.0f);
+        drawText(240, 200, toastMsg);
     }
-    glColor4f(0.5f, 0.5f, 0.5f, 1.0f);
-    drawText(170, 190, "dpad: navigate  (seed: left/right, L = x1000)");
     glColor4f(1, 1, 1, 1);
     glPopMatrix();
+}
+
+/* Pause menu: the game's pause_menu.png panel with its button column
+ * (PAUSED / RESUME / QUIT TO MENU labels from local.ini). */
+static const char *PAUSE_ITEMS[4] = {
+    "RESUME", "SAVE GAME", "LOAD GAME", "QUIT TO MENU",
+};
+
+static void drawPauseMenu(void) {
+    drawQuad(0, 0, SCREEN_W, SCREEN_H, 0, 0.0f, 0.0f, 0.0f, 0.55f);
+
+    /* pause_menu.png is 600x673; keep its aspect. */
+    float ph = 470.0f, pw = ph * (600.0f / 673.0f);
+    float px = 70.0f, py = (SCREEN_H - ph) * 0.5f;
+    if (pausePanelTex) {
+        drawTexQuad(px, py, pw, ph, pausePanelTex, 1.0f);
+    } else {
+        drawQuad(px, py, pw, ph, 0, 0.05f, 0.05f, 0.05f, 0.95f);
+    }
+
+    glPushMatrix();
+    glScalef(2.0f, 2.0f, 1.0f);
+    glColor4f(1, 1, 1, 1);
+    drawText((px + 36.0f) * 0.5f, (py + 30.0f) * 0.5f, "PAUSED");
+    glPopMatrix();
+
+    for (int i = 0; i < 4; i++) {
+        drawMenuButton(px + 36.0f, py + 84.0f + i * 78.0f, pw - 72.0f,
+                       54.0f, PAUSE_ITEMS[i], i == pauseSel);
+    }
 }
 
 int main(void) {
@@ -1383,8 +1516,13 @@ int main(void) {
         buildDoorAssets();
         buildNpcAssets();
         loadHudTextures();
+        loadMenuTextures();
         if (audioInit()) loadSounds();
-        regenerateMap((uint32_t)(sceKernelGetProcessTimeWide() & 0xFFFFFF) | 1u);
+        /* Boot to the title menu; the world is generated when the
+         * player starts or loads a game. */
+        pendingSeed = (uint32_t)(sceKernelGetProcessTimeWide() & 0xFFFFFF) | 1u;
+        gameState = 0;
+        titleSel = 0;
     } else {
         snprintf(statusLine, sizeof(statusLine),
                  "Data not found. Install the data package to " DATA_ROOT "/");
@@ -1406,13 +1544,61 @@ int main(void) {
 
         inputUpdate();
 
+        /* ---- title menu state: no world simulation, just the menu ---- */
+        if (haveData && gameState == 0) {
+            if (inputHit(ACTION_SAVE) && titleSel > 0) titleSel--;
+            if (inputDpadDownHit() && titleSel < 3) titleSel++;
+            if (titleSel == 2) {
+                uint32_t step = inputDown(ACTION_SPRINT) ? 1000u : 1u;
+                if (inputHit(ACTION_LEAN_LEFT)) pendingSeed -= step;
+                if (inputHit(ACTION_LEAN_RIGHT)) pendingSeed += step;
+                if (pendingSeed == 0) pendingSeed = 1;
+            }
+            if (inputHit(ACTION_INTERACT)) {
+                switch (titleSel) {
+                    case 0: /* NEW GAME */
+                    case 2: /* SEED row confirms too */
+                        regenerateMap(pendingSeed);
+                        gameState = 1;
+                        worldReady = 1;
+                        pauseOpen = 0;
+                        break;
+                    case 1: /* LOAD GAME */
+                        if (loadGame()) {
+                            snprintf(toastMsg, sizeof(toastMsg),
+                                     "GAME LOADED");
+                            gameState = 1;
+                            worldReady = 1;
+                            pauseOpen = 0;
+                        } else {
+                            snprintf(toastMsg, sizeof(toastMsg),
+                                     "NO SAVE FOUND");
+                        }
+                        toastTimer = 150;
+                        break;
+                    case 3: /* QUIT */
+                        running = 0;
+                        break;
+                }
+            }
+            /* Start returns to a game in progress (after QUIT TO MENU). */
+            if (worldReady && inputHit(ACTION_MENU)) gameState = 1;
+
+            if (toastTimer > 0) toastTimer--;
+            glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+            beginHud2D();
+            drawTitleMenu();
+            endHud2D();
+            vglSwapBuffers(GL_FALSE);
+            continue;
+        }
+
         if (haveData && inputHit(ACTION_MENU)) {
             pauseOpen = !pauseOpen;
             if (pauseOpen) {
                 invOpen = 0;
                 docOpen = 0;
                 pauseSel = 0;
-                pendingSeed = mapSeed;
             }
         } else if (!haveData && inputHit(ACTION_MENU)) {
             if (++menuHits >= 3) running = 0;
@@ -1420,24 +1606,18 @@ int main(void) {
         int pausedAtFrameStart = pauseOpen;
         if (pauseOpen) {
             if (inputHit(ACTION_SAVE) && pauseSel > 0) pauseSel--;
-            if (inputDpadDownHit() && pauseSel < 5) pauseSel++;
-            if (pauseSel == 4) {
-                uint32_t step = inputDown(ACTION_SPRINT) ? 1000u : 1u;
-                if (inputHit(ACTION_LEAN_LEFT)) pendingSeed -= step;
-                if (inputHit(ACTION_LEAN_RIGHT)) pendingSeed += step;
-                if (pendingSeed == 0) pendingSeed = 1;
-            }
+            if (inputDpadDownHit() && pauseSel < 3) pauseSel++;
             if (inputHit(ACTION_INTERACT)) {
                 switch (pauseSel) {
-                    case 0:
+                    case 0: /* RESUME */
                         pauseOpen = 0;
                         break;
-                    case 1:
+                    case 1: /* SAVE GAME */
                         snprintf(toastMsg, sizeof(toastMsg), "%s",
                                  saveGame() ? "GAME SAVED" : "SAVE FAILED");
                         toastTimer = 150;
                         break;
-                    case 2:
+                    case 2: /* LOAD GAME */
                         if (loadGame()) {
                             snprintf(toastMsg, sizeof(toastMsg),
                                      "GAME LOADED");
@@ -1448,16 +1628,11 @@ int main(void) {
                         }
                         toastTimer = 150;
                         break;
-                    case 3:
-                        regenerateMap(mapSeed * 7919u + 17u);
+                    case 3: /* QUIT TO MENU */
                         pauseOpen = 0;
-                        break;
-                    case 4:
-                        regenerateMap(pendingSeed);
-                        pauseOpen = 0;
-                        break;
-                    case 5:
-                        running = 0;
+                        gameState = 0;
+                        titleSel = 0;
+                        pendingSeed = mapSeed;
                         break;
                 }
             }
