@@ -283,6 +283,10 @@ static void templateEnsure(int idx) {
 /* Render transform: world = T(center) * Ry(-angle * 90deg) * local
  * (the -angle mirrors Blitz's left-handed rotation into our space). */
 
+/* These must match drawRoomBatches' glRotatef(-angle * 90): probing
+ * every grid doorway of a generated map through worldToLocal +
+ * collisionRayDown finds floor at all 228 doorways with this mapping
+ * (the 1/3-swapped variant misses 10). */
 static void worldToLocal(const RoomPlacement *p, const float w[3],
                          float l[3]) {
     float dx = w[0] - p->gridX * ROOM_SPACING;
@@ -290,9 +294,9 @@ static void worldToLocal(const RoomPlacement *p, const float w[3],
     float dz = w[2] - p->gridY * ROOM_SPACING;
     switch (p->angle & 3) {
         case 0: l[0] = dx;  l[2] = dz;  break;
-        case 1: l[0] = -dz; l[2] = dx;  break; /* Ry(+90) */
+        case 1: l[0] = dz;  l[2] = -dx; break;
         case 2: l[0] = -dx; l[2] = -dz; break;
-        case 3: l[0] = dz;  l[2] = -dx; break;
+        case 3: l[0] = -dz; l[2] = dx;  break;
     }
     l[1] = dy;
 }
@@ -302,9 +306,9 @@ static void localToWorld(const RoomPlacement *p, const float l[3],
     float x = 0.0f, z = 0.0f;
     switch (p->angle & 3) {
         case 0: x = l[0];  z = l[2];  break;
-        case 1: x = l[2];  z = -l[0]; break; /* Ry(-90) */
+        case 1: x = -l[2]; z = l[0];  break;
         case 2: x = -l[0]; z = -l[2]; break;
-        case 3: x = -l[2]; z = l[0];  break;
+        case 3: x = l[2];  z = -l[0]; break;
     }
     w[0] = x + p->gridX * ROOM_SPACING;
     w[1] = l[1];

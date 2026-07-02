@@ -58,15 +58,48 @@ def split_args(argstr):
 
 doors = []
 rooms = []
+# Stack of If-block filters: shared Case blocks (Case r_a, r_b) guard
+# variant-specific doors with `If r\RoomTemplate\RoomID = r_a`; track
+# nesting so those doors only attribute to the named variant.
+if_stack = []
+roomid_re = re.compile(r'RoomTemplate\\RoomID\s*=\s*(r_\w+)')
+if_re = re.compile(r'^\s*If\b', re.IGNORECASE)
+endif_re = re.compile(r'^\s*EndIf\b', re.IGNORECASE)
+else_re = re.compile(r'^\s*Else(If)?\b', re.IGNORECASE)
+
+
+def single_line_if(text):
+    m = re.search(r'\bThen\b(.*)$', text, re.IGNORECASE)
+    return m is not None and m.group(1).split(";")[0].strip() != ""
+
+
 lines = open(ROOMS, encoding="latin-1").readlines()
 for li, line in enumerate(lines):
     cm = case_re.match(line)
     if cm:
         rooms = [r.strip()[2:] for r in cm.group(1).split(",")
                  if r.strip().startswith("r_")]
+        if_stack = []
         continue
+    if if_re.match(line) and not single_line_if(line):
+        named = [m[2:] for m in roomid_re.findall(line)]
+        if_stack.append(named or None)
+    elif else_re.match(line) and if_stack:
+        named = if_stack[-1]
+        if named:
+            # Else of a RoomID check: the other rooms of this Case.
+            if_stack[-1] = [r for r in rooms if r not in named] or None
+    elif endif_re.match(line) and if_stack:
+        if_stack.pop()
+
     dm = door_re.search(line)
     if not dm or not rooms:
+        continue
+    active = rooms
+    for f in if_stack:
+        if f is not None:
+            active = [r for r in active if r in f]
+    if not active:
         continue
     args = split_args(dm.group(1))
     if len(args) < 4:
@@ -95,7 +128,7 @@ for li, line in enumerate(lines):
             if re.search(r'\\Locked\s*=\s*1', follow):
                 locked = 1
                 break
-    for room in rooms:
+    for room in active:
         doors.append((room, x, y, z, ang % 360.0, is_open, dtype,
                       keycard, locked))
 
