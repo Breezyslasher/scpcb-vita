@@ -769,6 +769,8 @@ static int playerSees173(void) {
     return dot > 0.55f; /* ~57-degree half-angle (bbox partially on screen) */
 }
 
+static int roomExistsAt(float x, float z);
+
 /* TeleportCloser: when 173 has fallen far behind, jump it to a room
  * near the player (out of the view cone) so the hunt continues. */
 static void teleport173Closer(void) {
