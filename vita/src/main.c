@@ -345,6 +345,12 @@ static void spawnRoomDoors(void) {
 #define INTRO_GX -8
 #define INTRO_GY -8
 static int introRoomIdx = -1;   /* index in map.rooms, -1 = none */
+/* The Class-D cell interior is a separate mesh the game overlays on
+ * the intro room (Rooms_Core: cont1_173_intro_player_cell.rmesh at
+ * the room origin). */
+static Scene *introCellScene;
+static BatchGL *introCellGL;
+static CollisionWorld *introCellCol;
 static int introPhase = -1;     /* -1 inactive, >=0 running */
 static int introTimer;
 static int introGateDoor = -1;
@@ -357,6 +363,42 @@ static int inIntroBounds(float x, float z) {
     float ox = INTRO_GX * ROOM_SPACING, oz = INTRO_GY * ROOM_SPACING;
     return x > ox - 9000.0f && x < ox + 2300.0f
         && z > oz - 4200.0f && z < oz + 1800.0f;
+}
+
+static void buildIntroCell(void) {
+    if (introCellScene) return; /* built once, kept for the session */
+    char err[128];
+    RMesh *mesh = rmeshLoadFile(MAP_DIR "/cont1_173_intro_player_cell.rmesh",
+                                err, sizeof(err));
+    if (!mesh) return;
+    introCellScene = sceneBuild(mesh);
+    if (!introCellScene) {
+        rmeshFree(mesh);
+        return;
+    }
+    introCellCol = collisionBuild(introCellScene, mesh);
+    rmeshFree(mesh);
+    introCellGL = (BatchGL *)calloc(
+        introCellScene->batchCount ? introCellScene->batchCount : 1,
+        sizeof(BatchGL));
+    if (!introCellGL) return;
+    for (uint32_t i = 0; i < introCellScene->batchCount; i++) {
+        const SceneBatch *b = &introCellScene->batches[i];
+        introCellGL[i].diffuse = textureGet(b->diffuseName);
+        introCellGL[i].lightmap = textureGet(b->lightmapName);
+        glGenBuffers(1, &introCellGL[i].vbo);
+        glBindBuffer(GL_ARRAY_BUFFER, introCellGL[i].vbo);
+        glBufferData(GL_ARRAY_BUFFER,
+                     (GLsizeiptr)(b->vertexCount * sizeof(SceneVertex)),
+                     b->vertices, GL_STATIC_DRAW);
+        glGenBuffers(1, &introCellGL[i].ibo);
+        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, introCellGL[i].ibo);
+        glBufferData(GL_ELEMENT_ARRAY_BUFFER,
+                     (GLsizeiptr)(b->indexCount * sizeof(uint16_t)),
+                     b->indices, GL_STATIC_DRAW);
+    }
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
 }
 
 static void appendIntroRoom(void) {
@@ -380,6 +422,7 @@ static void appendIntroRoom(void) {
     p->angle = 0;
     introRoomIdx = (int)map.roomCount;
     map.roomCount++;
+    buildIntroCell();
 }
 
 /* Active set: placements within one cell of the player. */
@@ -422,6 +465,17 @@ static const char *roomNameAt(const float pos[3]) {
 /* ---------------- collision across active rooms ---------------- */
 
 static void pushWorld(float pos[3], float radius, int *pushedUp) {
+    if (introCellCol && inIntroBounds(pos[0], pos[2])) {
+        float local[3] = { pos[0] - INTRO_GX * ROOM_SPACING, pos[1],
+                           pos[2] - INTRO_GY * ROOM_SPACING };
+        int up = 0;
+        if (collisionSpherePush(introCellCol, local, radius, &up)) {
+            pos[0] = local[0] + INTRO_GX * ROOM_SPACING;
+            pos[1] = local[1];
+            pos[2] = local[2] + INTRO_GY * ROOM_SPACING;
+        }
+        if (up && pushedUp) *pushedUp = 1;
+    }
     for (int i = 0; i < activeCount; i++) {
         const RoomPlacement *p = activeRooms[i];
         const CollisionWorld *col = tplRT[p->templateIndex].col;
@@ -439,6 +493,15 @@ static void pushWorld(float pos[3], float radius, int *pushedUp) {
 static int rayDownWorld(const float origin[3], float maxDist, float *hitY) {
     int hit = 0;
     float best = -1e30f;
+    if (introCellCol && inIntroBounds(origin[0], origin[2])) {
+        float local[3] = { origin[0] - INTRO_GX * ROOM_SPACING, origin[1],
+                           origin[2] - INTRO_GY * ROOM_SPACING };
+        float y;
+        if (collisionRayDown(introCellCol, local, maxDist, &y)) {
+            best = y;
+            hit = 1;
+        }
+    }
     for (int i = 0; i < activeCount; i++) {
         const RoomPlacement *p = activeRooms[i];
         const CollisionWorld *col = tplRT[p->templateIndex].col;
@@ -844,10 +907,11 @@ static ModelRT introGuardRT, introClassDRT, introScientistRT,
 static void buildHumanRT(ModelRT *rt, const char *model, const char *tex) {
     buildModelRT(rt, model, 0, 0, 0, tex);
     if (!rt->ok || !rt->scene) return;
-    /* Uniform scale to a ~1.75-unit standing height. */
+    /* Uniform scale to human height, a touch under the 313-unit
+     * doorway. */
     float h = rt->scene->boundsMax[1] - rt->scene->boundsMin[1];
     if (h > 0.0f) {
-        float k = 448.0f / h;
+        float k = 285.0f / h;
         rt->scale[0] = rt->scale[1] = rt->scale[2] = k;
     }
 }
@@ -1202,14 +1266,13 @@ static void introStart(void) {
         }
     }
 
-    /* Wake up in the Class-D cell: the cells sit north of the block
-     * corridor (corridor floor y=384, cells y=320; the middle cell is
-     * at local x~-4050, z~1050 - the escort guards stand right
-     * outside it on the corridor). */
-    camPos[0] = INTRO_GX * ROOM_SPACING - 4050.0f;
-    camPos[1] = 320.0f + EYE_HEIGHT;
-    camPos[2] = INTRO_GY * ROOM_SPACING + 1060.0f;
-    camYaw = 0.0f; /* face the corridor (south) */
+    /* Wake up in the player's cell: its interior overlay mesh spans
+     * local x -4320..-3872, z -128..512, floor y=0, with the cell
+     * door at z=512 opening north onto the block corridor. */
+    camPos[0] = INTRO_GX * ROOM_SPACING - 4096.0f;
+    camPos[1] = EYE_HEIGHT;
+    camPos[2] = INTRO_GY * ROOM_SPACING + 150.0f;
+    camYaw = 3.14159265f; /* face the cell door (north) */
     camPitch = 0.0f;
     velY = 0.0f;
     npc173Active = 0; /* nothing hunts until the breach */
@@ -1296,9 +1359,9 @@ static void introUpdate(void) {
                 audioPlay(sndIntroBreach, 1.0f, 0.0f);
                 /* The breach: 173 is loose in the chamber, the gate
                  * reopens, and the player runs. */
-                npc173Pos[0] = INTRO_GX * ROOM_SPACING + 1500.0f;
+                npc173Pos[0] = INTRO_GX * ROOM_SPACING + 1760.0f;
                 npc173Pos[1] = 0.0f;
-                npc173Pos[2] = INTRO_GY * ROOM_SPACING + 500.0f;
+                npc173Pos[2] = INTRO_GY * ROOM_SPACING + 912.0f;
                 npc173Active = npc173RT.ok;
                 if (introGateDoor >= 0) doors.items[introGateDoor].open = 1;
                 introPhase = 4;
@@ -1330,15 +1393,15 @@ static int introHumanCount;
 
 static void introPlaceHumans(void) {
     IntroHuman defs[8] = {
-        /* The block corridor floor is at y=384, the cells at 320. */
-        { &introGuardRT, -4205.0f, 384.0f, 870.0f, 180.0f }, /* Ulgrin */
-        { &introGuardRT, -3985.0f, 384.0f, 786.0f, 135.0f },
-        { &introGuardRT, -8064.0f, 0.0f, 1096.0f, 180.0f },  /* radio guy */
-        { &introClassDRT, -3550.0f, 320.0f, 1060.0f, 0.0f }, /* inmate */
-        { &introGuardRT, 328.0f, 480.0f, 1072.0f, 180.0f },  /* balcony */
+        /* Positions from UpdateIntro (block corridor floor y=0). */
+        { &introGuardRT, -4205.0f, 0.0f, 870.0f, 180.0f },  /* Ulgrin */
+        { &introGuardRT, -3985.0f, 0.0f, 786.0f, 135.0f },
+        { &introGuardRT, -8064.0f, 0.0f, 1096.0f, 180.0f }, /* radio guy */
+        { &introClassDRT, -3550.0f, 0.0f, 800.0f, 0.0f },   /* inmate */
+        { &introGuardRT, 328.0f, 480.0f, 1072.0f, 180.0f }, /* balcony */
         { &introFranklinRT, -3424.0f, -100.0f, -2208.0f, 0.0f },
         { &introScientistRT, -3073.0f, -315.0f, -2165.0f, 45.0f },
-        { &introGuardRT, -4000.0f, 384.0f, 950.0f, 160.0f },
+        { &introGuardRT, -4000.0f, 0.0f, 950.0f, 160.0f },
     };
     introHumanCount = 0;
     for (int i = 0; i < 8; i++) {
@@ -3796,6 +3859,13 @@ int main(void) {
             for (int i = 0; i < activeCount; i++) {
                 drawRoomBatches(activeRooms[i], 0);
             }
+            if (introCellGL && inIntroBounds(camPos[0], camPos[2])) {
+                glPushMatrix();
+                glTranslatef(INTRO_GX * ROOM_SPACING, 0.0f,
+                             INTRO_GY * ROOM_SPACING);
+                drawBatchSet(introCellScene, introCellGL, 0);
+                glPopMatrix();
+            }
             drawDoors(camPos);
             drawItems(camPos);
             draw173(camPos);
@@ -3803,6 +3873,13 @@ int main(void) {
             glDisable(GL_CULL_FACE);
             for (int i = 0; i < activeCount; i++) {
                 drawRoomBatches(activeRooms[i], 1);
+            }
+            if (introCellGL && inIntroBounds(camPos[0], camPos[2])) {
+                glPushMatrix();
+                glTranslatef(INTRO_GX * ROOM_SPACING, 0.0f,
+                             INTRO_GY * ROOM_SPACING);
+                drawBatchSet(introCellScene, introCellGL, 1);
+                glPopMatrix();
             }
         }
 
