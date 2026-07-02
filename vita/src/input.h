@@ -58,6 +58,10 @@ StickState inputLook(void);
 /* Front touch panel, mapped to screen coordinates (for menus/inventory). */
 TouchState inputTouch(void);
 
+/* A touch began this frame (edge-triggered); fills the screen-space
+ * tap position. Pure: safe to call more than once per frame. */
+bool inputTouchTap(float *x, float *y);
+
 /* Human-readable Vita button name bound to an action, for UI/help screens. */
 const char *inputBindingName(GameAction action);
 

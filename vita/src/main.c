@@ -492,17 +492,25 @@ static void drawBatchSet(const Scene *scene, const BatchGL *gl, int alphaPass) {
             glDisable(GL_TEXTURE_2D);
         }
         if (alphaPass) {
+            /* The game alpha-blends these surfaces with the texture's
+             * alpha (glass is ~0.13-0.7); a mask-style alpha test only
+             * drops fully transparent texels. */
             glEnable(GL_ALPHA_TEST);
-            glAlphaFunc(GL_GREATER, 0.5f);
+            glAlphaFunc(GL_GREATER, 0.01f);
+            glEnable(GL_BLEND);
+            glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+            glDepthMask(GL_FALSE);
         }
         glDrawElements(GL_TRIANGLES, (GLsizei)b->indexCount,
                        GL_UNSIGNED_SHORT, NULL);
         if (alphaPass) {
             glDisable(GL_ALPHA_TEST);
+            glDisable(GL_BLEND);
+            glDepthMask(GL_TRUE);
         }
 
         GLuint lightmap = gl[i].lightmap;
-        if (lightmap) {
+        if (lightmap && !alphaPass) {
             glEnable(GL_TEXTURE_2D);
             glBindTexture(GL_TEXTURE_2D, lightmap);
             glTexCoordPointer(2, GL_FLOAT, sizeof(SceneVertex), VTX_OFF(lu));
@@ -1786,6 +1794,19 @@ static void mtextWrap(float x, float y, float w, float sc, const char *t) {
     if (ll) mtext(x, cy, sc, 1, 1, 1, line);
 }
 
+/* Tap state for the frame, set once per menu/pause frame. */
+static int menuTapped;
+static float menuTapX, menuTapY;
+
+static void menuPollTap(void) {
+    menuTapped = inputTouchTap(&menuTapX, &menuTapY);
+}
+
+static int tapIn(float x, float y, float w, float h) {
+    return menuTapped && menuTapX >= x && menuTapX <= x + w
+        && menuTapY >= y && menuTapY <= y + h;
+}
+
 /* A bordered box in the game's frame style; focus brightens the
  * border like the mouse-hover. */
 static void drawFrame(float x, float y, float w, float h, int focused) {
@@ -1889,6 +1910,11 @@ static void drawMenuChrome(void) {
 }
 
 /* Tab header frame + BACK button (top row of every sub-tab). */
+static int tapOnBackButton(void) {
+    return tapIn((159.0f + 400.0f + 20.0f) * MENU_SX, 286.0f * MENU_SY,
+                 160.0f * MENU_SX, 70.0f * MENU_SY);
+}
+
 static void drawTabHeader(const char *title, int backFocused) {
     float x = 159.0f * MENU_SX, y = 286.0f * MENU_SY;
     float w = 400.0f * MENU_SX, h = 70.0f * MENU_SY;
@@ -1932,7 +1958,7 @@ static void drawOsk(void) {
 static int oskUpdate(void) {
     if (!oskOpen) return 0;
     const char *row = oskRowChars(oskRow);
-    int rowLen = (int)strlen(row);
+    int rowLen;
     if (inputHit(ACTION_SAVE) && oskRow > 0) oskRow--;          /* up */
     if (inputDpadDownHit() && oskRow < OSK_NROWS - 1) oskRow++; /* down */
     row = oskRowChars(oskRow);
@@ -1940,10 +1966,32 @@ static int oskUpdate(void) {
     if (oskCol >= rowLen) oskCol = rowLen - 1;
     if (inputHit(ACTION_LEAN_LEFT) && oskCol > 0) oskCol--;
     if (inputHit(ACTION_LEAN_RIGHT) && oskCol < rowLen - 1) oskCol++;
-    if (inputHit(ACTION_INTERACT)) {
+    int typeChar = -1;
+    if (inputHit(ACTION_INTERACT)) typeChar = row[oskCol];
+    if (menuTapped) {
+        /* Tap a key to type it; tap outside the panel to finish. */
+        float w = 560.0f, h = 300.0f;
+        float x = (SCREEN_W - w) * 0.5f, y = (SCREEN_H - h) * 0.5f;
+        if (!tapIn(x, y, w, h)) {
+            oskOpen = 0;
+            return 1;
+        }
+        for (int r = 0; r < OSK_NROWS; r++) {
+            const char *rc = oskRowChars(r);
+            for (int c = 0; rc[c]; c++) {
+                if (tapIn(x + 26 + c * 39.0f - 5, y + 96 + r * 34.0f - 8,
+                          39.0f, 34.0f)) {
+                    oskRow = r;
+                    oskCol = c;
+                    typeChar = rc[c];
+                }
+            }
+        }
+    }
+    if (typeChar >= 0) {
         size_t len = strlen(oskTarget);
         if ((int)len < oskCap - 1) {
-            oskTarget[len] = row[oskCol];
+            oskTarget[len] = (char)typeChar;
             oskTarget[len + 1] = '\0';
         }
     }
@@ -1992,11 +2040,52 @@ static void newGameTab(void) {
     if (newSel > backIdx) newSel = backIdx;
 
     /* --- input --- */
+    float x = 159.0f * SX, y = 376.0f * SY;
     if (!oskUpdate()) {
         if (inputHit(ACTION_SAVE) && newSel > 0) newSel--;
         if (inputDpadDownHit() && newSel < backIdx) newSel++;
         int esoRow = (newSel >= 8 && newSel < 8 + extra) ? newSel - 8 : -1;
         int lft = inputHit(ACTION_LEAN_LEFT), rgt = inputHit(ACTION_LEAN_RIGHT);
+        /* Touch: activate the widget under the tap. */
+        int act = inputHit(ACTION_INTERACT) ? newSel : -1;
+        if (menuTapped) {
+            if (tapIn(x + 150.0f * SX, y + 12.0f * SY, 200.0f * SX,
+                      32.0f * SY)) {
+                newSel = 0;
+                act = 0;
+            } else if (tapIn(x + 150.0f * SX, y + 52.0f * SY, 200.0f * SX,
+                             32.0f * SY)) {
+                newSel = 1;
+                act = 1;
+            } else if (tapIn(x + 270.0f * SX, y + 96.0f * SY, 54.0f * SY,
+                             46.0f * SY)) {
+                newSel = 2;
+                act = 2;
+            } else if (tapOnBackButton()) {
+                newSel = backIdx;
+                act = backIdx;
+            } else if (tapIn(x + 420.0f * SX, y + 385.0f * SY, 160.0f * SX,
+                             75.0f * SY)) {
+                newSel = startIdx;
+                act = startIdx;
+            } else {
+                for (int i = 0; i < 5; i++) {
+                    if (tapIn(x + 14.0f * SX, y + (174.0f + 30.0f * i) * SY,
+                              140.0f * SX, 30.0f * SY)) {
+                        newSel = 3 + i;
+                        act = 3 + i;
+                    }
+                }
+                for (int i = 0; i < extra; i++) {
+                    if (tapIn(x + 160.0f * SX, y + (180.0f + 30.0f * i) * SY,
+                              390.0f * SX, 30.0f * SY)) {
+                        newSel = 8 + i;
+                        esoRow = i;
+                        rgt = 1; /* tap cycles the value forward */
+                    }
+                }
+            }
+        }
         if (esoRow == 0 && (lft || rgt)) {
             df->saveType = (df->saveType + (rgt ? 1 : 3)) % 4;
         } else if (esoRow == 1 && (lft || rgt)) {
@@ -2010,20 +2099,18 @@ static void newGameTab(void) {
         } else if (newSel == 2 && (lft || rgt)) {
             introEnabled = !introEnabled;
         }
-        if (inputHit(ACTION_INTERACT)) {
-            if (newSel == 0) {
+        if (act >= 0) {
+            if (act == 0) {
                 oskStart(newName, (int)sizeof(newName), "NAME");
-            } else if (newSel == 1) {
+            } else if (act == 1) {
                 oskStart(newSeedStr, (int)sizeof(newSeedStr), "MAP SEED");
-            } else if (newSel == 2) {
+            } else if (act == 2) {
                 introEnabled = !introEnabled;
-            } else if (newSel >= 3 && newSel <= 7) {
-                selDiff = newSel - 3;
-            } else if (esoRow == 1) {
-                df->aggressiveNPCs = !df->aggressiveNPCs;
-            } else if (newSel == startIdx) {
+            } else if (act >= 3 && act <= 7) {
+                selDiff = act - 3;
+            } else if (act == startIdx) {
                 if (startNewGame()) return;
-            } else if (newSel == backIdx) {
+            } else if (act == backIdx) {
                 optionsSave();
                 menuTab = 0;
                 return;
@@ -2039,29 +2126,28 @@ static void newGameTab(void) {
     /* --- draw (Menu_Core.bb's New Game layout) --- */
     df = &DIFFICULTIES[selDiff];
     drawTabHeader("NEW GAME", newSel == backIdx);
-    float x = 159.0f * SX, y = 376.0f * SY;
     drawFrame(x, y, 580.0f * SX, 345.0f * SY, 0);
 
-    mtext(x + 20.0f * SX, y + 19.0f * SY, 1.5f, 1, 1, 1, "Name:");
+    mtext(x + 20.0f * SX, y + 19.0f * SY, 1.2f, 1, 1, 1, "Name:");
     drawFrame(x + 150.0f * SX, y + 12.0f * SY, 200.0f * SX, 32.0f * SY,
               newSel == 0);
-    mtext(x + 158.0f * SX, y + 21.0f * SY, 1.5f, 1, 1, 1, newName);
+    mtext(x + 158.0f * SX, y + 21.0f * SY, 1.2f, 1, 1, 1, newName);
 
-    mtext(x + 20.0f * SX, y + 59.0f * SY, 1.5f, 1, 1, 1, "Map seed:");
+    mtext(x + 20.0f * SX, y + 59.0f * SY, 1.2f, 1, 1, 1, "Map seed:");
     drawFrame(x + 150.0f * SX, y + 52.0f * SY, 200.0f * SX, 32.0f * SY,
               newSel == 1);
-    mtext(x + 158.0f * SX, y + 61.0f * SY, 1.5f, 1, 1, 1, newSeedStr);
+    mtext(x + 158.0f * SX, y + 61.0f * SY, 1.2f, 1, 1, 1, newSeedStr);
 
-    mtext(x + 20.0f * SX, y + 111.0f * SY, 1.5f, 1, 1, 1, "Intro sequence:");
+    mtext(x + 20.0f * SX, y + 111.0f * SY, 1.2f, 1, 1, 1, "Intro sequence:");
     drawTick(x + 280.0f * SX, y + 102.0f * SY, 34.0f * SY, introEnabled,
              newSel == 2);
 
-    mtext(x + 20.0f * SX, y + 151.0f * SY, 1.5f, 1, 1, 1, "Difficulty:");
+    mtext(x + 20.0f * SX, y + 151.0f * SY, 1.2f, 1, 1, 1, "Difficulty:");
     for (int i = 0; i < 5; i++) {
         const DifficultyDef *d2 = &DIFFICULTIES[i];
         drawTick(x + 20.0f * SX, y + (180.0f + 30.0f * i) * SY, 26.0f * SY,
                  selDiff == i, newSel == 3 + i);
-        mtext(x + 50.0f * SX, y + (185.0f + 30.0f * i) * SY, 1.5f,
+        mtext(x + 50.0f * SX, y + (185.0f + 30.0f * i) * SY, 1.2f,
               d2->r / 255.0f, d2->g / 255.0f, d2->b / 255.0f, d2->name);
     }
 
@@ -2072,19 +2158,19 @@ static void newGameTab(void) {
         float rx = x + 170.0f * SX;
         snprintf(row, sizeof(row), "< Save type: %s >",
                  SAVE_TYPE_NAMES[df->saveType]);
-        mtext(rx, y + 186.0f * SY, 1.5f, 1, 1, newSel == 8 ? 0.5f : 1.0f, row);
+        mtext(rx, y + 186.0f * SY, 1.2f, 1, 1, newSel == 8 ? 0.5f : 1.0f, row);
         snprintf(row, sizeof(row), "< Aggressive NPCs: %s >",
                  df->aggressiveNPCs ? "YES" : "NO");
-        mtext(rx, y + 216.0f * SY, 1.5f, 1, 1, newSel == 9 ? 0.5f : 1.0f, row);
+        mtext(rx, y + 216.0f * SY, 1.2f, 1, 1, newSel == 9 ? 0.5f : 1.0f, row);
         snprintf(row, sizeof(row), "< Inventory slots: %d >", df->slots);
-        mtext(rx, y + 246.0f * SY, 1.5f, 1, 1, newSel == 10 ? 0.5f : 1.0f,
+        mtext(rx, y + 246.0f * SY, 1.2f, 1, 1, newSel == 10 ? 0.5f : 1.0f,
               row);
         snprintf(row, sizeof(row), "< Other difficulty factors: %s >",
                  FACTOR_NAMES[df->factors]);
-        mtext(rx, y + 276.0f * SY, 1.5f, 1, 1, newSel == 11 ? 0.5f : 1.0f,
+        mtext(rx, y + 276.0f * SY, 1.2f, 1, 1, newSel == 11 ? 0.5f : 1.0f,
               row);
     } else {
-        mtextWrap(x + 160.0f * SX, y + 180.0f * SY, 390.0f * SX, 1.5f,
+        mtextWrap(x + 160.0f * SX, y + 180.0f * SY, 390.0f * SX, 1.2f,
                   df->desc);
         /* Stats frame to the right (the game's x+590 box). */
         drawFrame(x + 590.0f * SX, y + 50.0f * SY, 350.0f * SX, 110.0f * SY,
@@ -2093,17 +2179,17 @@ static void newGameTab(void) {
         float rx = x + 600.0f * SX;
         snprintf(row, sizeof(row), "Save type: %s",
                  SAVE_TYPE_NAMES[df->saveType]);
-        mtext(rx, y + 58.0f * SY, 1.5f, 1, 1, 1, row);
+        mtext(rx, y + 58.0f * SY, 1.2f, 1, 1, 1, row);
         snprintf(row, sizeof(row), "Aggressive NPCs: %s",
                  df->aggressiveNPCs ? "YES" : "NO");
-        mtext(rx, y + 78.0f * SY, 1.5f, 1, 1, 1, row);
+        mtext(rx, y + 78.0f * SY, 1.2f, 1, 1, 1, row);
         snprintf(row, sizeof(row), "Inventory slots: %d", df->slots);
-        mtext(rx, y + 98.0f * SY, 1.5f, 1, 1, 1, row);
+        mtext(rx, y + 98.0f * SY, 1.2f, 1, 1, 1, row);
         snprintf(row, sizeof(row), "Other difficulty factors: %s",
                  FACTOR_NAMES[df->factors]);
-        mtext(rx, y + 118.0f * SY, 1.5f, 1, 1, 1, row);
+        mtext(rx, y + 118.0f * SY, 1.2f, 1, 1, 1, row);
         if (df->saveType == NO_SAVES) {
-            mtext(rx, y + 138.0f * SY, 1.5f, 1, 0.6f, 0.6f, "No HUD");
+            mtext(rx, y + 138.0f * SY, 1.2f, 1, 0.6f, 0.6f, "No HUD");
         }
     }
 
@@ -2124,28 +2210,61 @@ static void loadGameTab(void) {
     if (onPage > SAVES_PER_PAGE) onPage = SAVES_PER_PAGE;
 
     /* --- input --- */
+    float x = 159.0f * SX, y = 376.0f * SY;
     if (saveConfirmDel >= 0) {
-        if (inputHit(ACTION_INTERACT)) {
+        int yes = inputHit(ACTION_INTERACT);
+        int no = inputHit(ACTION_CROUCH);
+        if (menuTapped) {
+            float w = 620.0f, h = 130.0f;
+            float cx = (SCREEN_W - w) * 0.5f, cy = (SCREEN_H - h) * 0.5f;
+            if (tapIn(cx, cy, w * 0.5f, h)) yes = 1;
+            else no = 1;
+        }
+        if (yes) {
             remove(saveList[saveConfirmDel].path);
             scanSaves();
-        } else if (inputHit(ACTION_CROUCH)) {
+        } else if (no) {
             saveConfirmDel = -1;
         }
     } else {
+        int doLoad = inputHit(ACTION_INTERACT);
         if (inputHit(ACTION_SAVE) && saveSel > 0) saveSel--;
         if (inputDpadDownHit() && saveSel < onPage - 1) saveSel++;
-        if (inputHit(ACTION_LEAN_LEFT) && savePage > 0) {
+        int pgl = inputHit(ACTION_LEAN_LEFT), pgr = inputHit(ACTION_LEAN_RIGHT);
+        if (menuTapped) {
+            if (tapOnBackButton()) {
+                menuTab = 0;
+                return;
+            }
+            /* Tap a save to select it; tap the selected one to load. */
+            for (int i = 0; i < onPage; i++) {
+                if (tapIn(x + 20.0f * SX, y + (20.0f + i * 78.0f) * SY,
+                          540.0f * SX, 66.0f * SY)) {
+                    if (i == saveSel) doLoad = 1;
+                    else saveSel = i;
+                }
+            }
+            /* Page bar: left half back, right half forward. */
+            if (tapIn(x + 60.0f * SX, y + 440.0f * SY, 230.0f * SX,
+                      50.0f * SY)) {
+                pgl = 1;
+            } else if (tapIn(x + 290.0f * SX, y + 440.0f * SY, 230.0f * SX,
+                             50.0f * SY)) {
+                pgr = 1;
+            }
+        }
+        if (pgl && savePage > 0) {
             savePage--;
             saveSel = 0;
         }
-        if (inputHit(ACTION_LEAN_RIGHT) && savePage < pages - 1) {
+        if (pgr && savePage < pages - 1) {
             savePage++;
             saveSel = 0;
             base = savePage * SAVES_PER_PAGE;
             onPage = saveCount - base;
             if (onPage > SAVES_PER_PAGE) onPage = SAVES_PER_PAGE;
         }
-        if (inputHit(ACTION_INTERACT) && onPage > 0) {
+        if (doLoad && onPage > 0) {
             if (loadGameFrom(saveList[base + saveSel].path)) {
                 snprintf(toastMsg, sizeof(toastMsg), "GAME LOADED");
                 toastTimer = 150;
@@ -2169,7 +2288,6 @@ static void loadGameTab(void) {
 
     /* --- draw --- */
     drawTabHeader("LOAD GAME", 0);
-    float x = 159.0f * SX, y = 376.0f * SY;
     drawFrame(x, y, 580.0f * SX, 430.0f * SY, 0);
 
     if (saveCount == 0) {
@@ -2219,10 +2337,37 @@ static void loadGameTab(void) {
 static void optionsTab(void) {
     const float SX = MENU_SX, SY = MENU_SY;
     int backIdx = OPT_ROWS;
+    float x = 159.0f * SX, y = 376.0f * SY;
 
     if (inputHit(ACTION_SAVE) && optSel > 0) optSel--;
     if (inputDpadDownHit() && optSel < backIdx) optSel++;
     int lft = inputHit(ACTION_LEAN_LEFT), rgt = inputHit(ACTION_LEAN_RIGHT);
+    if (menuTapped) {
+        if (tapOnBackButton()) {
+            optionsSave();
+            menuTab = 0;
+            return;
+        }
+        for (int i = 0; i < OPT_ROWS; i++) {
+            float ry = y + (30.0f + i * 55.0f) * SY;
+            if (!tapIn(x, ry - 10.0f, 580.0f * SX, 34.0f)) continue;
+            optSel = i;
+            if (i < 2) {
+                /* Tap sets the slider position directly. */
+                float frac = (menuTapX - (x + 330.0f * SX))
+                           / (150.0f * SX);
+                if (frac < 0.0f) frac = 0.0f;
+                if (frac > 1.0f) frac = 1.0f;
+                if (i == 0) optMusicVol = frac;
+                else optSfxVol = frac;
+                optionsApply();
+            } else if (i == 3) {
+                optInvertY = !optInvertY;
+            } else {
+                rgt = 1; /* sensitivity: tap steps forward */
+            }
+        }
+    }
     float d = rgt ? 1.0f : (lft ? -1.0f : 0.0f);
     if (d != 0.0f) {
         switch (optSel) {
@@ -2263,7 +2408,6 @@ static void optionsTab(void) {
     }
 
     drawTabHeader("OPTIONS", optSel == backIdx);
-    float x = 159.0f * SX, y = 376.0f * SY;
     drawFrame(x, y, 580.0f * SX, 260.0f * SY, 0);
 
     const char *labels[OPT_ROWS] = {
@@ -2305,8 +2449,16 @@ static void mainButtonsTab(int *running) {
     const float SX = MENU_SX, SY = MENU_SY;
     if (inputHit(ACTION_SAVE) && titleSel > 0) titleSel--;
     if (inputDpadDownHit() && titleSel < 3) titleSel++;
-    if (inputHit(ACTION_INTERACT)) {
-        switch (titleSel) {
+    int act = inputHit(ACTION_INTERACT) ? titleSel : -1;
+    for (int i = 0; menuTapped && i < 4; i++) {
+        if (tapIn(159.0f * SX, (286.0f + i * 100.0f) * SY, 400.0f * SX,
+                  70.0f * SY)) {
+            titleSel = i;
+            act = i;
+        }
+    }
+    if (act >= 0) {
+        switch (act) {
             case 0: /* NEW GAME */
                 newName[0] = '\0';
                 randomSeedString(newSeedStr, sizeof(newSeedStr));
@@ -2349,6 +2501,7 @@ static void mainButtonsTab(int *running) {
 
 /* One full menu frame: input + draw. Draws inside HUD 2D state. */
 static void menuFrame(int *running) {
+    menuPollTap();
     drawMenuChrome();
     switch (menuTab) {
         case 1: newGameTab(); break;
@@ -2478,10 +2631,22 @@ int main(void) {
         }
         int pausedAtFrameStart = pauseOpen;
         if (pauseOpen) {
+            menuPollTap();
             if (inputHit(ACTION_SAVE) && pauseSel > 0) pauseSel--;
             if (inputDpadDownHit() && pauseSel < 3) pauseSel++;
-            if (inputHit(ACTION_INTERACT)) {
-                switch (pauseSel) {
+            int pact = inputHit(ACTION_INTERACT) ? pauseSel : -1;
+            /* Tap a pause button (same geometry as drawPauseMenu). */
+            float ph = 470.0f, pw = ph * (600.0f / 673.0f);
+            float ppx = 70.0f, ppy = (SCREEN_H - ph) * 0.5f;
+            for (int i = 0; menuTapped && i < 4; i++) {
+                if (tapIn(ppx + 36.0f, ppy + 84.0f + i * 78.0f, pw - 72.0f,
+                          54.0f)) {
+                    pauseSel = i;
+                    pact = i;
+                }
+            }
+            if (pact >= 0) {
+                switch (pact) {
                     case 0: /* RESUME */
                         pauseOpen = 0;
                         break;
