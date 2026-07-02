@@ -662,16 +662,20 @@ static void drawModelRT(const ModelRT *rt);
 
 /* ---------------- SCP-173 behavior ---------------- */
 
-static ModelRT npc173RT;
+static ModelRT npc173RT, npc173HeadRT;
 static float npc173YOff; /* lifts the model so its base sits on the floor */
 
 static void buildNpcAssets(void) {
     buildModelRT(&npc173RT, "scp_173_body.b3d", 0, 0, 0, NULL);
+    buildModelRT(&npc173HeadRT, "scp_173_head.b3d", 0, 0, 0, NULL);
     if (npc173RT.scene) {
-        /* NPCs.ini: Scale = 0.3 world units of mesh depth (z). */
+        /* NPCs.ini: Scale = 0.3 world units of BODY mesh depth; the
+         * head shares the body's factor (NPCs_Core.bb 240-244). */
         float extZ = npc173RT.scene->boundsMax[2] - npc173RT.scene->boundsMin[2];
         float k = extZ > 0.0f ? (0.3f * 256.0f) / extZ : 1.0f;
         npc173RT.scale[0] = npc173RT.scale[1] = npc173RT.scale[2] = k;
+        npc173HeadRT.scale[0] = npc173HeadRT.scale[1] =
+            npc173HeadRT.scale[2] = k;
         npc173YOff = -npc173RT.scene->boundsMin[1] * k;
     }
 }
@@ -776,8 +780,10 @@ static void draw173(const float viewPos[3]) {
     if (dx * dx + dz * dz > VIEW_RANGE * VIEW_RANGE) return;
     glPushMatrix();
     glTranslatef(npc173Pos[0], npc173Pos[1] + npc173YOff, npc173Pos[2]);
-    glRotatef(npc173YawDeg, 0.0f, 1.0f, 0.0f);
+    /* +180: the model faces its own -z, so flip to face the player. */
+    glRotatef(npc173YawDeg + 180.0f, 0.0f, 1.0f, 0.0f);
     drawModelRT(&npc173RT);
+    drawModelRT(&npc173HeadRT);
     glPopMatrix();
 }
 
