@@ -48,6 +48,10 @@ jobs:
             vita/src/formats/rmesh.c \
             vita/src/formats/b3d.c \
             vita/src/formats/texture.c \
+            vita/src/render/scene.c \
+            vita/src/game/collision.c \
+            vita/src/game/mapgen.c \
+            vita/src/game/doors.c \
             -lm
 
       - name: Stage device data (world textures capped at 256px)
