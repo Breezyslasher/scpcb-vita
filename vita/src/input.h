@@ -46,6 +46,10 @@ bool inputDown(GameAction action);
 /* Action was pressed this frame (edge-triggered). */
 bool inputHit(GameAction action);
 
+/* Raw D-pad down, edge-triggered. It maps to no game action (crouch is
+ * Circle), so menus read it directly. */
+bool inputDpadDownHit(void);
+
 /* Left stick (movement) and right stick (camera), deadzone applied,
  * components in -1..1. */
 StickState inputMove(void);
@@ -53,6 +57,10 @@ StickState inputLook(void);
 
 /* Front touch panel, mapped to screen coordinates (for menus/inventory). */
 TouchState inputTouch(void);
+
+/* A touch began this frame (edge-triggered); fills the screen-space
+ * tap position. Pure: safe to call more than once per frame. */
+bool inputTouchTap(float *x, float *y);
 
 /* Human-readable Vita button name bound to an action, for UI/help screens. */
 const char *inputBindingName(GameAction action);

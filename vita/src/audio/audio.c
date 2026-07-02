@@ -37,7 +37,9 @@ static void alog(const char *fmt, ...) {
 #define GRAIN 256
 #define MAX_SOUNDS 64
 #define MAX_CHANNELS 12
-#define AMBIENCE_CHANNEL MAX_CHANNELS /* extra looping slot */
+#define AMBIENCE_CHANNEL MAX_CHANNELS       /* extra looping slot */
+#define MUSIC_CHANNEL (MAX_CHANNELS + 1)    /* extra looping slot */
+#define LAST_CHANNEL MUSIC_CHANNEL
 
 typedef struct {
     char *path;
@@ -57,7 +59,7 @@ typedef struct {
 
 static Sound sounds[MAX_SOUNDS];
 static int soundCount;
-static Channel channels[MAX_CHANNELS + 1];
+static Channel channels[LAST_CHANNEL + 1];
 static int port = -1;
 static SceUID mixThread = -1;
 static volatile int running;
@@ -78,7 +80,7 @@ static int mixerLoop(SceSize args, void *argp) {
 
     while (running) {
         memset(acc, 0, sizeof(acc));
-        for (int c = 0; c <= MAX_CHANNELS; c++) {
+        for (int c = 0; c <= LAST_CHANNEL; c++) {
             Channel *ch = &channels[c];
             int si = ch->sound;
             if (si < 0 || si >= soundCount) continue;
@@ -140,7 +142,7 @@ int audioInit(void) {
     sceAudioOutSetVolume(port,
                          SCE_AUDIO_VOLUME_FLAG_L_CH | SCE_AUDIO_VOLUME_FLAG_R_CH,
                          vols);
-    for (int c = 0; c <= MAX_CHANNELS; c++) channels[c].sound = -1;
+    for (int c = 0; c <= LAST_CHANNEL; c++) channels[c].sound = -1;
     running = 1;
     mixThread = sceKernelCreateThread("audio_mix", mixerLoop, 64, 0x10000,
                                       0, 0, NULL);
@@ -217,8 +219,23 @@ static void startChannel(int c, int sound, float volL, float volR, int loop) {
     ch->sound = sound;
 }
 
+static float sfxVol = 1.0f;
+static float musicVol = 1.0f;
+static float musicBaseVol = 1.0f;
+
+void audioSetSfxVolume(float vol) {
+    sfxVol = vol;
+}
+
+void audioSetMusicVolume(float vol) {
+    musicVol = vol;
+    channels[MUSIC_CHANNEL].volL = musicBaseVol * musicVol;
+    channels[MUSIC_CHANNEL].volR = musicBaseVol * musicVol;
+}
+
 void audioPlay(int sound, float vol, float pan) {
     if (sound < 0 || sound >= soundCount) return;
+    vol *= sfxVol;
     if (pan < -1) pan = -1;
     if (pan > 1) pan = 1;
     float volL = vol * (pan <= 0 ? 1.0f : 1.0f - pan);
@@ -250,5 +267,20 @@ void audioLoopAmbience(int sound, float vol) {
         channels[AMBIENCE_CHANNEL].sound = -1;
         return;
     }
+    vol *= sfxVol;
     startChannel(AMBIENCE_CHANNEL, sound, vol, vol, 1);
+}
+
+void audioLoopMusic(int sound, float vol) {
+    if (sound < 0 || sound >= soundCount) {
+        channels[MUSIC_CHANNEL].sound = -1;
+        return;
+    }
+    musicBaseVol = vol;
+    float v = vol * musicVol;
+    startChannel(MUSIC_CHANNEL, sound, v, v, 1);
+}
+
+void audioStopMusic(void) {
+    channels[MUSIC_CHANNEL].sound = -1;
 }

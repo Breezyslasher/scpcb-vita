@@ -71,6 +71,7 @@ static const char *actionNames[ACTION_COUNT] = {
 static SceCtrlData ctrl;
 static SceCtrlData ctrlPrev;
 static SceTouchData touch;
+static SceTouchData touchPrev;
 
 void inputInit(void) {
     sceCtrlSetSamplingMode(SCE_CTRL_MODE_ANALOG_WIDE);
@@ -82,8 +83,19 @@ void inputInit(void) {
 
 void inputUpdate(void) {
     ctrlPrev = ctrl;
+    touchPrev = touch;
     sceCtrlPeekBufferPositive(0, &ctrl, 1);
     sceTouchPeek(SCE_TOUCH_PORT_FRONT, &touch, 1);
+}
+
+bool inputTouchTap(float *x, float *y) {
+    if (touch.reportNum > 0 && touchPrev.reportNum == 0) {
+        /* Touch panel reports 1920x1088; screen is 960x544. */
+        *x = touch.report[0].x / 2.0f;
+        *y = touch.report[0].y / 2.0f;
+        return true;
+    }
+    return false;
 }
 
 bool inputDown(GameAction action) {
@@ -93,6 +105,13 @@ bool inputDown(GameAction action) {
 bool inputHit(GameAction action) {
     return (ctrl.buttons & actionButtons[action]) != 0
         && (ctrlPrev.buttons & actionButtons[action]) == 0;
+}
+
+bool inputDpadDownHit(void) {
+    /* D-pad down has no game action (crouch is Circle); menus use it
+     * raw. Edge-triggered. */
+    return (ctrl.buttons & SCE_CTRL_DOWN) != 0
+        && (ctrlPrev.buttons & SCE_CTRL_DOWN) == 0;
 }
 
 static StickState readStick(uint8_t rawX, uint8_t rawY) {
