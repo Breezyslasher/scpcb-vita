@@ -399,8 +399,13 @@ static int npc173Active;
 static float npc173Pos[3];      /* floor position, raw units */
 static float npc173SpawnX, npc173SpawnZ;
 static float npc173YawDeg;
+static float npc173HeadYawDeg;  /* head offset from the body (n\Angle) */
 static int npc173DragCooldown;
 static int npc173WasMoving;
+static float npc173EnemyX, npc173EnemyZ; /* last seen player position */
+static int npc173SpotTimer;     /* horror-sting cooldown (n\LastSeen) */
+static float npc173LastDist = 1e9f;
+static float npc173WanderYawDeg;
 static int deathTimer;          /* >0: death screen counting down */
 
 static void reset173(void);
@@ -561,6 +566,7 @@ static int sndButton[2], sndKeycardUse[2], sndDoorLock;
 static int sndPick[4];
 static int sndAmbience;
 static int sndRattle[3], sndNeckSnap[3], sndStoneDrag;
+static int sndHorrorSpot[2], sndHorrorClose[5], sndDoor173;
 static float stepAccum;
 
 static void loadSounds(void) {
@@ -601,6 +607,16 @@ static void loadSounds(void) {
         sndNeckSnap[i] = audioLoad(p);
     }
     sndStoneDrag = audioLoad(SFX_DIR "/SCP/173/StoneDrag.ogg");
+    /* UpdateNPCType173: HorrorSFX[3..4] on spotting it, HorrorSFX
+     * [1,2,9,10,12] on a very close encounter. */
+    sndHorrorSpot[0] = audioLoad(SFX_DIR "/Horror/Horror3.ogg");
+    sndHorrorSpot[1] = audioLoad(SFX_DIR "/Horror/Horror4.ogg");
+    sndHorrorClose[0] = audioLoad(SFX_DIR "/Horror/Horror1.ogg");
+    sndHorrorClose[1] = audioLoad(SFX_DIR "/Horror/Horror2.ogg");
+    sndHorrorClose[2] = audioLoad(SFX_DIR "/Horror/Horror9.ogg");
+    sndHorrorClose[3] = audioLoad(SFX_DIR "/Horror/Horror10.ogg");
+    sndHorrorClose[4] = audioLoad(SFX_DIR "/Horror/Horror12.ogg");
+    sndDoor173 = audioLoad(SFX_DIR "/Door/DoorOpen173.ogg");
     sndAmbience = audioLoad(SFX_DIR "/Ambient/Room ambience/rumble.ogg");
     audioLoopAmbience(sndAmbience, 0.30f);
 }
@@ -712,6 +728,11 @@ static void reset173(void) {
     }
     npc173WasMoving = 0;
     npc173DragCooldown = 0;
+    npc173EnemyX = npc173EnemyZ = 0.0f;
+    npc173HeadYawDeg = 0.0f;
+    npc173SpotTimer = 0;
+    npc173LastDist = 1e9f;
+    npc173WanderYawDeg = 0.0f;
     deathTimer = 0;
 }
 
@@ -728,15 +749,82 @@ static int playerSees173(void) {
     return dot > 0.55f; /* ~57-degree half-angle (bbox partially on screen) */
 }
 
+/* TeleportCloser: when 173 has fallen far behind, jump it to a room
+ * near the player (out of the view cone) so the hunt continues. */
+static void teleport173Closer(void) {
+    int best = -1, count = 0;
+    float fwdX = sinf(camYaw), fwdZ = -cosf(camYaw);
+    for (uint32_t i = 0; i < map.roomCount; i++) {
+        float rx = map.rooms[i].gridX * ROOM_SPACING;
+        float rz = map.rooms[i].gridY * ROOM_SPACING;
+        float dx = rx - camPos[0], dz = rz - camPos[2];
+        float d = sqrtf(dx * dx + dz * dz);
+        if (d < ROOM_SPACING * 1.2f || d > ROOM_SPACING * 2.6f) continue;
+        /* Never pop in on screen. */
+        if ((dx * fwdX + dz * fwdZ) / d > 0.35f) continue;
+        count++;
+        if (rand() % count == 0) best = (int)i;
+    }
+    if (best < 0) return;
+    npc173Pos[0] = map.rooms[best].gridX * ROOM_SPACING;
+    npc173Pos[2] = map.rooms[best].gridY * ROOM_SPACING;
+    float origin[3] = { npc173Pos[0], camPos[1] + 200.0f, npc173Pos[2] };
+    float hitY;
+    npc173Pos[1] = rayDownWorld(origin, 3000.0f, &hitY) ? hitY : 0.0f;
+    npc173EnemyX = npc173EnemyZ = 0.0f;
+}
+
+/* 173 opens unlocked keycard-free doors it is standing next to
+ * (UpdateNPCType173's door pass). */
+static void try173OpenDoor(void) {
+    for (uint32_t i = 0; i < doors.count; i++) {
+        Door *d = &doors.items[i];
+        if (d->open || d->locked || d->keycard > 0) continue;
+        if (d->openState > 0.0f) continue; /* mid-animation */
+        if (fabsf(d->x - npc173Pos[0]) > 300.0f
+            || fabsf(d->z - npc173Pos[2]) > 300.0f) {
+            continue;
+        }
+        d->open = 1;
+        float dpos[3] = { d->x, camPos[1], d->z };
+        audioPlay3D(sndDoor173, dpos, camPos, camYaw, 2500.0f);
+        return;
+    }
+}
+
+/* Substepped move so 173 cannot tunnel through walls or closed
+ * doors; returns how far it actually got. */
+static float move173(float dirX, float dirZ, float speed) {
+    float sx0 = npc173Pos[0], sz0 = npc173Pos[2];
+    int steps = (int)(speed / 25.0f) + 1;
+    for (int i = 0; i < steps; i++) {
+        npc173Pos[0] += dirX * (speed / steps);
+        npc173Pos[2] += dirZ * (speed / steps);
+        float body[3] = { npc173Pos[0], npc173Pos[1] + 110.0f, npc173Pos[2] };
+        pushWorld(body, 48.0f, NULL);
+        doorsCollide(&doors, body, 48.0f);
+        npc173Pos[0] = body[0];
+        npc173Pos[2] = body[2];
+    }
+    float mx = npc173Pos[0] - sx0, mz = npc173Pos[2] - sz0;
+    return sqrtf(mx * mx + mz * mz);
+}
+
+static float normDeg(float a) {
+    while (a > 180.0f) a -= 360.0f;
+    while (a < -180.0f) a += 360.0f;
+    return a;
+}
+
+/* UpdateNPCType173 (NPCs_AI_Core.bb), distances in raw units
+ * (1 world unit = 256): freezes while watched, hunts a player it can
+ * reach within 10u, remembers the last seen position, wanders and
+ * teleports closer when far, opens doors, snaps necks at 0.65u. */
 static void update173(void) {
     if (!npc173Active || deathTimer > 0 || !walkMode) return;
     float dx = camPos[0] - npc173Pos[0];
     float dz = camPos[2] - npc173Pos[2];
     float dist = sqrtf(dx * dx + dz * dz);
-    if (dist > ROOM_SPACING * 3.5f) return; /* dormant when far away */
-
-    int seen = playerSees173();
-    int moving = 0;
 
     /* Vertical separation: the statue kills and hunts only on its own
      * level. camPos is the eye; the player's feet are ~EYE_HEIGHT
@@ -744,42 +832,96 @@ static void update173(void) {
     float feetDy = fabsf((camPos[1] - EYE_HEIGHT) - npc173Pos[1]);
     int sameLevel = feetDy < 220.0f;
 
-    if (!seen) {
-        /* Kill on contact while unobserved - never through a floor. */
-        if (dist < 110.0f && sameLevel) {
-            audioPlay(sndNeckSnap[rand() % 3], 1.0f, 0.0f);
-            deathTimer = 180;
-            return;
-        }
-        /* Player on another floor: hold position instead of grinding
-         * into the ceiling/floor beneath them. */
-        if (!sameLevel && dist < 500.0f) {
-            npc173WasMoving = 0;
-            return;
-        }
+    /* "Temp" in the original: the player is a reachable target
+     * (EntityVisible approximated by range + same floor). */
+    int hasTarget = dist < 2560.0f && sameLevel;
+    int seen = playerSees173();
+    int move = !(seen && dist < 3840.0f);
+    int moving = 0;
+    float yawToPlayer = atan2f(dx, dz) * 180.0f / 3.14159265f;
 
-        /* NPCs.ini Speed = 38 -> 0.38 world units/frame = ~97 raw.
-         * Substep so it cannot tunnel through walls or closed doors. */
-        float speed = npcAggressive ? 121.0f : 97.0f;
-        if (speed > dist - 80.0f) speed = dist - 80.0f;
-        if (speed > 0.0f) {
-            int steps = (int)(speed / 25.0f) + 1;
-            float sx = dx / dist * (speed / steps);
-            float sz = dz / dist * (speed / steps);
-            for (int s = 0; s < steps; s++) {
-                npc173Pos[0] += sx;
-                npc173Pos[2] += sz;
-                float body[3] = { npc173Pos[0], npc173Pos[1] + 110.0f,
-                                  npc173Pos[2] };
-                pushWorld(body, 48.0f, NULL);
-                doorsCollide(&doors, body, 48.0f);
-                npc173Pos[0] = body[0];
-                npc173Pos[2] = body[2];
+    if (npc173SpotTimer > 0) npc173SpotTimer--;
+
+    if (!move) {
+        /* Watched: hold still, stare back. */
+        npc173HeadYawDeg = normDeg(yawToPlayer - npc173YawDeg);
+        /* Horror sting when spotted up close after a quiet minute. */
+        if (dist < 896.0f && hasTarget && npc173SpotTimer == 0) {
+            audioPlay(sndHorrorSpot[rand() % 2], 0.9f, 0.0f);
+            npc173SpotTimer = 3600;
+        }
+        if (dist < 384.0f) {
+            if (rand() % 700 == 0) {
+                audioPlay3D(sndRattle[rand() % 3], npc173Pos, camPos, camYaw,
+                            2200.0f);
             }
-            npc173YawDeg = atan2f(dx, dz) * 180.0f / 3.14159265f;
-            moving = 1;
+            /* First moment it gets this close: a hard sting. */
+            if (npc173LastDist > 512.0f && hasTarget) {
+                audioPlay(sndHorrorClose[rand() % 5], 1.0f, 0.0f);
+            }
         }
+        npc173LastDist = dist;
+    } else if (dist > 3482.0f) {
+        /* Beyond ~0.8x the hide distance: hop between rooms toward
+         * the player instead of pathing the whole facility. */
+        if (rand() % 70 == 0) teleport173Closer();
+        npc173LastDist = dist;
+    } else {
+        /* Tries to open doors in its way. */
+        if (rand() % (npcAggressive ? 10 : 20) == 0) try173OpenDoor();
 
+        if (hasTarget) {
+            npc173EnemyX = camPos[0];
+            npc173EnemyZ = camPos[2];
+            npc173HeadYawDeg = 0.0f; /* body faces the player */
+            if (dist < 166.0f) {
+                /* Kill: neck snap, camera wrenched around. */
+                audioPlay(sndNeckSnap[rand() % 3], 1.0f, 0.0f);
+                camYaw += ((rand() % 2) ? 1.0f : -1.0f)
+                        * (80.0f + (float)(rand() % 21))
+                        * 3.14159265f / 180.0f;
+                deathTimer = 180;
+                return;
+            }
+            float speed = 97.0f; /* NPCs.ini Speed 38 */
+            if (speed > dist - 80.0f) speed = dist - 80.0f;
+            if (speed > 0.0f) {
+                move173(dx / dist, dz / dist, speed);
+                npc173YawDeg = yawToPlayer;
+                moving = 1;
+            }
+        } else if (npc173EnemyX != 0.0f || npc173EnemyZ != 0.0f) {
+            /* Move to where the player was last seen. */
+            float ex = npc173EnemyX - npc173Pos[0];
+            float ez = npc173EnemyZ - npc173Pos[2];
+            float ed = sqrtf(ex * ex + ez * ez);
+            if (ed > 128.0f && rand() % 500 != 0) {
+                move173(ex / ed, ez / ed, 97.0f);
+                npc173YawDeg = atan2f(ex, ez) * 180.0f / 3.14159265f;
+                npc173HeadYawDeg = normDeg(yawToPlayer - npc173YawDeg);
+                moving = 1;
+            } else {
+                npc173EnemyX = npc173EnemyZ = 0.0f;
+            }
+        } else {
+            /* Wander: drift forward, sometimes picking a new heading. */
+            if (rand() % 400 == 0) {
+                npc173WanderYawDeg = (float)(rand() % 360);
+                npc173HeadYawDeg = (float)(rand() % 241) - 120.0f;
+            }
+            float wy = npc173WanderYawDeg * 3.14159265f / 180.0f;
+            float got = move173(sinf(wy), cosf(wy), 97.0f * 0.5f);
+            if (got < 10.0f) { /* stuck on a wall: turn */
+                npc173WanderYawDeg = (float)(rand() % 360);
+            } else {
+                npc173YawDeg = npc173WanderYawDeg;
+                moving = 1;
+            }
+        }
+        npc173LastDist = dist;
+    }
+
+    if (moving) {
         /* Keep it on the floor. */
         float origin[3] = { npc173Pos[0], npc173Pos[1] + 250.0f,
                             npc173Pos[2] };
@@ -810,6 +952,9 @@ static void draw173(const float viewPos[3]) {
     /* +180: the model faces its own -z, so flip to face the player. */
     glRotatef(npc173YawDeg + 180.0f, 0.0f, 1.0f, 0.0f);
     drawModelRT(&npc173RT);
+    /* The head turns toward the player independently (the game's
+     * OBJ2 with n\Angle). */
+    glRotatef(npc173HeadYawDeg, 0.0f, 1.0f, 0.0f);
     drawModelRT(&npc173HeadRT);
     glPopMatrix();
 }
@@ -2792,6 +2937,8 @@ int main(void) {
                 npc173Pos[0] = npc173SpawnX;
                 npc173Pos[2] = npc173SpawnZ;
                 npc173WasMoving = 0;
+                npc173EnemyX = npc173EnemyZ = 0.0f;
+                npc173LastDist = 1e9f;
                 snprintf(toastMsg, sizeof(toastMsg),
                          "YOU WERE KILLED BY SCP-173");
                 toastTimer = 240;
