@@ -835,9 +835,26 @@ static void drawModelRT(const ModelRT *rt);
 /* ---------------- SCP-173 behavior ---------------- */
 
 static ModelRT npc173RT, npc173HeadRT;
+static ModelRT introGuardRT, introClassDRT, introScientistRT,
+               introFranklinRT;
+
+static void buildHumanRT(ModelRT *rt, const char *model, const char *tex) {
+    buildModelRT(rt, model, 0, 0, 0, tex);
+    if (!rt->ok || !rt->scene) return;
+    /* Uniform scale to a ~1.75-unit standing height. */
+    float h = rt->scene->boundsMax[1] - rt->scene->boundsMin[1];
+    if (h > 0.0f) {
+        float k = 448.0f / h;
+        rt->scale[0] = rt->scale[1] = rt->scale[2] = k;
+    }
+}
 static float npc173YOff; /* lifts the model so its base sits on the floor */
 
 static void buildNpcAssets(void) {
+    buildHumanRT(&introGuardRT, "guard.b3d", NULL);
+    buildHumanRT(&introClassDRT, "class_d.b3d", NULL);
+    buildHumanRT(&introScientistRT, "class_d.b3d", "scientist.png");
+    buildHumanRT(&introFranklinRT, "class_d.b3d", "Franklin.png");
     buildModelRT(&npc173RT, "scp_173_body.b3d", 0, 0, 0, NULL);
     buildModelRT(&npc173HeadRT, "scp_173_head.b3d", 0, 0, 0, NULL);
     if (npc173RT.scene) {
@@ -1145,6 +1162,7 @@ static void update173(void) {
  * as voice lines. */
 
 static void gameMusicStart(void);
+static void introPlaceHumans(void);
 
 static int sndIntroAttention = -1, sndIntroExitCell = -1;
 static int sndIntroEscort = -1, sndIntroDone = -1;
@@ -1181,14 +1199,16 @@ static void introStart(void) {
         }
     }
 
-    /* Wake up in the cell, facing its door. */
-    camPos[0] = INTRO_GX * ROOM_SPACING - 8064.0f;
+    /* Wake up in the Class-D cell (the recessed pocket off the block
+     * corridor; the escort guards stand just outside it). */
+    camPos[0] = INTRO_GX * ROOM_SPACING - 4250.0f;
     camPos[1] = EYE_HEIGHT;
-    camPos[2] = INTRO_GY * ROOM_SPACING + 620.0f;
-    camYaw = 0.0f;
+    camPos[2] = INTRO_GY * ROOM_SPACING + 730.0f;
+    camYaw = 3.14159265f; /* face the corridor */
     camPitch = 0.0f;
     velY = 0.0f;
     npc173Active = 0; /* nothing hunts until the breach */
+    introPlaceHumans();
     introPhase = 0;
     introTimer = 0;
     audioStreamMusic(DATA_ROOT "/SFX/Music/173IntroChamber.ogg", 0.5f, 1);
@@ -1288,6 +1308,52 @@ static void introUpdate(void) {
                 introEnd("YOU ESCAPED INTO THE FACILITY");
             }
             break;
+    }
+}
+
+/* The intro's people (UpdateIntro's CreateNPC calls): the escort
+ * guards outside the cell, inmates, the observation-room staff.
+ * Static figures - the port has no NPC animation. */
+typedef struct {
+    ModelRT *rt;
+    float x, y, z;   /* intro-room local, raw units */
+    float yawDeg;
+} IntroHuman;
+
+static IntroHuman INTRO_HUMANS[8];
+static int introHumanCount;
+
+static void introPlaceHumans(void) {
+    IntroHuman defs[8] = {
+        { &introGuardRT, -4205.0f, 0.0f, 870.0f, 180.0f },  /* Ulgrin */
+        { &introGuardRT, -3985.0f, 0.0f, 786.0f, 135.0f },
+        { &introGuardRT, -8064.0f, 0.0f, 1096.0f, 180.0f }, /* radio guy */
+        { &introClassDRT, -3700.0f, 0.0f, 750.0f, 90.0f },  /* inmate */
+        { &introGuardRT, 328.0f, 480.0f, 1072.0f, 180.0f }, /* balcony */
+        { &introFranklinRT, -3424.0f, -100.0f, -2208.0f, 0.0f },
+        { &introScientistRT, -3073.0f, -315.0f, -2165.0f, 45.0f },
+        { &introGuardRT, -4000.0f, 0.0f, 950.0f, 160.0f },
+    };
+    introHumanCount = 0;
+    for (int i = 0; i < 8; i++) {
+        if (defs[i].rt->ok) INTRO_HUMANS[introHumanCount++] = defs[i];
+    }
+}
+
+static void drawIntroHumans(const float viewPos[3]) {
+    /* Only during the escort; the breach clears the block. */
+    if (introPhase < 0 || introPhase >= 4) return;
+    for (int i = 0; i < introHumanCount; i++) {
+        const IntroHuman *h = &INTRO_HUMANS[i];
+        float wx = INTRO_GX * ROOM_SPACING + h->x;
+        float wz = INTRO_GY * ROOM_SPACING + h->z;
+        float dx = wx - viewPos[0], dz = wz - viewPos[2];
+        if (dx * dx + dz * dz > VIEW_RANGE * VIEW_RANGE) continue;
+        glPushMatrix();
+        glTranslatef(wx, h->y, wz);
+        glRotatef(-h->yawDeg + 180.0f, 0.0f, 1.0f, 0.0f);
+        drawModelRT(h->rt);
+        glPopMatrix();
     }
 }
 
@@ -3727,6 +3793,7 @@ int main(void) {
             drawDoors(camPos);
             drawItems(camPos);
             draw173(camPos);
+            drawIntroHumans(camPos);
             glDisable(GL_CULL_FACE);
             for (int i = 0; i < activeCount; i++) {
                 drawRoomBatches(activeRooms[i], 1);
