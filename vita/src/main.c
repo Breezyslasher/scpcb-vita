@@ -384,6 +384,23 @@ static float camYaw, camPitch;
 static float velY = 0.0f;
 static int walkMode = 1;
 static int cullMode = 0;
+
+/* ---- S-NAV: explored-room tracking and the equipped navigator ---- */
+#define MAX_VISITED 1024
+static uint8_t roomVisited[MAX_VISITED];
+static int equippedNav = -1;  /* inventory template index, -1 = none */
+static int navVisible = 1;
+
+static void markRoomVisited(const float pos[3]) {
+    int gx = (int)floorf(pos[0] / ROOM_SPACING + 0.5f);
+    int gy = (int)floorf(pos[2] / ROOM_SPACING + 0.5f);
+    for (uint32_t i = 0; i < map.roomCount && i < MAX_VISITED; i++) {
+        if (map.rooms[i].gridX == gx && map.rooms[i].gridY == gy) {
+            roomVisited[i] = 1;
+            return;
+        }
+    }
+}
 static int fogOn = 1;
 
 /* Vitals (approximate Main_Core.bb rates). */
@@ -422,6 +439,9 @@ static void spawnPlayer(void) {
 }
 
 static void regenerateMap(uint32_t seed) {
+    memset(roomVisited, 0, sizeof(roomVisited));
+    equippedNav = -1;
+    navVisible = 1;
     for (uint32_t i = 0; i < tplList.count; i++) {
         templateUnload(&tplRT[i]);
     }
@@ -1095,6 +1115,37 @@ static int itemPickupNearest(const float pos[3]) {
     return worldItems[best].tpl;
 }
 
+/* Use/equip the selected inventory item (the game's right-click).
+ * Returns a toast string or NULL if the item has no use action. */
+static const char *useInventoryItem(int slot) {
+    static char msg[96];
+    if (slot < 0 || slot >= (int)inventoryCount) return NULL;
+    int tpl = inventory[slot];
+    const char *name = ITEM_TEMPLATES[tpl].name;
+    if (strstr(name, "Eyedrops")) {
+        /* ReVision Eyedrops: refills the blink meter, consumed. */
+        blinkTimer = 100.0f;
+        for (unsigned i = (unsigned)slot; i + 1 < inventoryCount; i++) {
+            inventory[i] = inventory[i + 1];
+        }
+        inventoryCount--;
+        if (invSel >= (int)inventoryCount && invSel > 0) invSel--;
+        return "YOU USED THE EYEDROPS";
+    }
+    if (strstr(name, "S-NAV")) {
+        if (equippedNav == tpl) {
+            equippedNav = -1;
+            snprintf(msg, sizeof(msg), "PUT AWAY THE %s", name);
+        } else {
+            equippedNav = tpl;
+            navVisible = 1;
+            snprintf(msg, sizeof(msg), "EQUIPPED THE %s", name);
+        }
+        return msg;
+    }
+    return NULL;
+}
+
 static void drawItems(const float viewPos[3]) {
     for (unsigned i = 0; i < worldItemCount; i++) {
         const WorldItem *w = &worldItems[i];
@@ -1378,6 +1429,8 @@ static int saveGame(void) {
     fprintf(f, "vitals=%f %f\n", blinkTimer, stamina);
     fprintf(f, "npc173=%f %f %f %f %d\n", npc173Pos[0], npc173Pos[1],
             npc173Pos[2], npc173YawDeg, npc173Active);
+    fprintf(f, "nav=%s\n",
+            equippedNav >= 0 ? ITEM_TEMPLATES[equippedNav].name : "");
     fprintf(f, "inv=");
     for (unsigned i = 0; i < inventoryCount; i++) {
         fprintf(f, "%s|", ITEM_TEMPLATES[inventory[i]].name);
@@ -1416,6 +1469,7 @@ static int loadGameFrom(const char *path) {
     char name[16] = "save";
     int cfg[4] = { -1, -1, -1, -1 };
     static char invLine[640], takenLine[640], doorLine[640];
+    char navLine[64] = "";
     invLine[0] = takenLine[0] = doorLine[0] = '\0';
     /* Parsed with strtof/strtoul: vitasdk newlib faults on scanf
      * float conversions. */
@@ -1450,6 +1504,9 @@ static int loadGameFrom(const char *path) {
             nz = strtof(p, &p);
             nyaw = strtof(p, &p);
             nact = (int)strtol(p, &p, 10);
+        } else if (strncmp(line, "nav=", 4) == 0) {
+            snprintf(navLine, sizeof(navLine), "%s", line + 4);
+            navLine[strcspn(navLine, "\r\n")] = '\0';
         } else if (strncmp(line, "inv=", 4) == 0) {
             snprintf(invLine, sizeof(invLine), "%s", line + 4);
         } else if (strncmp(line, "taken=", 6) == 0) {
@@ -1488,6 +1545,7 @@ static int loadGameFrom(const char *path) {
     npc173Pos[2] = nz;
     npc173YawDeg = nyaw;
     if (!nact) npc173Active = 0;
+    if (navLine[0]) equippedNav = itemTplFind(navLine);
     inventoryCount = 0;
     char *tok = strtok(invLine, "|\n");
     while (tok && inventoryCount < MAX_INVENTORY) {
@@ -2701,6 +2759,63 @@ static void drawPauseMenu(void) {
     }
 }
 
+/* S-NAV overlay: explored rooms around the player on a green LCD
+ * grid; the Ultimate model also shows SCP-173 as a hostile blip. */
+static void drawNav(void) {
+    const float PANEL = 200.0f;
+    const int R = 4; /* rooms shown each side of the player */
+    float ox = SCREEN_W - PANEL - 18.0f, oy = SCREEN_H - PANEL - 60.0f;
+    float cell = PANEL / (float)(2 * R + 1);
+
+    drawQuad(ox - 5, oy - 5, PANEL + 10, PANEL + 10, 0, 0.02f, 0.08f, 0.02f,
+             0.88f);
+    float bc = 0.1f, bg = 0.75f;
+    drawQuad(ox - 5, oy - 5, PANEL + 10, 2, 0, bc, bg, bc, 1.0f);
+    drawQuad(ox - 5, oy + PANEL + 3, PANEL + 10, 2, 0, bc, bg, bc, 1.0f);
+    drawQuad(ox - 5, oy - 5, 2, PANEL + 10, 0, bc, bg, bc, 1.0f);
+    drawQuad(ox + PANEL + 3, oy - 5, 2, PANEL + 10, 0, bc, bg, bc, 1.0f);
+
+    float pgx = camPos[0] / ROOM_SPACING;
+    float pgy = camPos[2] / ROOM_SPACING;
+    float cx0 = ox + PANEL * 0.5f, cy0 = oy + PANEL * 0.5f;
+
+    for (uint32_t i = 0; i < map.roomCount && i < MAX_VISITED; i++) {
+        if (!roomVisited[i]) continue;
+        float dxc = map.rooms[i].gridX - pgx;
+        float dyc = map.rooms[i].gridY - pgy;
+        if (fabsf(dxc) > R || fabsf(dyc) > R) continue;
+        float cx = cx0 + dxc * cell, cy = cy0 + dyc * cell;
+        drawQuad(cx - cell * 0.40f, cy - cell * 0.40f, cell * 0.80f,
+                 cell * 0.80f, 0, 0.05f, 0.45f, 0.08f, 0.95f);
+    }
+
+    /* Player: bright blip with a heading dot ("north" = -z, up). */
+    drawQuad(cx0 - 4, cy0 - 4, 8, 8, 0, 0.5f, 1.0f, 0.5f, 1.0f);
+    float hx = cx0 + sinf(camYaw) * cell * 0.45f;
+    float hy = cy0 - cosf(camYaw) * cell * 0.45f;
+    drawQuad(hx - 2, hy - 2, 4, 4, 0, 0.8f, 1.0f, 0.8f, 1.0f);
+
+    /* SCP-173 blip on the Ultimate model. */
+    if (equippedNav >= 0
+        && strstr(ITEM_TEMPLATES[equippedNav].name, "Ultimate")
+        && npc173Active) {
+        float dxc = npc173Pos[0] / ROOM_SPACING - pgx;
+        float dyc = npc173Pos[2] / ROOM_SPACING - pgy;
+        if (fabsf(dxc) <= R && fabsf(dyc) <= R) {
+            float cx = cx0 + dxc * cell, cy = cy0 + dyc * cell;
+            drawQuad(cx - 3, cy - 3, 6, 6, 0, 1.0f, 0.15f, 0.1f, 1.0f);
+        }
+    }
+
+    glPushMatrix();
+    glScalef(1.5f, 1.5f, 1.0f);
+    glColor4f(0.4f, 0.9f, 0.4f, 1.0f);
+    drawText((ox - 2) / 1.5f, (oy - 22.0f) / 1.5f,
+             equippedNav >= 0 ? ITEM_TEMPLATES[equippedNav].name : "S-NAV");
+    glColor4f(1, 1, 1, 1);
+    glPopMatrix();
+}
+
 int main(void) {
     vglInit(0x800000);
 
@@ -2856,9 +2971,19 @@ int main(void) {
                 const char *doc = ITEM_TEMPLATES[inventory[invSel]].docImage;
                 if (doc[0]) openDocument(doc);
             }
+            /* Square uses/equips the selected item (right-click). */
+            if (inputHit(ACTION_USE_ITEM)) {
+                const char *r = useInventoryItem(invSel);
+                if (r) {
+                    snprintf(toastMsg, sizeof(toastMsg), "%s", r);
+                    toastTimer = 150;
+                }
+            }
         } else if (!pauseOpen) {
             if (inputHit(ACTION_LEAN_LEFT)) fogOn = !fogOn;
-            if (inputHit(ACTION_USE_ITEM)) cullMode = (cullMode + 1) % 3;
+            if (inputHit(ACTION_USE_ITEM) && equippedNav >= 0) {
+                navVisible = !navVisible;
+            }
             if (inputHit(ACTION_SAVE)) { /* D-pad up: walk/fly */
                 walkMode = !walkMode;
                 velY = 0.0f;
@@ -2961,6 +3086,7 @@ int main(void) {
 
         if (haveData) {
             updateActiveRooms(camPos);
+            markRoomVisited(camPos);
         }
 
         float fwdX = sinf(camYaw), fwdZ = -cosf(camYaw);
@@ -3115,6 +3241,7 @@ int main(void) {
                       blinkTimer / 100.0f);
             drawMeter(20, SCREEN_H - 110, hudSprintIcon, hudStaminaBar,
                       stamina / 100.0f);
+            if (equippedNav >= 0 && navVisible) drawNav();
         }
         if (invOpen) {
             /* Reading a document dims the world and shows the page;
