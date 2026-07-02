@@ -185,10 +185,48 @@ int audioLoad(const char *path) {
     }
     fclose(probe);
 
-    int chans = 0, rate = 0;
-    short *pcm = NULL;
-    int frames = stb_vorbis_decode_filename(path, &chans, &rate, &pcm);
+    /* Decode manually: stb_vorbis_decode_filename() treats a
+     * zero-sample frame as end-of-stream, but some encoders (the menu
+     * music) emit a zero-length priming frame first, which made the
+     * whole file decode to 0 frames. Only two consecutive empty reads
+     * mean real EOF. */
+    int err = 0;
+    stb_vorbis *v = stb_vorbis_open_filename(path, &err, NULL);
+    if (!v) {
+        loadDecodeFails++;
+        alog("load DECODE-FAIL %s open err=%d", path, err);
+        return -1;
+    }
+    stb_vorbis_info info = stb_vorbis_get_info(v);
+    int chans = info.channels >= 2 ? 2 : 1;
+    int rate = (int)info.sample_rate;
+    uint32_t cap = stb_vorbis_stream_length_in_samples(v);
+    if (cap < 4096) cap = 4096;
+    short *pcm = (short *)malloc((size_t)cap * chans * sizeof(short));
+    uint32_t total = 0;
+    int emptyReads = 0;
+    while (pcm) {
+        if (total == cap) {
+            cap *= 2;
+            short *grown2 = (short *)realloc(
+                pcm, (size_t)cap * chans * sizeof(short));
+            if (!grown2) break;
+            pcm = grown2;
+        }
+        int n = stb_vorbis_get_samples_short_interleaved(
+            v, chans, pcm + (size_t)total * chans,
+            (int)((cap - total) * chans));
+        if (n <= 0) {
+            if (++emptyReads >= 2) break;
+            continue;
+        }
+        emptyReads = 0;
+        total += (uint32_t)n;
+    }
+    stb_vorbis_close(v);
+    int frames = (int)total;
     if (frames <= 0 || !pcm) {
+        free(pcm);
         loadDecodeFails++;
         alog("load DECODE-FAIL %s frames=%d", path, frames);
         return -1;
