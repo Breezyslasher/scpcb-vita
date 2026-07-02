@@ -64,6 +64,113 @@ static int port = -1;
 static SceUID mixThread = -1;
 static volatile int running;
 
+/* ---- streamed music ----
+ * Music decodes from disk on the mixer thread instead of being held
+ * as PCM (a 3-minute track is ~30 MB decoded). The main thread posts
+ * requests through a mailbox; the mixer opens/closes the vorbis
+ * handle itself, so there is no cross-thread lifetime to manage. */
+#define MUSIC_CHUNK 1024
+static stb_vorbis *musicV;
+static int musicSrcChans, musicSrcRate;
+static int musicLoop;
+static float musicBaseVol = 1.0f;
+static float musicVol = 1.0f;
+static int16_t musicChunk[MUSIC_CHUNK * 2];
+static int musicChunkLen, musicChunkPos; /* frames */
+static int16_t musicPrevL, musicPrevR, musicCurL, musicCurR;
+static uint32_t musicFracFx, musicStepFx;
+static int musicEmptyReads;
+
+static volatile int musicReq;            /* 0 idle, 1 start, 2 stop */
+static char musicReqPath[256];
+static float musicReqVol;
+static int musicReqLoop;
+
+/* Mixer thread only. Returns 0 at end of stream (after loop wrap). */
+static int musicNextFrame(int16_t *l, int16_t *r) {
+    while (musicChunkPos >= musicChunkLen) {
+        int outCh = musicSrcChans >= 2 ? 2 : 1;
+        int n = stb_vorbis_get_samples_short_interleaved(
+            musicV, outCh, musicChunk, MUSIC_CHUNK * outCh);
+        if (n <= 0) {
+            /* Zero-length priming frames occur mid-open; two empty
+             * reads mean real EOF. */
+            if (++musicEmptyReads >= 2) {
+                if (!musicLoop) return 0;
+                stb_vorbis_seek_start(musicV);
+                musicEmptyReads = 0;
+            }
+            continue;
+        }
+        musicEmptyReads = 0;
+        if (outCh == 1) { /* expand mono in place, back to front */
+            for (int i = n - 1; i >= 0; i--) {
+                musicChunk[i * 2] = musicChunk[i];
+                musicChunk[i * 2 + 1] = musicChunk[i];
+            }
+        }
+        musicChunkLen = n;
+        musicChunkPos = 0;
+    }
+    *l = musicChunk[musicChunkPos * 2];
+    *r = musicChunk[musicChunkPos * 2 + 1];
+    musicChunkPos++;
+    return 1;
+}
+
+/* Mixer thread only: handle start/stop requests, then mix GRAIN
+ * output frames of music into acc. */
+static void musicService(int32_t *acc) {
+    if (musicReq) {
+        if (musicV) {
+            stb_vorbis_close(musicV);
+            musicV = NULL;
+        }
+        if (musicReq == 1) {
+            int err = 0;
+            musicV = stb_vorbis_open_filename(musicReqPath, &err, NULL);
+            if (musicV) {
+                stb_vorbis_info info = stb_vorbis_get_info(musicV);
+                musicSrcChans = info.channels;
+                musicSrcRate = (int)info.sample_rate;
+                musicStepFx = (uint32_t)(((uint64_t)musicSrcRate << 16)
+                                         / OUT_RATE);
+                musicBaseVol = musicReqVol;
+                musicLoop = musicReqLoop;
+                musicChunkLen = musicChunkPos = 0;
+                musicFracFx = 0;
+                musicEmptyReads = 0;
+                musicPrevL = musicPrevR = musicCurL = musicCurR = 0;
+            } else {
+                alog("music OPEN-FAIL %s err=%d", musicReqPath, err);
+            }
+        }
+        musicReq = 0;
+    }
+    if (!musicV) return;
+
+    float vL = musicBaseVol * musicVol, vR = vL;
+    for (int i = 0; i < GRAIN; i++) {
+        musicFracFx += musicStepFx;
+        while (musicFracFx >= 0x10000u) {
+            musicFracFx -= 0x10000u;
+            musicPrevL = musicCurL;
+            musicPrevR = musicCurR;
+            if (!musicNextFrame(&musicCurL, &musicCurR)) {
+                stb_vorbis_close(musicV);
+                musicV = NULL;
+                return;
+            }
+        }
+        int32_t l = musicPrevL
+                  + (((musicCurL - musicPrevL) * (int32_t)musicFracFx) >> 16);
+        int32_t r = musicPrevR
+                  + (((musicCurR - musicPrevR) * (int32_t)musicFracFx) >> 16);
+        acc[i * 2] += (int32_t)(l * vL);
+        acc[i * 2 + 1] += (int32_t)(r * vR);
+    }
+}
+
 /* The main thread starts channels; the mixer thread advances and
  * retires them. `sound` is written last when starting (with the rest
  * already set), so a torn read at worst plays one stale grain. */
@@ -115,6 +222,7 @@ static int mixerLoop(SceSize args, void *argp) {
                 ch->posFx += ch->stepFx;
             }
         }
+        musicService(acc);
         for (int i = 0; i < GRAIN * 2; i++) {
             int32_t v = acc[i];
             if (v > 32767) v = 32767;
@@ -258,17 +366,13 @@ static void startChannel(int c, int sound, float volL, float volR, int loop) {
 }
 
 static float sfxVol = 1.0f;
-static float musicVol = 1.0f;
-static float musicBaseVol = 1.0f;
 
 void audioSetSfxVolume(float vol) {
     sfxVol = vol;
 }
 
 void audioSetMusicVolume(float vol) {
-    musicVol = vol;
-    channels[MUSIC_CHANNEL].volL = musicBaseVol * musicVol;
-    channels[MUSIC_CHANNEL].volR = musicBaseVol * musicVol;
+    musicVol = vol; /* mixer applies it per grain */
 }
 
 void audioPlay(int sound, float vol, float pan) {
@@ -309,16 +413,13 @@ void audioLoopAmbience(int sound, float vol) {
     startChannel(AMBIENCE_CHANNEL, sound, vol, vol, 1);
 }
 
-void audioLoopMusic(int sound, float vol) {
-    if (sound < 0 || sound >= soundCount) {
-        channels[MUSIC_CHANNEL].sound = -1;
-        return;
-    }
-    musicBaseVol = vol;
-    float v = vol * musicVol;
-    startChannel(MUSIC_CHANNEL, sound, v, v, 1);
+void audioStreamMusic(const char *path, float vol, int loop) {
+    snprintf(musicReqPath, sizeof(musicReqPath), "%s", path);
+    musicReqVol = vol;
+    musicReqLoop = loop;
+    musicReq = 1;
 }
 
 void audioStopMusic(void) {
-    channels[MUSIC_CHANNEL].sound = -1;
+    musicReq = 2;
 }

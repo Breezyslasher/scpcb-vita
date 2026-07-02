@@ -25,6 +25,7 @@ static int addDoor(DoorList *list, float x, float z, int angle, int heavy,
     list->items = grown;
     Door *d = &list->items[list->count++];
     d->x = x;
+    d->y = 0.0f;
     d->z = z;
     d->angle = angle;
     d->heavy = heavy;
@@ -138,6 +139,15 @@ void doorsUpdate(DoorList *list) {
     }
 }
 
+int doorsAddInternal(DoorList *list, float x, float y, float z, int angle,
+                     int heavy, int open, int keycard, int locked) {
+    if (!addDoor(list, x, z, angle, heavy, open, keycard)) return 0;
+    Door *d = &list->items[list->count - 1];
+    d->y = y;
+    d->locked = locked;
+    return 1;
+}
+
 float doorSlide(const Door *d) {
     float max = d->heavy ? DOOR_SLIDE_HEAVY : DOOR_SLIDE_DEFAULT;
     float t = d->openState * 3.14159265f / 180.0f;
@@ -159,7 +169,7 @@ void doorButtonWorldPos(const Door *d, int side, float out[3]) {
         out[0] = d->x + lx;
         out[2] = d->z + lz;
     }
-    out[1] = ly;
+    out[1] = d->y + ly;
 }
 
 DoorPressResult doorsPressButton(DoorList *list, const float pos[3],
@@ -214,7 +224,8 @@ void doorsCollide(const DoorList *list, float pos[3], float radius) {
 
         float dx = pos[0] - d->x, dz = pos[2] - d->z;
         if (dx * dx + dz * dz > 1024.0f * 1024.0f) continue;
-        if (pos[1] > DOOR_PANEL_H + 200.0f) continue;
+        if (pos[1] > d->y + DOOR_PANEL_H + 200.0f) continue;
+        if (pos[1] < d->y - 100.0f) continue;
 
         /* Door-local frame: lx spans the doorway, lz is through it. */
         float lx, lz;
