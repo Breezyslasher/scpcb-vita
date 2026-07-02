@@ -723,11 +723,23 @@ static void update173(void) {
     int seen = playerSees173();
     int moving = 0;
 
+    /* Vertical separation: the statue kills and hunts only on its own
+     * level. camPos is the eye; the player's feet are ~EYE_HEIGHT
+     * below, and npc173Pos[1] is the statue's floor. */
+    float feetDy = fabsf((camPos[1] - EYE_HEIGHT) - npc173Pos[1]);
+    int sameLevel = feetDy < 220.0f;
+
     if (!seen) {
-        /* Kill on contact while unobserved. */
-        if (dist < 110.0f) {
+        /* Kill on contact while unobserved - never through a floor. */
+        if (dist < 110.0f && sameLevel) {
             audioPlay(sndNeckSnap[rand() % 3], 1.0f, 0.0f);
             deathTimer = 180;
+            return;
+        }
+        /* Player on another floor: hold position instead of grinding
+         * into the ceiling/floor beneath them. */
+        if (!sameLevel && dist < 500.0f) {
+            npc173WasMoving = 0;
             return;
         }
 
@@ -936,6 +948,109 @@ static void drawItems(const float viewPos[3]) {
         drawModelRT(itemModel(w->tpl));
         glPopMatrix();
     }
+}
+
+/* ---------------- pause menu and save/load ---------------- */
+
+static int pauseOpen;
+static int pauseSel;
+static uint32_t pendingSeed;
+
+#define SAVE_PATH DATA_ROOT "/save.dat"
+
+/* The map, doors, item spawns and 173 placement are all deterministic
+ * from the seed, so a save only records the seed plus mutable state. */
+static int saveGame(void) {
+    FILE *f = fopen(SAVE_PATH, "w");
+    if (!f) return 0;
+    fprintf(f, "SCPVITA1\n");
+    fprintf(f, "seed=%u\n", mapSeed);
+    fprintf(f, "player=%f %f %f %f %f\n", camPos[0], camPos[1], camPos[2],
+            camYaw, camPitch);
+    fprintf(f, "vitals=%f %f\n", blinkTimer, stamina);
+    fprintf(f, "npc173=%f %f %f %f %d\n", npc173Pos[0], npc173Pos[1],
+            npc173Pos[2], npc173YawDeg, npc173Active);
+    fprintf(f, "inv=");
+    for (unsigned i = 0; i < inventoryCount; i++) {
+        fprintf(f, "%s|", ITEM_TEMPLATES[inventory[i]].name);
+    }
+    fprintf(f, "\ntaken=");
+    for (unsigned i = 0; i < worldItemCount; i++) {
+        fputc(worldItems[i].taken ? '1' : '0', f);
+    }
+    fprintf(f, "\ndoors=");
+    for (uint32_t i = 0; i < doors.count; i++) {
+        fputc(doors.items[i].open ? '1' : '0', f);
+    }
+    fprintf(f, "\n");
+    fclose(f);
+    return 1;
+}
+
+static int loadGame(void) {
+    FILE *f = fopen(SAVE_PATH, "r");
+    if (!f) return 0;
+    char line[1024];
+    if (!fgets(line, sizeof(line), f)
+        || strncmp(line, "SCPVITA1", 8) != 0) {
+        fclose(f);
+        return 0;
+    }
+    uint32_t seed = 0;
+    float px = 0, py = 0, pz = 0, yaw = 0, pitch = 0, bt = 100, st = 100;
+    float nx = 0, ny = 0, nz = 0, nyaw = 0;
+    int nact = 1;
+    static char invLine[640], takenLine[640], doorLine[640];
+    invLine[0] = takenLine[0] = doorLine[0] = '\0';
+    while (fgets(line, sizeof(line), f)) {
+        if (sscanf(line, "seed=%u", &seed) == 1) continue;
+        if (sscanf(line, "player=%f %f %f %f %f", &px, &py, &pz, &yaw,
+                   &pitch) == 5) continue;
+        if (sscanf(line, "vitals=%f %f", &bt, &st) == 2) continue;
+        if (sscanf(line, "npc173=%f %f %f %f %d", &nx, &ny, &nz, &nyaw,
+                   &nact) == 5) continue;
+        if (strncmp(line, "inv=", 4) == 0) {
+            snprintf(invLine, sizeof(invLine), "%s", line + 4);
+        } else if (strncmp(line, "taken=", 6) == 0) {
+            snprintf(takenLine, sizeof(takenLine), "%s", line + 6);
+        } else if (strncmp(line, "doors=", 6) == 0) {
+            snprintf(doorLine, sizeof(doorLine), "%s", line + 6);
+        }
+    }
+    fclose(f);
+    if (seed == 0) return 0;
+
+    regenerateMap(seed);
+    camPos[0] = px;
+    camPos[1] = py;
+    camPos[2] = pz;
+    camYaw = yaw;
+    camPitch = pitch;
+    velY = 0.0f;
+    blinkTimer = bt;
+    stamina = st;
+    npc173Pos[0] = nx;
+    npc173Pos[1] = ny;
+    npc173Pos[2] = nz;
+    npc173YawDeg = nyaw;
+    if (!nact) npc173Active = 0;
+    inventoryCount = 0;
+    char *tok = strtok(invLine, "|\n");
+    while (tok && inventoryCount < MAX_INVENTORY) {
+        int t = itemTplFind(tok);
+        if (t >= 0) inventory[inventoryCount++] = t;
+        tok = strtok(NULL, "|\n");
+    }
+    for (unsigned i = 0;
+         i < worldItemCount && takenLine[i] && takenLine[i] != '\n'; i++) {
+        worldItems[i].taken = takenLine[i] == '1';
+    }
+    for (uint32_t i = 0;
+         i < doors.count && doorLine[i] && doorLine[i] != '\n'; i++) {
+        doors.items[i].open = doorLine[i] == '1';
+        doors.items[i].openState = doors.items[i].open ? 180.0f : 0.0f;
+    }
+    return 1;
 }
 
 static void drawModelRT(const ModelRT *rt) {
@@ -1215,6 +1330,40 @@ static void drawDocument(void) {
                 1.0f);
 }
 
+/* Pause menu: runs inside the HUD ortho/flat-2D state. */
+static void drawPauseMenu(void) {
+    static const char *items[6] = {
+        "Resume", "Save Game", "Load Game", "New Game (new seed)",
+        "", "Exit",
+    };
+    drawQuad(0, 0, SCREEN_W, SCREEN_H, 0, 0.0f, 0.0f, 0.0f, 0.78f);
+
+    glPushMatrix();
+    glScalef(2.0f, 2.0f, 1.0f);
+    glColor4f(0.85f, 0.92f, 0.85f, 1.0f);
+    drawText(170, 60, "PAUSED");
+    for (int i = 0; i < 6; i++) {
+        char row[64];
+        if (i == 4) {
+            snprintf(row, sizeof(row), "Seed: %u  (start new: X)",
+                     pendingSeed);
+        } else {
+            snprintf(row, sizeof(row), "%s", items[i]);
+        }
+        if (i == pauseSel) {
+            glColor4f(1.0f, 1.0f, 0.6f, 1.0f);
+            drawText(160, 90.0f + i * 16.0f, ">");
+        } else {
+            glColor4f(0.75f, 0.75f, 0.75f, 1.0f);
+        }
+        drawText(170, 90.0f + i * 16.0f, row);
+    }
+    glColor4f(0.5f, 0.5f, 0.5f, 1.0f);
+    drawText(170, 190, "dpad: navigate  (seed: left/right, L = x1000)");
+    glColor4f(1, 1, 1, 1);
+    glPopMatrix();
+}
+
 int main(void) {
     vglInit(0x800000);
 
@@ -1257,10 +1406,63 @@ int main(void) {
 
         inputUpdate();
 
-        if (inputHit(ACTION_MENU)) {
+        if (haveData && inputHit(ACTION_MENU)) {
+            pauseOpen = !pauseOpen;
+            if (pauseOpen) {
+                invOpen = 0;
+                docOpen = 0;
+                pauseSel = 0;
+                pendingSeed = mapSeed;
+            }
+        } else if (!haveData && inputHit(ACTION_MENU)) {
             if (++menuHits >= 3) running = 0;
         }
-        if (inputHit(ACTION_INVENTORY)) {
+        int pausedAtFrameStart = pauseOpen;
+        if (pauseOpen) {
+            if (inputHit(ACTION_SAVE) && pauseSel > 0) pauseSel--;
+            if (inputDpadDownHit() && pauseSel < 5) pauseSel++;
+            if (pauseSel == 4) {
+                uint32_t step = inputDown(ACTION_SPRINT) ? 1000u : 1u;
+                if (inputHit(ACTION_LEAN_LEFT)) pendingSeed -= step;
+                if (inputHit(ACTION_LEAN_RIGHT)) pendingSeed += step;
+                if (pendingSeed == 0) pendingSeed = 1;
+            }
+            if (inputHit(ACTION_INTERACT)) {
+                switch (pauseSel) {
+                    case 0:
+                        pauseOpen = 0;
+                        break;
+                    case 1:
+                        snprintf(toastMsg, sizeof(toastMsg), "%s",
+                                 saveGame() ? "GAME SAVED" : "SAVE FAILED");
+                        toastTimer = 150;
+                        break;
+                    case 2:
+                        if (loadGame()) {
+                            snprintf(toastMsg, sizeof(toastMsg),
+                                     "GAME LOADED");
+                            pauseOpen = 0;
+                        } else {
+                            snprintf(toastMsg, sizeof(toastMsg),
+                                     "NO SAVE FOUND");
+                        }
+                        toastTimer = 150;
+                        break;
+                    case 3:
+                        regenerateMap(mapSeed * 7919u + 17u);
+                        pauseOpen = 0;
+                        break;
+                    case 4:
+                        regenerateMap(pendingSeed);
+                        pauseOpen = 0;
+                        break;
+                    case 5:
+                        running = 0;
+                        break;
+                }
+            }
+        }
+        if (!pauseOpen && inputHit(ACTION_INVENTORY)) {
             invOpen = !invOpen;
             if (!invOpen) docOpen = 0;
         }
@@ -1284,7 +1486,7 @@ int main(void) {
                 const char *doc = ITEM_TEMPLATES[inventory[invSel]].docImage;
                 if (doc[0]) openDocument(doc);
             }
-        } else {
+        } else if (!pauseOpen) {
             if (inputHit(ACTION_LEAN_LEFT)) fogOn = !fogOn;
             if (inputHit(ACTION_USE_ITEM)) cullMode = (cullMode + 1) % 3;
             if (inputHit(ACTION_SAVE)) { /* D-pad up: walk/fly */
@@ -1292,7 +1494,10 @@ int main(void) {
                 velY = 0.0f;
             }
         }
-        if (haveData && !invOpen && inputHit(ACTION_INTERACT)) {
+        /* pausedAtFrameStart: a Cross that activated a menu entry this
+         * frame must not also interact with the world. */
+        if (haveData && !invOpen && !pauseOpen && !pausedAtFrameStart
+            && inputHit(ACTION_INTERACT)) {
             int picked = itemPickupNearest(camPos);
             if (picked >= 0) {
                 snprintf(toastMsg, sizeof(toastMsg), "PICKED UP %s",
@@ -1336,7 +1541,7 @@ int main(void) {
             }
             }
         }
-        if (haveData) {
+        if (haveData && !pauseOpen) {
             doorsUpdate(&doors);
             update173();
             itemSpin += 1.0f;
@@ -1355,13 +1560,10 @@ int main(void) {
             }
         }
         if (toastTimer > 0) toastTimer--;
-        if (haveData && !invOpen && inputHit(ACTION_LEAN_RIGHT)) {
-            regenerateMap(mapSeed * 7919u + 17u);
-        }
 
         StickState look = inputLook();
         StickState move = inputMove();
-        if (invOpen || deathTimer > 0) {
+        if (invOpen || pauseOpen || deathTimer > 0) {
             /* Freeze the camera and player while a menu is open or the
              * death screen is playing. */
             look.x = look.y = 0.0f;
@@ -1378,7 +1580,7 @@ int main(void) {
 
         float fwdX = sinf(camYaw), fwdZ = -cosf(camYaw);
         if (walkMode && haveData) {
-            int crouched = inputDown(ACTION_CROUCH) && !invOpen;
+            int crouched = inputDown(ACTION_CROUCH) && !invOpen && !pauseOpen;
             float eye = crouched ? CROUCH_EYE_HEIGHT : EYE_HEIGHT;
             /* Stamina: drains while sprinting, blocks at empty until
              * partially recovered. */
@@ -1399,9 +1601,12 @@ int main(void) {
 
             /* Blink: meter drains; empty or R closes the eyes. New
              * blinks don't start while a menu is open. */
-            if (!invOpen) blinkTimer -= 100.0f / 600.0f; /* ~10 s */
-            if (!invOpen && inputHit(ACTION_BLINK)) blinkTimer = 0.0f;
-            if (!invOpen && blinkTimer <= 0.0f && blinkFrames == 0) {
+            if (!invOpen && !pauseOpen) blinkTimer -= 100.0f / 600.0f;
+            if (!invOpen && !pauseOpen && inputHit(ACTION_BLINK)) {
+                blinkTimer = 0.0f;
+            }
+            if (!invOpen && !pauseOpen && blinkTimer <= 0.0f
+                && blinkFrames == 0) {
                 blinkFrames = 18;
             }
 
@@ -1461,8 +1666,12 @@ int main(void) {
             float speed = 30.0f * (inputDown(ACTION_SPRINT) ? 3.0f : 1.0f);
             camPos[0] += (fwdX * -move.y + cosf(camYaw) * move.x) * speed;
             camPos[2] += (fwdZ * -move.y + sinf(camYaw) * move.x) * speed;
-            if (!invOpen && inputDown(ACTION_BLINK)) camPos[1] += speed;
-            if (!invOpen && inputDown(ACTION_CROUCH)) camPos[1] -= speed;
+            if (!invOpen && !pauseOpen && inputDown(ACTION_BLINK)) {
+                camPos[1] += speed;
+            }
+            if (!invOpen && !pauseOpen && inputDown(ACTION_CROUCH)) {
+                camPos[1] -= speed;
+            }
         }
 
         /* A started blink always finishes counting down, whatever mode
@@ -1503,7 +1712,7 @@ int main(void) {
         char line2[200];
         snprintf(line2, sizeof(line2),
                  "fps=%.0f  au=%d/%d open-fail=%d dec-fail=%d  x: door"
-                 "  up: %s  start x3: exit", fps, audioStatus(),
+                 "  up: %s  start: menu", fps, audioStatus(),
                  audioSoundCount(), audioLoadFopenFails(),
                  audioLoadDecodeFails(), walkMode ? "WALK" : "fly");
         drawHud(line1, line2, toastTimer > 0 ? toastMsg : NULL, NULL);
@@ -1516,7 +1725,7 @@ int main(void) {
         glDisable(GL_CULL_FACE);
         glDisableClientState(GL_COLOR_ARRAY);
         glDisableClientState(GL_TEXTURE_COORD_ARRAY);
-        if (haveData && walkMode && !invOpen) {
+        if (haveData && walkMode && !invOpen && !pauseOpen) {
             drawMeter(20, SCREEN_H - 60, hudBlinkIcon, hudBlinkBar,
                       blinkTimer / 100.0f);
             drawMeter(20, SCREEN_H - 110, hudSprintIcon, hudStaminaBar,
@@ -1530,6 +1739,9 @@ int main(void) {
             } else {
                 drawInventory();
             }
+        }
+        if (pauseOpen) {
+            drawPauseMenu();
         }
         /* Death: fade to black with a red flash and a message. */
         if (deathTimer > 0) {
@@ -1546,7 +1758,7 @@ int main(void) {
         }
 
         /* Eyes closed: solid black, but never over an open menu. */
-        if (blinkFrames > 0 && !invOpen) {
+        if (blinkFrames > 0 && !invOpen && !pauseOpen) {
             drawQuad(0, 0, SCREEN_W, SCREEN_H, 0, 0.0f, 0.0f, 0.0f, 1.0f);
         }
         glEnableClientState(GL_COLOR_ARRAY);
