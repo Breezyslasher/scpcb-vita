@@ -71,7 +71,7 @@ Updated as features land. States: **done** / **partial** / **missing**.
 | SCP-173 | done | Freeze-on-sight, blink interplay, last-seen search, TeleportCloser, door opening, kill + camera wrench, horror stings, head tracking |
 | Skeletal animation engine | done | B3D BONE/KEYS/ANIM, CPU skin, VBO path |
 | Intro guards / Class-Ds | done | Source roster, idles, walking escort, gunfire enforcement |
-| SCP-106 | partial | Roaming hunter; femur-breaker recontainment now gated on the magnet lever, with 106 lured up to feed then contained; catch drags you to the pocket dimension; leaves a corrosion pool on spawn and a footfall trail. Missing vs source: the grab/head-wrench attack (teleports on contact instead), the trailing OBJ2 back-body, door-surface corrosion, the blur/camera-zoom dread pulse, and difficulty/room-modulated spawn timing |
+| SCP-106 | partial | Roaming hunter; femur-breaker recontainment gated on the magnet lever, with 106 lured up to feed then contained; leaves a corrosion pool on spawn and a footfall trail. On contact it now seizes the player - grab animation (frames 105-110), a violent head-wrench (view twist + camera shake, input frozen) and a drag before the pocket dimension - rather than teleporting. Missing vs source: the trailing OBJ2 back-body, door-surface corrosion, the blur/camera-zoom dread pulse, and difficulty/room-modulated spawn timing |
 | SCP-682 | partial | Roar set-piece via the e_682_roar event (countdown + roar + camera shake); no roaming battle |
 | SCP-096, 049, 049-2, 939, 966, 860-1, 1499-1 | missing | |
 | Guards/MTF in gameplay | missing | Only intro figures |

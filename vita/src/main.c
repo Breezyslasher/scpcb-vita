@@ -1468,8 +1468,10 @@ static SkinnedMesh *skin106;
 static float skin106Scale = 1.0f;
 static GLuint vbo106;
 static int posed106;
-enum { N106_DORMANT = 0, N106_SPAWNING, N106_CHASING, N106_SINKING };
+enum { N106_DORMANT = 0, N106_SPAWNING, N106_CHASING, N106_SINKING,
+       N106_GRABBING };
 static int npc106State;
+static float npc106GrabTimer;   /* grab-and-wrench progress before the PD */
 static int npc106Active;
 static float npc106Pos[3];
 static float npc106YawDeg;
@@ -2889,6 +2891,7 @@ static void reset106(void) {
      * frames; scaled down so it turns up within a session). */
     npc106Timer = 3600.0f + (float)(rand() % 3000);
     npc106Cool = 0;
+    npc106GrabTimer = 0.0f;
     posed106 = 0;
     npc106Pos[1] = -5000.0f;
 }
@@ -3360,16 +3363,13 @@ static void update106(void) {
                                0.1f, 0.8f);
             }
             if (dist < 150.0f && sameLevel) {
-                /* Caught: dragged into the pocket dimension. */
+                /* Caught: it seizes the player and wrenches (frames
+                 * 105..110), then drags them under (source's grab +
+                 * FallTimer, MoveToPocketDimension at FallTimer<-250). */
+                npc106State = N106_GRABBING;
+                npc106Frame = 105.0f;
+                npc106GrabTimer = 0.0f;
                 audioPlay(snd106Laugh, 1.0f, 0.0f);
-                if (pdRoomIdx >= 0) {
-                    enterPocketDimension();
-                } else {
-                    snprintf(deathCause, sizeof(deathCause), "SCP-106");
-                    audioPlay(sndHorror11, 1.0f, 0.0f);
-                    deathTimer = 180;
-                }
-                reset106();
                 return;
             }
             float ndx, ndz;
@@ -3411,6 +3411,56 @@ static void update106(void) {
             }
             /* Give up if the player breaks away for good. */
             if (dist > ROOM_SPACING * 4.0f) reset106();
+            break;
+        }
+        case N106_GRABBING: {
+            /* It holds the player fast; movement/look are frozen (the
+             * input gate checks N106_GRABBING). Frames 105..110 are the
+             * grab; at 110 it wrenches - a violent head twist (source
+             * shows me\Head rotated +-45 with DamageSFX/HorrorSFX) - and
+             * then drags them down (FallTimer) into the pocket
+             * dimension. */
+            npc106GrabTimer += 1.0f;
+            npc106YawDeg = atan2f(dx, dz) * 180.0f / 3.14159265f;
+            /* Cling to the player's position. */
+            float toX = camPos[0] - dx * 0.15f;
+            float toZ = camPos[2] - dz * 0.15f;
+            npc106Pos[0] = toX;
+            npc106Pos[2] = toZ;
+            float o[3] = { npc106Pos[0], npc106Pos[1] + 250.0f, npc106Pos[2] };
+            float hy;
+            if (rayDownWorld(o, 600.0f, &hy)) npc106Pos[1] = hy;
+            if (npc106Frame < 110.0f) {
+                npc106Frame += 0.7f; /* grab */
+                if (npc106Frame >= 110.0f) {
+                    npc106Frame = 110.0f;
+                    audioPlay(sndHorror11, 1.0f, 0.0f);
+                    audioPlay(snd106Laugh, 0.9f, 0.0f);
+                    blinkFrames = 8;
+                    blinkTimer = 100.0f;
+                }
+            } else {
+                /* The wrench: twist the view harder over the drag. */
+                float g = npc106GrabTimer;
+                camYaw += sinf(g * 0.8f) * 0.06f;
+                camPitch += cosf(g * 1.1f) * 0.04f;
+                if (camPitch > 1.5f) camPitch = 1.5f;
+                if (camPitch < -1.5f) camPitch = -1.5f;
+                camShake = 3.0f;
+                injuries += 0.01f;
+            }
+            /* FallTimer < -250: dragged under. */
+            if (npc106GrabTimer > 190.0f) {
+                camShake = 0.0f;
+                if (pdRoomIdx >= 0) {
+                    enterPocketDimension();
+                } else {
+                    snprintf(deathCause, sizeof(deathCause), "SCP-106");
+                    deathTimer = 180;
+                }
+                reset106();
+                return;
+            }
             break;
         }
         default:
@@ -6214,10 +6264,10 @@ int main(void) {
         StickState look = inputLook();
         StickState move = inputMove();
         if (invOpen || pauseOpen || keypadOpen || deathTimer > 0
-            || introCameraLocked()) {
+            || introCameraLocked() || npc106State == N106_GRABBING) {
             /* Freeze the camera and player while a menu is open, the
-             * death screen is playing, or the intro wake-up cinematic
-             * drives the camera. */
+             * death screen is playing, the intro wake-up cinematic drives
+             * the camera, or SCP-106 has the player in its grab. */
             look.x = look.y = 0.0f;
             move.x = move.y = 0.0f;
         }
