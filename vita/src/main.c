@@ -1723,7 +1723,6 @@ static float npc966Drowsy;      /* insomnia buildup / aggression */
 static SkinnedMesh *skin1499;
 static float skin1499Scale = 1.0f;
 static GLuint vbo1499;
-static int posed1499;
 static GLuint tex1499King;      /* the king's distinct texture */
 
 /* ---- SCP-860-1: the thing in the forest room (cont2_860_1). It only
