@@ -29,6 +29,7 @@
 #include "game/item_spawns.h"
 #include "game/room_doors.h"
 #include "game/room_fixtures.h"
+#include "game/room_decals.h"
 #include "game/mapgen.h"
 #include "input.h"
 #include "render/scene.h"
@@ -1635,6 +1636,7 @@ static void regenerateMap(uint32_t seed) {
         spawn860();
         eventRng = mapSeed ^ 0xA5A5F00Du;
         spawnItems();
+        spawnRoomDecals();
         reset173();
         reset106();
         snprintf(statusLine, sizeof(statusLine), "map seed %u: %u rooms %u doors",
@@ -3537,8 +3539,14 @@ enum {
     DECAL_CORROSIVE_1 = 0, DECAL_CORROSIVE_2 = 1,
     DECAL_BLOOD_1 = 2, DECAL_BLOOD_6 = 7,
     DECAL_PD_1 = 8, DECAL_PD_6 = 13,
+    DECAL_BULLET_HOLE_1 = 14, DECAL_BULLET_HOLE_2 = 15,
     DECAL_BLOOD_DROP_1 = 16, DECAL_BLOOD_DROP_2 = 17,
-    DECAL_ID_MAX = 18
+    DECAL_427 = 18, DECAL_409 = 19, DECAL_WATER = 20,
+    /* KETER/APOLLYON are achievement-gated: slots exist so IDs line up
+     * with the source, but their textures are never loaded (decalSpawn
+     * skips an id with no texture). */
+    DECAL_KETER = 21, DECAL_APOLLYON = 22,
+    DECAL_ID_MAX = 23
 };
 
 typedef struct {
@@ -3559,6 +3567,12 @@ static int decalHead;
 static GLuint decalTex[DECAL_ID_MAX];
 static int decalsLoaded;
 
+/* FillRoom's static splats live apart from the transient ring so the
+ * corrosion/blood effects can never recycle the room scatter. */
+#define MAX_ROOM_DECALS 256
+static Decal roomDecals[MAX_ROOM_DECALS];
+static int roomDecalCount;
+
 static void decalsInit(void) {
     if (decalsLoaded) return;
     decalsLoaded = 1;
@@ -3576,9 +3590,17 @@ static void decalsInit(void) {
         decalTex[DECAL_PD_1 + i] = textureGet(name);
     }
     for (int i = 0; i < 2; i++) {
+        snprintf(name, sizeof(name), "bullet_hole_decal(%d).png", i);
+        decalTex[DECAL_BULLET_HOLE_1 + i] = textureGet(name);
+    }
+    for (int i = 0; i < 2; i++) {
         snprintf(name, sizeof(name), "blood_drop_decal(%d).png", i);
         decalTex[DECAL_BLOOD_DROP_1 + i] = textureGet(name);
     }
+    decalTex[DECAL_427] = textureGet("scp_427_decal.png");
+    decalTex[DECAL_409] = textureGet("scp_409_decal.png");
+    decalTex[DECAL_WATER] = textureGet("water_decal.png");
+    /* DECAL_KETER / DECAL_APOLLYON: achievement-gated, left unloaded. */
 }
 
 /* Full form; call sites tune sizeChange/life afterward. */
@@ -3598,6 +3620,40 @@ static Decal *decalSpawn(int id, float x, float y, float z, float pitch,
     d->timer = 0.0f;
     d->life = -1.0f;
     return d;
+}
+
+/* Lay FillRoom's static splats (room_decals.h) into every placed room,
+ * rotated with the room, in the persistent room-decal array. Runs once
+ * per map, after the map is generated and decal textures are loaded. */
+static void spawnRoomDecals(void) {
+    roomDecalCount = 0;
+    const int N = (int)(sizeof(ROOM_DECALS) / sizeof(ROOM_DECALS[0]));
+    for (uint32_t r = 0;
+         r < map.roomCount && roomDecalCount < MAX_ROOM_DECALS; r++) {
+        const RoomPlacement *p = &map.rooms[r];
+        const char *nm = tplList.items[p->templateIndex].name;
+        for (int i = 0; i < N && roomDecalCount < MAX_ROOM_DECALS; i++) {
+            const RoomDecalDef *rd = &ROOM_DECALS[i];
+            if (strcmp(rd->room, nm) != 0) continue;
+            float local[3] = { rd->x, rd->y, rd->z };
+            float w[3];
+            localToWorld(p, local, w);
+            Decal *d = &roomDecals[roomDecalCount++];
+            memset(d, 0, sizeof(*d));
+            d->used = 1;
+            d->id = rd->id;
+            d->pos[0] = w[0]; d->pos[1] = w[1]; d->pos[2] = w[2];
+            d->pitch = rd->pitch;
+            /* Yaw follows the room's quarter-turn placement. */
+            d->yaw = rd->yaw + (float)(p->angle * 90);
+            d->roll = rd->roll;
+            d->size = rd->size;
+            d->maxSize = rd->size;
+            d->alpha = rd->alpha;
+            d->blend = rd->blend;
+            d->life = -1.0f;
+        }
+    }
 }
 
 /* A flat corrosion splat on the floor at (x,z), random spin. */
@@ -3637,9 +3693,39 @@ static void decalsUpdate(void) {
     }
 }
 
+/* Emit one decal quad (blend/rotation/size); the GL passes are set up by
+ * decalsDraw. Distance-culled and skipped if its texture never loaded. */
+static void decalEmit(const Decal *d) {
+    if (!d->used) return;
+    float ddx = d->pos[0] - camPos[0], ddz = d->pos[2] - camPos[2];
+    if (ddx * ddx + ddz * ddz > VIEW_RANGE * VIEW_RANGE) return;
+    GLuint tex = decalTex[d->id];
+    if (!tex) return;
+    switch (d->blend) {
+        case 2: glBlendFunc(GL_DST_COLOR, GL_ZERO); break;      /* mul */
+        case 3: glBlendFunc(GL_SRC_ALPHA, GL_ONE); break;       /* add */
+        default: glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    }
+    glBindTexture(GL_TEXTURE_2D, tex);
+    glColor4f(1.0f, 1.0f, 1.0f, d->alpha);
+    float h = d->size * 256.0f;
+    GLfloat v[18] = {
+        -h,  h, 0.0f,   h,  h, 0.0f,   h, -h, 0.0f,
+        -h,  h, 0.0f,   h, -h, 0.0f,  -h, -h, 0.0f,
+    };
+    glPushMatrix();
+    glTranslatef(d->pos[0], d->pos[1], d->pos[2]);
+    glRotatef(-d->yaw, 0.0f, 1.0f, 0.0f);
+    glRotatef(d->pitch, 1.0f, 0.0f, 0.0f);
+    glRotatef(d->roll, 0.0f, 0.0f, 1.0f);
+    glVertexPointer(3, GL_FLOAT, 0, v);
+    glDrawArrays(GL_TRIANGLES, 0, 6);
+    glPopMatrix();
+}
+
 static void decalsDraw(void) {
-    int any = 0;
-    for (int i = 0; i < MAX_DECALS; i++) if (decals[i].used) { any = 1; break; }
+    int any = roomDecalCount > 0;
+    for (int i = 0; !any && i < MAX_DECALS; i++) if (decals[i].used) any = 1;
     if (!any) return;
     glBindBuffer(GL_ARRAY_BUFFER, 0);
     glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
@@ -3652,34 +3738,8 @@ static void decalsDraw(void) {
     glDepthMask(GL_FALSE);
     static const GLfloat uvs[12] = { 0, 0, 1, 0, 1, 1, 0, 0, 1, 1, 0, 1 };
     glTexCoordPointer(2, GL_FLOAT, 0, uvs);
-    for (int i = 0; i < MAX_DECALS; i++) {
-        Decal *d = &decals[i];
-        if (!d->used) continue;
-        float ddx = d->pos[0] - camPos[0], ddz = d->pos[2] - camPos[2];
-        if (ddx * ddx + ddz * ddz > VIEW_RANGE * VIEW_RANGE) continue;
-        GLuint tex = decalTex[d->id];
-        if (!tex) continue;
-        switch (d->blend) {
-            case 2: glBlendFunc(GL_DST_COLOR, GL_ZERO); break;      /* mul */
-            case 3: glBlendFunc(GL_SRC_ALPHA, GL_ONE); break;       /* add */
-            default: glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-        }
-        glBindTexture(GL_TEXTURE_2D, tex);
-        glColor4f(1.0f, 1.0f, 1.0f, d->alpha);
-        float h = d->size * 256.0f;
-        GLfloat v[18] = {
-            -h,  h, 0.0f,   h,  h, 0.0f,   h, -h, 0.0f,
-            -h,  h, 0.0f,   h, -h, 0.0f,  -h, -h, 0.0f,
-        };
-        glPushMatrix();
-        glTranslatef(d->pos[0], d->pos[1], d->pos[2]);
-        glRotatef(-d->yaw, 0.0f, 1.0f, 0.0f);
-        glRotatef(d->pitch, 1.0f, 0.0f, 0.0f);
-        glRotatef(d->roll, 0.0f, 0.0f, 1.0f);
-        glVertexPointer(3, GL_FLOAT, 0, v);
-        glDrawArrays(GL_TRIANGLES, 0, 6);
-        glPopMatrix();
-    }
+    for (int i = 0; i < roomDecalCount; i++) decalEmit(&roomDecals[i]);
+    for (int i = 0; i < MAX_DECALS; i++) decalEmit(&decals[i]);
     glColor4f(1, 1, 1, 1);
     glDepthMask(GL_TRUE);
     glDisable(GL_ALPHA_TEST);
@@ -4279,6 +4339,15 @@ static void update106(void) {
                     float ez = dr->z - npc106Pos[2];
                     if (ex * ex + ez * ez < 256.0f * 256.0f) {
                         dr->corroded = 1;
+                        /* Beyond the texture swap, 106's rot pools at the
+                         * door's foot and eats into the panel face - the
+                         * door-surface corrosion. */
+                        decalCorrosion(dr->x, dr->y, dr->z, 0.7f, 0.7f);
+                        Decal *fd = decalSpawn(DECAL_CORROSIVE_2,
+                                               dr->x, dr->y + 150.0f, dr->z,
+                                               0.0f, (float)dr->angle, 0.0f,
+                                               0.6f, 0.75f, 1);
+                        if (fd) fd->life = 3600.0f;
                         audioPlay3D(snd106Corr[rand() % 3], npc106Pos,
                                     camPos, camYaw, 1500.0f);
                         break;
