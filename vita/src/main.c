@@ -615,6 +615,8 @@ static float pdReturn[4];     /* pre-catch pos + yaw to restore */
 static int sndPdEnter = -1, sndPdExit = -1, sndPdRumble = -1,
            sndPdExplode = -1;
 static int snd096Trigger = -1, snd096Scream = -1;
+static int snd049Breath = -1, snd049Horror = -1;
+static int snd049Spot[3] = { -1, -1, -1 }, snd049Search[3] = { -1, -1, -1 };
 
 /* Tesla gates (Events_Core e_tesla): the room2_tesla_* corridors have
  * an electrified gate at their centre that idles, charges, zaps and
@@ -1065,6 +1067,8 @@ static void updatePocketDimension(void);
 static void teslaSpawn(void);
 static void spawn096(void);
 static void reset096(void);
+static void spawn049(void);
+static void reset049(void);
 
 static void regenerateMap(uint32_t seed) {
     memset(roomVisited, 0, sizeof(roomVisited));
@@ -1102,6 +1106,7 @@ static void regenerateMap(uint32_t seed) {
         spawnRoomEvents();
         teslaSpawn();
         spawn096();
+        spawn049();
         eventRng = mapSeed ^ 0xA5A5F00Du;
         spawnItems();
         reset173();
@@ -1368,6 +1373,15 @@ static void loadSounds(void) {
     sndPdExplode = audioLoad(SFX_DIR "/Room/PocketDimension/Explosion.ogg");
     snd096Trigger = audioLoad(SFX_DIR "/SCP/096/Triggered.ogg");
     snd096Scream = audioLoad(SFX_DIR "/SCP/096/Scream.ogg");
+    snd049Breath = audioLoad(SFX_DIR "/SCP/049/Breath.ogg");
+    snd049Horror = audioLoad(SFX_DIR "/SCP/049/Horror.ogg");
+    for (int i = 0; i < 3; i++) {
+        char p[128];
+        snprintf(p, sizeof(p), SFX_DIR "/SCP/049/Spotted%d.ogg", i);
+        snd049Spot[i] = audioLoad(p);
+        snprintf(p, sizeof(p), SFX_DIR "/SCP/049/Searching%d.ogg", i);
+        snd049Search[i] = audioLoad(p);
+    }
     sndTeslaIdle = audioLoad(SFX_DIR "/Room/Tesla/Idle.ogg");
     sndTeslaWind = audioLoad(SFX_DIR "/Room/Tesla/WindUp.ogg");
     sndTeslaShock = audioLoad(SFX_DIR "/Room/Tesla/Shock.ogg");
@@ -1554,6 +1568,33 @@ static float npc096YawDeg;
 static float npc096Frame;
 static float npc096ScreamTimer; /* frames spent screaming before it runs */
 
+/* ---- SCP-049 (the Plague Doctor) and its reanimated 049-2 - slow,
+ * relentless pursuers that kill on a touch (UpdateNPCType049 / 049_2).
+ * 049 frames: idle 269..345, walk 346..463, kill 537..660; 049-2 walk
+ * 705..794. ---- */
+static SkinnedMesh *skin049;
+static float skin049Scale = 1.0f;
+static GLuint vbo049;
+static int posed049;
+enum { S049_IDLE = 0, S049_PURSUE, S049_KILL };
+static int npc049State;
+static int npc049Active;
+static float npc049Pos[3];
+static float npc049YawDeg;
+static float npc049Frame;
+static float npc049Timer;       /* activation delay */
+static int npc049Cool;          /* teleport-closer cooldown */
+#define MAX_0492 3
+static SkinnedMesh *skin0492;
+static float skin0492Scale = 1.0f;
+static GLuint vbo0492;
+static int posed0492;
+static float npc0492Frame;      /* shared walk phase (skinned once) */
+static float npc0492Pos[MAX_0492][3];
+static float npc0492Yaw[MAX_0492];
+static int npc0492Active[MAX_0492];
+static int npc0492Count;
+
 static void buildHumanRT(ModelRT *rt, const char *model, const char *tex) {
     buildModelRT(rt, model, 0, 0, 0, tex);
     if (!rt->ok || !rt->scene) return;
@@ -1596,6 +1637,18 @@ static void buildNpcAssets(void) {
             skinnedBounds(skin096, mn, mx);
             /* Taller than 106 - it's a lanky ~2.4 m creature. */
             if (mx[1] > mn[1]) skin096Scale = 460.0f / (mx[1] - mn[1]);
+        }
+        B3DModel *m049 = propModelGet("scp_049.b3d");
+        skin049 = m049 ? skinnedCreate(m049) : NULL;
+        if (skin049) {
+            skinnedBounds(skin049, mn, mx);
+            if (mx[1] > mn[1]) skin049Scale = 300.0f / (mx[1] - mn[1]);
+        }
+        B3DModel *m0492 = propModelGet("scp_049_2.b3d");
+        skin0492 = m0492 ? skinnedCreate(m0492) : NULL;
+        if (skin0492) {
+            skinnedBounds(skin0492, mn, mx);
+            if (mx[1] > mn[1]) skin0492Scale = 285.0f / (mx[1] - mn[1]);
         }
     }
     buildHumanRT(&introScientistRT, "class_d.b3d", "scientist.png");
@@ -2940,6 +2993,7 @@ static void decalsDraw(void) {
 /* ---- SCP-106 ---- */
 static void draw106(const float viewPos[3]);
 static void draw096(const float viewPos[3]);
+static void draw049(const float viewPos[3]);
 
 static void spawn106Near(void) {
     /* Behind the player, out of the cell if possible, on the floor. */
@@ -3765,6 +3819,185 @@ static void update096(void) {
     }
 }
 
+/* ---- SCP-049 + SCP-049-2 ---- */
+
+static void reset049(void) {
+    npc049State = S049_IDLE;
+    npc049Frame = 269.0f;
+    npc049Timer = 1800.0f + (float)(rand() % 2400);
+    npc049Cool = 0;
+}
+
+static void spawn049(void) {
+    npc049Active = 0;
+    npc0492Count = 0;
+    for (int z = 0; z < MAX_0492; z++) npc0492Active[z] = 0;
+    if (!skin049) return;
+    /* Its containment (cont2_049) if generated, else any large room far
+     * from the player's start cell. */
+    int best = -1;
+    for (uint32_t r = 0; r < map.roomCount; r++) {
+        if (strcmp(tplList.items[map.rooms[r].templateIndex].name,
+                   "cont2_049") == 0) { best = (int)r; break; }
+    }
+    if (best < 0) {
+        for (uint32_t r = 0; r < map.roomCount && best < 0; r++) {
+            const char *nm = tplList.items[map.rooms[r].templateIndex].name;
+            int gx = map.rooms[r].gridX, gy = map.rooms[r].gridY;
+            if ((strncmp(nm, "room2", 5) == 0 || strncmp(nm, "room3", 5) == 0)
+                && (gx * gx + gy * gy) > 9) {
+                best = (int)r;
+            }
+        }
+    }
+    if (best < 0) return;
+    npc049Pos[0] = map.rooms[best].gridX * ROOM_SPACING;
+    npc049Pos[2] = map.rooms[best].gridY * ROOM_SPACING;
+    npc049Pos[1] = 0.0f;
+    npc049YawDeg = 0.0f;
+    reset049();
+    npc049Active = 1;
+    /* A small retinue of reanimated 049-2 shambling nearby. */
+    if (skin0492) {
+        npc0492Count = 2;
+        npc0492Frame = 705.0f;
+        for (int z = 0; z < npc0492Count; z++) {
+            npc0492Pos[z][0] = npc049Pos[0] + (z == 0 ? 300.0f : -300.0f);
+            npc0492Pos[z][1] = 0.0f;
+            npc0492Pos[z][2] = npc049Pos[2] + 200.0f;
+            npc0492Yaw[z] = 0.0f;
+            npc0492Active[z] = 1;
+        }
+    }
+}
+
+/* A slow relentless walk toward the player, cell-pathed; returns the
+ * step direction (0,0 if already on top of the player). */
+static void doctorStep(const float from[3], float speed, float out[3]) {
+    float dx = camPos[0] - from[0], dz = camPos[2] - from[2];
+    float wp[2], ndx = dx, ndz = dz;
+    if (navNextCell(from[0], from[2], camPos[0], camPos[2], wp)) {
+        ndx = wp[0] - from[0];
+        ndz = wp[1] - from[2];
+    }
+    float d = sqrtf(ndx * ndx + ndz * ndz);
+    if (d > 1.0f) { ndx /= d; ndz /= d; }
+    out[0] = ndx * speed;
+    out[2] = ndz * speed;
+    out[1] = 0.0f;
+}
+
+/* UpdateNPCType049: idles until active, then walks the player down and
+ * kills on contact (the hazmat/714 delays are not ported - no such item
+ * effects yet). Phases closer when far, like 173/106. */
+static void update049(void) {
+    if (!npc049Active || !skin049 || deathTimer > 0 || !walkMode
+        || introPhase >= 0 || inPocket) {
+        return;
+    }
+    float dx = camPos[0] - npc049Pos[0];
+    float dz = camPos[2] - npc049Pos[2];
+    float dist = sqrtf(dx * dx + dz * dz);
+
+    switch (npc049State) {
+        case S049_IDLE:
+            npc049Frame += 0.2f;
+            if (npc049Frame > 345.0f) npc049Frame = 269.0f;
+            npc049Timer -= 1.0f + (float)npcAggressive;
+            if (npc049Timer <= 0.0f) {
+                npc049State = S049_PURSUE;
+                npc049Frame = 346.0f;
+                audioPlay3D(snd049Spot[rand() % 3], npc049Pos, camPos,
+                            camYaw, 3500.0f);
+            }
+            break;
+        case S049_PURSUE: {
+            npc049Frame += 0.6f;
+            if (npc049Frame > 463.0f) npc049Frame = 346.0f;
+            if (dist < 200.0f) {
+                /* The doctor's "cure": instant death. */
+                audioPlay(snd049Horror, 1.0f, 0.0f);
+                snprintf(deathCause, sizeof(deathCause), "SCP-049");
+                deathTimer = 180;
+                npc049State = S049_KILL;
+                npc049Frame = 537.0f;
+                return;
+            }
+            float step[3];
+            doctorStep(npc049Pos, 32.0f, step);
+            npc049Pos[0] += step[0];
+            npc049Pos[2] += step[2];
+            if (step[0] != 0.0f || step[2] != 0.0f) {
+                npc049YawDeg = atan2f(step[0], step[2]) * 180.0f / 3.14159265f;
+            }
+            float o[3] = { npc049Pos[0], npc049Pos[1] + 250.0f, npc049Pos[2] };
+            float hy;
+            if (rayDownWorld(o, 600.0f, &hy)) npc049Pos[1] = hy;
+            if (rand() % 260 == 0) {
+                audioPlay3D(snd049Search[rand() % 3], npc049Pos, camPos,
+                            camYaw, 3000.0f);
+            }
+            if (rand() % 200 == 0) {
+                audioPlay3D(snd049Breath, npc049Pos, camPos, camYaw, 2000.0f);
+            }
+            /* Phase closer if the player breaks away (TeleportCloser). */
+            if (npc049Cool > 0) npc049Cool--;
+            if (npc049Cool == 0 && dist > ROOM_SPACING * 2.5f) {
+                float wp[2];
+                if (navNextCell(npc049Pos[0], npc049Pos[2], camPos[0],
+                                camPos[2], wp)) {
+                    npc049Pos[0] = wp[0];
+                    npc049Pos[2] = wp[1];
+                    npc049Cool = 180;
+                }
+            }
+            break;
+        }
+        case S049_KILL:
+            npc049Frame += 0.6f;
+            if (npc049Frame > 660.0f) npc049Frame = 660.0f;
+            break;
+        default:
+            break;
+    }
+}
+
+/* The 049-2 retinue: slow shamblers that also kill on a touch. They
+ * share one animation phase (skinned once) and each walk the player
+ * down independently. */
+static void update0492(void) {
+    if (!npc0492Count || !skin0492 || deathTimer > 0 || !walkMode
+        || introPhase >= 0 || inPocket) {
+        return;
+    }
+    npc0492Frame += 0.5f;
+    if (npc0492Frame > 794.0f) npc0492Frame = 705.0f;
+    /* Only shamble once 049 itself is on the hunt. */
+    if (npc049State == S049_IDLE) return;
+    for (int z = 0; z < npc0492Count; z++) {
+        if (!npc0492Active[z]) continue;
+        float dx = camPos[0] - npc0492Pos[z][0];
+        float dz = camPos[2] - npc0492Pos[z][2];
+        if (dx * dx + dz * dz < 200.0f * 200.0f) {
+            audioPlay(snd049Horror, 0.9f, 0.0f);
+            snprintf(deathCause, sizeof(deathCause), "SCP-049-2");
+            deathTimer = 180;
+            return;
+        }
+        float step[3];
+        doctorStep(npc0492Pos[z], 24.0f, step);
+        npc0492Pos[z][0] += step[0];
+        npc0492Pos[z][2] += step[2];
+        if (step[0] != 0.0f || step[2] != 0.0f) {
+            npc0492Yaw[z] = atan2f(step[0], step[2]) * 180.0f / 3.14159265f;
+        }
+        float o[3] = { npc0492Pos[z][0], npc0492Pos[z][1] + 250.0f,
+                       npc0492Pos[z][2] };
+        float hy;
+        if (rayDownWorld(o, 600.0f, &hy)) npc0492Pos[z][1] = hy;
+    }
+}
+
 /* ---- Tesla gates ---- */
 
 static void teslaSpawn(void) {
@@ -4123,6 +4356,82 @@ static void draw096(const float viewPos[3]) {
     glBindBuffer(GL_ARRAY_BUFFER, 0);
     glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
     glPopMatrix();
+}
+
+/* Draw a posed skinned mesh (its VBO already filled) at a world
+ * position/yaw - shared by 049 and each 049-2. */
+static void drawSkinnedAt(SkinnedMesh *skin, GLuint vbo, GLuint *ibos,
+                          float scale, const float pos[3], float yawDeg) {
+    glPushMatrix();
+    glTranslatef(pos[0], pos[1], pos[2]);
+    glRotatef(-yawDeg + 180.0f, 0.0f, 1.0f, 0.0f);
+    glScalef(scale, scale, scale);
+    glBindBuffer(GL_ARRAY_BUFFER, vbo);
+    glVertexPointer(3, GL_FLOAT, sizeof(SceneVertex), VTX_OFF(x));
+    glColorPointer(4, GL_UNSIGNED_BYTE, sizeof(SceneVertex), VTX_OFF(r));
+    glTexCoordPointer(2, GL_FLOAT, sizeof(SceneVertex), VTX_OFF(du));
+    for (uint32_t b = 0; b < skinnedBatchCount(skin); b++) {
+        const SkinBatch *batch = skinnedBatch(skin, b);
+        GLuint tex = textureGet(batch->textureName);
+        if (tex) { glEnable(GL_TEXTURE_2D); glBindTexture(GL_TEXTURE_2D, tex); }
+        else glDisable(GL_TEXTURE_2D);
+        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, ibos[b]);
+        glDrawElements(GL_TRIANGLES, (GLsizei)batch->indexCount,
+                       GL_UNSIGNED_SHORT, NULL);
+    }
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
+    glPopMatrix();
+}
+
+static void draw049(const float viewPos[3]) {
+    if (npc049Active && skin049) {
+        float dx = npc049Pos[0] - viewPos[0], dz = npc049Pos[2] - viewPos[2];
+        GLuint *ibos = skinIBOsFor(skin049);
+        if (ibos && dx * dx + dz * dz <= VIEW_RANGE * VIEW_RANGE) {
+            if (!vbo049) glGenBuffers(1, &vbo049);
+            static int poseTick;
+            if (!posed049 || ((poseTick++) & 1) == 0) {
+                skinnedEval(skin049, npc049Frame);
+                uint32_t vc;
+                const SceneVertex *v = skinnedVertices(skin049, &vc);
+                glBindBuffer(GL_ARRAY_BUFFER, vbo049);
+                glBufferData(GL_ARRAY_BUFFER,
+                             (GLsizeiptr)(vc * sizeof(SceneVertex)), v,
+                             GL_DYNAMIC_DRAW);
+                glBindBuffer(GL_ARRAY_BUFFER, 0);
+                posed049 = 1;
+            }
+            drawSkinnedAt(skin049, vbo049, ibos, skin049Scale, npc049Pos,
+                          npc049YawDeg);
+        }
+    }
+    /* 049-2: skin once at the shared phase, draw each shambler. */
+    if (npc0492Count && skin0492) {
+        GLuint *ibos = skinIBOsFor(skin0492);
+        if (!ibos) return;
+        if (!vbo0492) glGenBuffers(1, &vbo0492);
+        static int poseTick2;
+        if (!posed0492 || ((poseTick2++) & 1) == 0) {
+            skinnedEval(skin0492, npc0492Frame);
+            uint32_t vc;
+            const SceneVertex *v = skinnedVertices(skin0492, &vc);
+            glBindBuffer(GL_ARRAY_BUFFER, vbo0492);
+            glBufferData(GL_ARRAY_BUFFER,
+                         (GLsizeiptr)(vc * sizeof(SceneVertex)), v,
+                         GL_DYNAMIC_DRAW);
+            glBindBuffer(GL_ARRAY_BUFFER, 0);
+            posed0492 = 1;
+        }
+        for (int z = 0; z < npc0492Count; z++) {
+            if (!npc0492Active[z]) continue;
+            float dx = npc0492Pos[z][0] - viewPos[0];
+            float dz = npc0492Pos[z][2] - viewPos[2];
+            if (dx * dx + dz * dz > VIEW_RANGE * VIEW_RANGE) continue;
+            drawSkinnedAt(skin0492, vbo0492, ibos, skin0492Scale,
+                          npc0492Pos[z], npc0492Yaw[z]);
+        }
+    }
 }
 
 /* ---------------- items and inventory ---------------- */
@@ -6768,6 +7077,8 @@ int main(void) {
             update173();
             update106();
             update096();
+            update049();
+            update0492();
             introUpdate();
             if (introPhase < 0 && !inPocket) {
                 updateZoneMusic();
@@ -6834,6 +7145,7 @@ int main(void) {
                 npc173EnemyX = npc173EnemyZ = 0.0f;
                 npc173LastDist = 1e9f;
                 reset096();
+                reset049();
                 health = 100.0f;
                 injuries = 0.0f;
                 bloodloss = 0.0f;
@@ -7037,6 +7349,7 @@ int main(void) {
             draw173(camPos);
             draw106(camPos);
             draw096(camPos);
+            draw049(camPos);
             drawTeslaArcs(camPos);
             drawPocketPillars();
             drawPocketThrone();
