@@ -660,6 +660,9 @@ enum { ELEV_IDLE = 0, ELEV_CLOSE, ELEV_TRAVEL, ELEV_ARRIVE };
 static int elevState;
 static float elevTimer;
 static float elevDest[3];     /* arrival position */
+static float elevRayFromY = 1500.0f; /* height to drop the arrival floor
+                                        ray from (raised for the vertical
+                                        cont1_079 car to a lower level) */
 static int elevDoorA = -1, elevDoorB = -1; /* doors to open on arrival */
 /* The gate surfaces are real elevator destinations: gate_a_entrance /
  * gate_b_entrance (in the facility) ride to the appended gate_a / gate_b
@@ -731,6 +734,8 @@ static int sndTeslaIdle = -1, sndTeslaWind = -1, sndTeslaShock = -1,
            sndTeslaPower = -1;
 /* MTF camera-check announcements (UpdateCameraCheck). */
 static int sndCamCheck = -1, sndCamFound[2] = { -1, -1 }, sndCamNoFound = -1;
+/* SCP-079 speech (cont1_079 event). */
+static int snd079Speech = -1, snd079Refuse = -1;
 static GLuint teslaArcTex;
 static float teslaFlash;       /* white screen flash when it zaps nearby */
 
@@ -1636,6 +1641,7 @@ static void spawn966(void);
 static void spawn860(void);
 static void reset860(void);
 static void removeInventoryByName(const char *name);
+static void spawn079(void);
 
 static void regenerateMap(uint32_t seed) {
     memset(roomVisited, 0, sizeof(roomVisited));
@@ -1690,6 +1696,7 @@ static void regenerateMap(uint32_t seed) {
         spawn939();
         spawn966();
         spawn860();
+        spawn079();
         eventRng = mapSeed ^ 0xA5A5F00Du;
         spawnItems();
         spawnRoomDecals();
@@ -2014,6 +2021,8 @@ static void loadSounds(void) {
     sndCamFound[0] = audioLoad(SFX_DIR "/Character/MTF/AnnouncCameraFound1.ogg");
     sndCamFound[1] = audioLoad(SFX_DIR "/Character/MTF/AnnouncCameraFound2.ogg");
     sndCamNoFound = audioLoad(SFX_DIR "/Character/MTF/AnnouncCameraNoFound.ogg");
+    snd079Speech = audioLoad(SFX_DIR "/SCP/079/Speech.ogg");
+    snd079Refuse = audioLoad(SFX_DIR "/SCP/079/Refuse.ogg");
     sndAmbience = audioLoad(SFX_DIR "/Ambient/Room ambience/rumble.ogg");
     audioLoopAmbience(sndAmbience, 0.30f);
 }
@@ -2047,6 +2056,19 @@ static int arm682Active;
 static float arm682Roll;      /* swing angle, 180 -> 360 */
 static float arm682Pos[3];
 static float arm682Yaw;
+/* SCP-079 (cont1_079): the sentient computer in the lower chamber. Its
+ * screen flickers overlay frames as it speaks; approaching the terminal
+ * plays its speech and drops the SCP-079 document. */
+static ModelRT scp079RT;
+static GLuint scp079Ov[7];
+static int scp079Ok;          /* placed in this map */
+static float scp079Pos[3];    /* computer world position (raw) */
+static float scp079Yaw;       /* world yaw */
+static int scp079State;       /* 0 idle, 1 speaking, 2 spoken/cooldown */
+static float scp079Timer;     /* state timer (frames) */
+static int scp079OvFrame;     /* current flicker overlay 0..6 */
+static float scp079FlickT;    /* flicker cadence */
+static int scp079DocDone;     /* the document has been dropped */
 static char toastMsg[128];
 static int toastTimer;
 
@@ -2164,6 +2186,15 @@ static void buildDoorAssets(void) {
     buildModelRT(&camHeadRT, "CamHead.b3d", 0, 0, 0, "camera(1).png");
     camHeadRT.scale[0] = camHeadRT.scale[1] = camHeadRT.scale[2] = 2.56f;
     camHeadRedTex = textureGet("camera(2).png");
+    /* SCP-079's computer (ScaleEntity 1.3 world -> *256 raw) and its
+     * seven screen-overlay frames. */
+    buildModelRT(&scp079RT, "scp_079.b3d", 0, 0, 0, NULL);
+    scp079RT.scale[0] = scp079RT.scale[1] = scp079RT.scale[2] = 332.8f;
+    for (int i = 0; i < 7; i++) {
+        char nm[48];
+        snprintf(nm, sizeof(nm), "scp_079_overlay(%d).png", i + 1);
+        scp079Ov[i] = textureGet(nm);
+    }
 }
 
 static void drawModelRT(const ModelRT *rt);
@@ -5466,9 +5497,29 @@ static void elevatorStart(const Door *d) {
     if (elevState != ELEV_IDLE || d->type != 1) return;
     int di = (int)(d - doors.items);
     const char *here = roomNameAt(camPos);
+    elevRayFromY = 1500.0f;
+    /* A vertical car (cont1_079's descent to SCP-079's chamber): its
+     * paired elevator door sits at the same X/Z but a very different Y.
+     * Ride to that level, dropping the arrival floor ray from just above
+     * the destination door so it lands in the lower chamber. */
+    int vpair = -1;
+    for (uint32_t j = 0; j < doors.count; j++) {
+        if ((int)j == di || doors.items[j].type != 1) continue;
+        float vx = doors.items[j].x - d->x, vz = doors.items[j].z - d->z;
+        if (vx * vx + vz * vz < 64.0f * 64.0f
+            && fabsf(doors.items[j].y - d->y) > 2000.0f) {
+            vpair = (int)j;
+            break;
+        }
+    }
     /* The gate elevators travel to the real surfaces (and back); every
      * other car fast-travels to the next elevator in the map. */
-    if (strcmp(here, "gate_a_entrance") == 0 && gateARoomIdx >= 0) {
+    if (vpair >= 0) {
+        elevDest[0] = doors.items[vpair].x;
+        elevDest[2] = doors.items[vpair].z;
+        elevRayFromY = doors.items[vpair].y + 400.0f;
+        elevDoorB = vpair;
+    } else if (strcmp(here, "gate_a_entrance") == 0 && gateARoomIdx >= 0) {
         elevDest[0] = GATEA_GX * ROOM_SPACING;
         elevDest[2] = GATEA_GY * ROOM_SPACING;
         elevDoorB = gateADoor;
@@ -5534,7 +5585,7 @@ static void updateElevator(void) {
             if (elevTimer > 150.0f) {
                 camPos[0] = elevDest[0];
                 camPos[2] = elevDest[2];
-                float o[3] = { camPos[0], 1500.0f, camPos[2] };
+                float o[3] = { camPos[0], elevRayFromY, camPos[2] };
                 float hy;
                 camPos[1] = (rayDownWorld(o, 3000.0f, &hy) ? hy : 0.0f)
                           + EYE_HEIGHT;
@@ -7325,6 +7376,122 @@ static void cameraCheckUpdate(void) {
     }
 }
 
+/* ---- SCP-079 (cont1_079): the sentient computer ---- */
+
+static void spawn079(void) {
+    scp079Ok = 0;
+    scp079State = 0;
+    scp079Timer = 0.0f;
+    scp079OvFrame = 0;
+    scp079FlickT = 0.0f;
+    scp079DocDone = 0;
+    for (uint32_t r = 0; r < map.roomCount; r++) {
+        const RoomPlacement *p = &map.rooms[r];
+        if (strcmp(tplList.items[p->templateIndex].name, "cont1_079") != 0) {
+            continue;
+        }
+        /* Computer position, source-local (PositionEntity 166,-10800,1606
+         * * RoomScale) with the room's quarter-turn; RotateEntity yaw -90. */
+        float local[3] = { 166.0f, -10800.0f, 1606.0f }, w[3];
+        localToWorld(p, local, w);
+        scp079Pos[0] = w[0]; scp079Pos[1] = w[1]; scp079Pos[2] = w[2];
+        scp079Yaw = (float)(p->angle * 90) - 90.0f;
+        scp079Ok = 1;
+        break;
+    }
+}
+
+/* e_cont1_079: reaching the terminal in the lower chamber wakes SCP-079 -
+ * it speaks (Speech.ogg), its screen flickers overlay frames, and it
+ * drops the SCP-079 document; approaching again once it has finished
+ * makes it refuse (Refuse.ogg). The Gate B broadcast tie-in is out of
+ * scope (no gate endings ported). */
+static void update079(void) {
+    if (!scp079Ok) return;
+    float dx = camPos[0] - scp079Pos[0];
+    float dy = camPos[1] - scp079Pos[1];
+    float dz = camPos[2] - scp079Pos[2];
+    int atTerminal = (dx * dx + dy * dy + dz * dz) < 768.0f * 768.0f;
+
+    if (scp079State == 1) {
+        scp079Timer += 1.0f;
+        scp079FlickT += 1.0f;
+        if (scp079FlickT >= 8.0f) {
+            scp079FlickT = 0.0f;
+            scp079OvFrame = 1 + (rand() % 6); /* overlays 2..7 while talking */
+        }
+        if (scp079Timer > 1800.0f) {          /* ~30 s, then settle */
+            scp079State = 2;
+            scp079Timer = 0.0f;
+            scp079OvFrame = 0;                /* overlay 1: idle screen */
+        }
+    } else if (scp079State == 2) {
+        scp079Timer += 1.0f;
+    }
+
+    if (atTerminal && scp079State == 0) {
+        if (snd079Speech >= 0) audioPlay(snd079Speech, 1.0f, 0.0f);
+        scp079State = 1;
+        scp079Timer = 0.0f;
+        snprintf(toastMsg, sizeof(toastMsg), "SCP-079 STIRS...");
+        toastTimer = 200;
+        if (!scp079DocDone) {
+            worldItemAdd(itemTplFind("Document SCP-079"), scp079Pos[0],
+                         scp079Pos[1] + 20.0f, scp079Pos[2] + 120.0f);
+            scp079DocDone = 1;
+        }
+    } else if (atTerminal && scp079State == 2 && scp079Timer > 300.0f) {
+        if (snd079Refuse >= 0) audioPlay(snd079Refuse, 1.0f, 0.0f);
+        scp079State = 1;
+        scp079Timer = 0.0f;
+    }
+}
+
+static void draw079(const float viewPos[3]) {
+    if (!scp079Ok) return;
+    float dx = scp079Pos[0] - viewPos[0], dz = scp079Pos[2] - viewPos[2];
+    if (dx * dx + dz * dz > VIEW_RANGE * VIEW_RANGE) return;
+
+    glPushMatrix();
+    glTranslatef(scp079Pos[0], scp079Pos[1], scp079Pos[2]);
+    glRotatef(-scp079Yaw, 0.0f, 1.0f, 0.0f);
+    drawModelRT(&scp079RT);
+    glPopMatrix();
+
+    /* The screen: a small glowing quad on the console's front face,
+     * showing the current overlay frame (flickers while it speaks). */
+    int f = scp079OvFrame;
+    if (f < 0 || f > 6) f = 0;
+    GLuint ov = scp079Ov[f];
+    if (!ov) return;
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
+    glDisableClientState(GL_COLOR_ARRAY);
+    glEnable(GL_TEXTURE_2D);
+    glBindTexture(GL_TEXTURE_2D, ov);
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE);   /* additive glow */
+    glDepthMask(GL_FALSE);
+    glColor4f(1.0f, 1.0f, 1.0f, 1.0f);
+    static const GLfloat uv[12] = { 0, 0, 1, 0, 1, 1, 0, 0, 1, 1, 0, 1 };
+    GLfloat v[18] = {
+        -45.0f,  36.0f, 0.0f,   45.0f,  36.0f, 0.0f,   45.0f, -36.0f, 0.0f,
+        -45.0f,  36.0f, 0.0f,   45.0f, -36.0f, 0.0f,  -45.0f, -36.0f, 0.0f,
+    };
+    glPushMatrix();
+    glTranslatef(scp079Pos[0], scp079Pos[1] + 44.0f, scp079Pos[2]);
+    glRotatef(-scp079Yaw, 0.0f, 1.0f, 0.0f);
+    glTranslatef(0.0f, 0.0f, 26.0f);     /* onto the console's face */
+    glTexCoordPointer(2, GL_FLOAT, 0, uv);
+    glVertexPointer(3, GL_FLOAT, 0, v);
+    glDrawArrays(GL_TRIANGLES, 0, 6);
+    glPopMatrix();
+    glColor4f(1, 1, 1, 1);
+    glDepthMask(GL_TRUE);
+    glDisable(GL_BLEND);
+    glEnableClientState(GL_COLOR_ARRAY);
+}
+
 static const ModelRT *buttonModelFor(int btnId) {
     switch (btnId) {
         case 1: return &buttonKeycardRT;
@@ -9011,6 +9178,7 @@ int main(void) {
             doorsUpdate(&doors);
             camerasUpdate();
             cameraCheckUpdate();
+            update079();
             update173();
             update106();
             update096();
@@ -9301,6 +9469,7 @@ int main(void) {
             drawDoors(camPos);
             drawFixtures(camPos);
             camerasDraw(camPos);
+            draw079(camPos);
             drawItems(camPos);
             draw173(camPos);
             draw106(camPos);
