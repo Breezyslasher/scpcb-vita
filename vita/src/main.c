@@ -597,6 +597,7 @@ static void appendIntroRoom(void) {
 #define MASK_GX -16
 #define MASK_GY 16
 static int maskRoomIdx = -1;
+static int maskEntries;       /* mask uses this run (re-entry ambush) */
 static int inMask;            /* wearing SCP-1499, in its dimension */
 static float maskReturn[4];   /* pre-mask pos + yaw */
 #define MAX_1499 8
@@ -1174,6 +1175,7 @@ static void regenerateMap(uint32_t seed) {
     currentAmbienceId = 0;
     inPocket = 0;
     inMask = 0;
+    maskEntries = 0;
     npc1499Count = 0;
     pdLunging = 0;
     femurTimer = 0.0f;
@@ -1688,6 +1690,7 @@ static float npc106YawDeg;
 static float npc106Frame;
 static float npc106Timer;      /* dormant spawn countdown */
 static int npc106Cool;         /* teleport-behind cooldown */
+static float npc106ChaseTimer; /* sinks away when it runs out unseen (State3) */
 
 /* ---- SCP-096: harmless while unseen; looking at its face enrages it,
  * and after a scream it sprints down and kills you (UpdateNPCType096).
@@ -3780,6 +3783,7 @@ static void update106(void) {
             if (npc106Frame >= 259.0f) {
                 npc106State = N106_CHASING;
                 npc106Frame = 284.0f;
+                npc106ChaseTimer = 3000.0f + (float)(rand() % 500);
                 audioPlay(snd106Laugh, 0.9f, 0.0f);
             }
             break;
@@ -3881,6 +3885,24 @@ static void update106(void) {
                     npc106Cool = 120;
                     audioPlay3D(snd106Wall[rand() % 3], npc106Pos, camPos,
                                 camYaw, 2500.0f);
+                }
+            }
+            /* Sink away (State3): the chase timer only runs down while
+             * 106 is unseen; when it empties and 106 is off-screen and
+             * not right on top of the player, it slips back into the
+             * walls to re-idle - the source's "it's suddenly gone". */
+            {
+                float vx = sinf(camYaw), vz = -cosf(camYaw);
+                float inFront = dist > 1.0f
+                              ? (-dx * vx - dz * vz) / dist : 1.0f;
+                float head[3] = { npc106Pos[0], npc106Pos[1] + 200.0f,
+                                  npc106Pos[2] };
+                int visible = inFront > 0.25f && blinkFrames == 0
+                            && lineOfSight(camPos, head);
+                if (!visible) npc106ChaseTimer -= 1.0f;
+                if (npc106ChaseTimer <= 0.0f && !visible && dist > 500.0f) {
+                    reset106();
+                    break;
                 }
             }
             /* Give up if the player breaks away for good. */
@@ -4087,6 +4109,20 @@ static void update096(void) {
             float o[3] = { npc096Pos[0], npc096Pos[1] + 250.0f, npc096Pos[2] };
             float hy;
             if (rayDownWorld(o, 600.0f, &hy)) npc096Pos[1] = hy;
+            /* It smashes shut doors out of its way (source force-opens +
+             * locks the door in its path with a slam + big shake). */
+            for (uint32_t di = 0; di < doors.count; di++) {
+                Door *dr = &doors.items[di];
+                if (dr->open || dr->openState > 1.0f) continue;
+                float ex = dr->x - npc096Pos[0], ez = dr->z - npc096Pos[2];
+                if (ex * ex + ez * ez < 300.0f * 300.0f) {
+                    dr->open = 1;
+                    if (dist < 2048.0f) camShake = 3.0f;
+                    audioPlay3D(sndDoorOpen[rand() % 3], npc096Pos, camPos,
+                                camYaw, 2500.0f);
+                    break;
+                }
+            }
             /* The dread-zoom pulses while it bears down (me\CurrCameraZoom,
              * Sin(MilliSec/20)*10). */
             if (dist < 3000.0f) {
@@ -4505,10 +4541,14 @@ static void update966(void) {
      * and unwatched, and eases when rested or watched through the
      * goggles (source: me\Stamina < 10 raises n\State3 toward attack). */
     int seen = wearNVG != 0;
+    /* A sealed head - gas mask or hazmat - or SCP-714 dulls the sleep
+     * pull (source I_966\HasInsomnia is halved by 714 and blocked by a
+     * mask/hazmat), so it rouses far slower. */
+    int shielded = wearGasMask || wearHazmat || using714;
     if (!seen && stamina < 15.0f) {
-        npc966Drowsy += 1.0f;
+        npc966Drowsy += shielded ? 0.35f : 1.0f;
     } else if (npc966Drowsy > 0.0f) {
-        npc966Drowsy -= 0.2f;
+        npc966Drowsy -= shielded ? 0.5f : 0.2f;
     }
     int aggro = npc966Drowsy > 300.0f;
 
@@ -4528,9 +4568,11 @@ static void update966(void) {
     /* Near and unwatched, it steals your rest - draining sanity and
      * blurring the view - but it never touches your stamina. */
     if (dist < 900.0f && !seen) {
-        sanity -= 0.12f;
+        sanity -= shielded ? 0.04f : 0.12f;
         if (sanity < 0.0f) sanity = 0.0f;
-        if (blurAmount < 0.3f) blurAmount = 0.3f;
+        if (blurAmount < (shielded ? 0.15f : 0.3f)) {
+            blurAmount = shielded ? 0.15f : 0.3f;
+        }
         if (aggro && (int)npc966Drowsy % 360 == 0) {
             snprintf(toastMsg, sizeof(toastMsg),
                      "YOUR EYELIDS ARE SO HEAVY...");
@@ -4595,6 +4637,19 @@ static void enterMaskDimension(void) {
         float a = (float)c * 1.5708f + 0.4f;
         mask1499Place(npc1499Count++, camPos[0] + cosf(a) * 750.0f,
                       camPos[2] + sinf(a) * 750.0f, 0, 0.0f);
+    }
+    /* Re-entry ambush: the dimension tires of visitors - every third
+     * donning, the citizens ring the arrival point already hostile
+     * (source: EventState2 hits Rand(2,3)/4 and spawns a State-2 ring). */
+    maskEntries++;
+    if (maskEntries % 3 == 0) {
+        for (int k = 0; k < npc1499Count; k++) {
+            if (npc1499Type[k] == 0) {
+                npc1499Aggro[k] = 1;
+                npc1499Frame[k] = (k & 1) ? 100.0f : 1.0f;
+            }
+        }
+        audioPlay(snd1499Trig, 1.0f, 0.0f);
     }
     audioPlay(snd1499Enter, 1.0f, 0.0f);
 }
@@ -4786,6 +4841,20 @@ static void update860(void) {
         float vx = sinf(camYaw), vz = -cosf(camYaw);
         float facing = dist > 1.0f ? (-dx * vx - dz * vz) / dist : 1.0f;
         if (facing > 0.4f) seen = 1;
+        /* A tree between the player and it hides it (the source's
+         * peek-from-behind-the-trees): project each trunk onto the
+         * sightline and block if it straddles the segment closely. */
+        if (seen && dist > 1.0f) {
+            float lx = -dx / dist, lz = -dz / dist; /* player -> 860 */
+            for (int t = 0; t < tree860Count; t++) {
+                float tx = tree860Pos[t][0] - camPos[0];
+                float tz = tree860Pos[t][2] - camPos[2];
+                float proj = tx * lx + tz * lz;
+                if (proj < 100.0f || proj > dist - 100.0f) continue;
+                float perp2 = (tx * tx + tz * tz) - proj * proj;
+                if (perp2 < 150.0f * 150.0f) { seen = 0; break; }
+            }
+        }
     }
     if (npc860Cool > 0) npc860Cool--;
     if (seen) return; /* frozen while watched - safe */
