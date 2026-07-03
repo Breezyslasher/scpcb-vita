@@ -6,10 +6,10 @@
 
 /*
  * Loader for Blitz3D .b3d models (props, NPC meshes). Parses static
- * geometry — TEXS, BRUS and the NODE/MESH/VRTS/TRIS hierarchy — and
- * skips animation chunks (ANIM/KEYS/BONE) for now; those become
- * relevant when NPCs are ported. Spec: blitz-research/blitz3d
- * b3dfile_specs.txt.
+ * geometry — TEXS, BRUS and the NODE/MESH/VRTS/TRIS hierarchy — plus
+ * the animation chunks (ANIM header, per-node KEYS keyframes and BONE
+ * skin weights) used by render/skin.c for skeletal animation.
+ * Spec: blitz-research/blitz3d b3dfile_specs.txt.
  */
 
 #define B3D_MAX_BRUSH_TEXTURES 8
@@ -56,6 +56,23 @@ typedef struct {
     uint32_t triSetCount;
 } B3DMesh;
 
+/* One KEYS entry; flags say which channels this key carries (keys
+ * from different KEYS chunks of one node can carry different
+ * channels). */
+typedef struct {
+    int32_t frame;
+    int32_t flags;
+    float position[3];   /* flags & 1 */
+    float scale[3];      /* flags & 2 */
+    float rotation[4];   /* flags & 4, quaternion w,x,y,z */
+} B3DKey;
+
+/* BONE chunk entry: skin weight of one mesh vertex to this node. */
+typedef struct {
+    int32_t vertexId;
+    float weight;
+} B3DBoneWeight;
+
 typedef struct B3DNode {
     char *name;
     float position[3];
@@ -64,6 +81,13 @@ typedef struct B3DNode {
     B3DMesh *mesh;       /* NULL for pivots/bones */
     struct B3DNode **children;
     uint32_t childCount;
+    /* animation */
+    int isBone;
+    B3DBoneWeight *weights;
+    uint32_t weightCount;
+    B3DKey *keys;        /* frame-ordered */
+    uint32_t keyCount;
+    int32_t keyFlags;    /* union of the node's KEYS chunk flags */
 } B3DNode;
 
 typedef struct {
@@ -73,6 +97,8 @@ typedef struct {
     B3DBrush *brushes;
     uint32_t brushCount;
     B3DNode *root;       /* may be NULL for texture/brush-only files */
+    int32_t animFrames;  /* ANIM chunk; 0 = no animation */
+    float animFps;
 } B3DModel;
 
 B3DModel *b3dLoadMemory(const void *data, size_t size, char *err, size_t errLen);

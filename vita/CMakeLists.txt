@@ -24,6 +24,7 @@ add_executable(${PROJECT_NAME}
   src/formats/b3d.c
   src/formats/texture.c
   src/render/scene.c
+  src/render/skin.c
   src/game/collision.c
   src/game/mapgen.c
   src/game/doors.c

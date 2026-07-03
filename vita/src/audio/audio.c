@@ -51,7 +51,8 @@ typedef struct {
 
 typedef struct {
     int sound;           /* -1 = free */
-    uint32_t posFx;      /* fixed-point source frame position (16.16) */
+    uint64_t posFx;      /* fixed-point source frame position (48.16);
+                            32 bits overflowed after ~1.5 s of audio */
     uint32_t stepFx;     /* rate conversion step */
     float volL, volR;
     int loop;
@@ -192,7 +193,7 @@ static int mixerLoop(SceSize args, void *argp) {
             int si = ch->sound;
             if (si < 0 || si >= soundCount) continue;
             const Sound *s = &sounds[si];
-            uint32_t endFx = s->frames << 16;
+            uint64_t endFx = (uint64_t)s->frames << 16;
             for (int i = 0; i < GRAIN; i++) {
                 if (ch->posFx >= endFx) {
                     if (ch->loop && endFx > 0) {
@@ -202,9 +203,9 @@ static int mixerLoop(SceSize args, void *argp) {
                         break;
                     }
                 }
-                uint32_t f = ch->posFx >> 16;
+                uint32_t f = (uint32_t)(ch->posFx >> 16);
                 uint32_t f2 = f + 1 < s->frames ? f + 1 : f;
-                int32_t frac = ch->posFx & 0xFFFF;
+                int32_t frac = (int32_t)(ch->posFx & 0xFFFF);
                 int32_t l, r;
                 if (s->channels == 2) {
                     l = s->pcm[f * 2]
