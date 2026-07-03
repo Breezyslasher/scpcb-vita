@@ -1781,7 +1781,15 @@ static void drawBatchSet(const Scene *scene, const BatchGL *gl, int alphaPass) {
             glBindTexture(GL_TEXTURE_2D, lightmap);
             glTexCoordPointer(2, GL_FLOAT, sizeof(SceneVertex), VTX_OFF(lu));
             glEnable(GL_BLEND);
-            glBlendFunc(GL_ONE, GL_ONE);
+            /* The lightmap modulates the diffuse, it does not add to it.
+             * Source composites 2 * diffuse * (ambient + lightmap): the
+             * diffuse layer is TextureBlend 5 (multiply x2), so this
+             * second pass is a modulate2x - result = 2 * dst * src -
+             * darkening shadowed areas instead of washing them out the
+             * way a plain additive (GL_ONE, GL_ONE) pass did. The
+             * per-room AmbientLightRoomTex term the port lacks is dropped
+             * (a dim uniform add), leaving 2 * diffuse * lightmap. */
+            glBlendFunc(GL_DST_COLOR, GL_SRC_COLOR);
             glDrawElements(GL_TRIANGLES, (GLsizei)b->indexCount,
                            GL_UNSIGNED_SHORT, NULL);
             glDisable(GL_BLEND);

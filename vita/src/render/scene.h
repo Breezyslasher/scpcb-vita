@@ -13,8 +13,11 @@
  *
  * Layer semantics recovered from LoadRMesh() in Map_Core.bb:
  *   - texture slot j samples UV set (1 - j)  [TextureCoords(Tex[j], 1-j)]
- *   - a texture whose name contains "_lm" is a lightmap (additive,
- *     Blitz TextureBlend 3)
+ *   - a texture whose name contains "_lm" is the baked lightmap (slot 0);
+ *     it modulates the diffuse rather than adding to it. Source composites
+ *     2 * diffuse * (ambient + lightmap) - the diffuse layer is Blitz
+ *     TextureBlend 5 (multiply x2) - so the GL layer draws the lightmap as
+ *     a modulate2x pass, not additive.
  *   - layer flag 3 marks the surface alpha-clipped
  */
 
