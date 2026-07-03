@@ -1372,8 +1372,9 @@ static GLuint *skinIBOsFor(SkinnedMesh *skin) {
     return NULL;
 }
 
-static IntroHuman INTRO_HUMANS[8];
+static IntroHuman INTRO_HUMANS[12];
 static int introHumanCount;
+static int introDIdx[2] = { -1, -1 }; /* the chamber-front Class-Ds */
 
 /* The escort route from the cell block to the chamber gate, BFS'd
  * over the intro mesh floors (room-local raw units). */
@@ -1709,7 +1710,34 @@ static void introUpdate(void) {
                 toastTimer = 240;
             }
             break;
-        case 2: /* walk into the chamber */
+        case 2: /* the two Class-Ds are ordered in first, then the
+                 * player follows them through the gate */
+            for (int k = 0; k < 2; k++) {
+                if (introDIdx[k] < 0) continue;
+                IntroHuman *d = &INTRO_HUMANS[introDIdx[k]];
+                float tx = k == 0 ? 1450.0f : 1350.0f;
+                float tz = k == 0 ? 620.0f : 980.0f;
+                float ddx = tx - d->x, ddz = tz - d->z;
+                float dd = sqrtf(ddx * ddx + ddz * ddz);
+                if (dd > 24.0f) {
+                    d->x += ddx / dd * 3.6f;
+                    d->z += ddz / dd * 3.6f;
+                    d->yawDeg = -atan2f(ddx, ddz) * 180.0f / 3.14159265f;
+                    if (d->animStart != 39.0f) {
+                        /* Class-D walk cycle (the intro event's own
+                         * AnimateNPC 39-76). */
+                        d->animStart = 39.0f;
+                        d->animEnd = 76.0f;
+                        d->animSpeed = 0.55f;
+                        d->frame = 39.0f;
+                    }
+                } else if (d->animStart == 39.0f) {
+                    d->animStart = 357.0f;
+                    d->animEnd = 381.0f;
+                    d->animSpeed = 0.12f;
+                    d->frame = 357.0f;
+                }
+            }
             if (l[0] > 1100.0f) {
                 introPhase = 3;
                 introTimer = 0;
@@ -1773,13 +1801,13 @@ static void introPlaceHumans(void) {
     /* AnimateNPC idle loops: guard state 7 = 77..201 @0.2,
      * Class-D idle = 210..235 @0.1; the scientist sits at a fixed
      * frame like SetNPCFrame(182). */
-    IntroHuman defs[8] = {
-        /* Positions from UpdateIntro (block corridor floor y=0). The
-         * standing yaws face the cells like the original (the draw
-         * convention showed their backs before). Ulgrin waits right
-         * across from the player's cell door. The guard idle (77-201)
-         * is authored very subtle; it plays at 2x so the
-         * breathing/shift reads on a small screen. */
+    /* The roster matches UpdateIntro's CreateNPC list: Ulgrin and his
+     * partner at the cell, the radio guard, the neighboring inmate,
+     * the chamber balcony guard, Franklin and the scientist in the
+     * observation room, the two Class-Ds posted in front of SCP-173's
+     * chamber (they get sent in ahead of the player), and the south
+     * balcony group. Standing yaws face as the original does. */
+    IntroHuman defs[11] = {
         { &introGuardRT, -4130.0f, 0.0f, 830.0f, 0.0f,
           NULL, 1, NULL, 77, 201, 0.4f, 77 },                /* Ulgrin */
         { &introGuardRT, -3985.0f, 0.0f, 786.0f, 315.0f,
@@ -1794,10 +1822,16 @@ static void introPlaceHumans(void) {
           NULL, 1, "Franklin.png", 357, 381, 0.12f, 366 },
         { &introScientistRT, -3073.0f, -315.0f, -2165.0f, 225.0f,
           NULL, 1, "scientist.png", 182, 182, 0.0f, 182 },
-        { &introGuardRT, -4000.0f, 0.0f, 950.0f, 160.0f,
-          NULL, 1, NULL, 77, 201, 0.4f, 90 },
+        { &introClassDRT, 208.0f, 0.0f, 480.0f, 270.0f,
+          NULL, 1, NULL, 357, 381, 0.12f, 360 },   /* chamber D #1 */
+        { &introClassDRT, 160.0f, 0.0f, 320.0f, 270.0f,
+          NULL, 1, "class_d(2).png", 357, 381, 0.12f, 372 }, /* D #2 */
+        { &introGuardRT, -3800.0f, 250.0f, -4088.0f, 0.0f,
+          NULL, 1, NULL, 77, 201, 0.4f, 90 },      /* south balcony */
+        { &introGuardRT, -4200.0f, 250.0f, -4088.0f, 0.0f,
+          NULL, 1, NULL, 77, 201, 0.4f, 150 },
     };
-    for (int i = 0; i < 8; i++) {
+    for (int i = 0; i < 11; i++) {
         if (defs[i].rt == &introGuardRT) {
             defs[i].skin = skinGuard;
             defs[i].skinScale = skinGuardScale;
@@ -1808,15 +1842,18 @@ static void introPlaceHumans(void) {
     }
     /* Per-slot VBOs, created once and reused (the roster is fixed, so
      * slot i always maps to the same model). */
-    static GLuint slotVbo[8];
+    static GLuint slotVbo[12];
     introHumanCount = 0;
-    for (int i = 0; i < 8; i++) {
+    introDIdx[0] = introDIdx[1] = -1;
+    for (int i = 0; i < 11; i++) {
         if (!defs[i].skin && !defs[i].rt->ok) continue;
         if (defs[i].skin) {
             if (!slotVbo[i]) glGenBuffers(1, &slotVbo[i]);
             defs[i].vbo = slotVbo[i];
             defs[i].posed = 0;
         }
+        if (i == 7) introDIdx[0] = introHumanCount;
+        if (i == 8) introDIdx[1] = introHumanCount;
         INTRO_HUMANS[introHumanCount++] = defs[i];
     }
 }
