@@ -1022,6 +1022,10 @@ static int wearGasMask;
 static int wearNVG;                 /* 0 none, 1 normal, 2 fine */
 static int wear268;                 /* SCP-268: unseen by NPCs */
 static int wearVest;
+static int wearHazmat;              /* delays SCP-049's "cure" */
+static int using714;                /* SCP-714 jade ring: wards off 049 */
+static float rmHazmatTimer = 500.0f; /* 049 tearing the suit off */
+static float rm714Timer = 500.0f;    /* 049 forcing the ring off */
 static int radioChannel = -1;       /* -1 off, 0..3 = SCPRadio0-3 */
 static int currentMusicZone = -1;   /* per-zone music tracking */
 static int currentAmbienceId;       /* active room ambience emitter id */
@@ -1069,6 +1073,7 @@ static void spawn096(void);
 static void reset096(void);
 static void spawn049(void);
 static void reset049(void);
+static void removeInventoryByName(const char *name);
 
 static void regenerateMap(uint32_t seed) {
     memset(roomVisited, 0, sizeof(roomVisited));
@@ -1089,6 +1094,10 @@ static void regenerateMap(uint32_t seed) {
     wearNVG = 0;
     wear268 = 0;
     wearVest = 0;
+    wearHazmat = 0;
+    using714 = 0;
+    rmHazmatTimer = 500.0f;
+    rm714Timer = 500.0f;
     if (radioChannel >= 0) radioChannel = -1;
     for (uint32_t i = 0; i < tplList.count; i++) {
         templateUnload(&tplRT[i]);
@@ -3899,6 +3908,13 @@ static void update049(void) {
     float dz = camPos[2] - npc049Pos[2];
     float dist = sqrtf(dx * dx + dz * dz);
 
+    /* Away from it, the protective timers recover (source: both climb
+     * back to 500 while Dist >= 0.25). */
+    if (dist > 250.0f) {
+        if (rmHazmatTimer < 500.0f) rmHazmatTimer += 1.0f;
+        if (rm714Timer < 500.0f) rm714Timer += 1.0f;
+    }
+
     switch (npc049State) {
         case S049_IDLE:
             npc049Frame += 0.2f;
@@ -3915,7 +3931,37 @@ static void update049(void) {
             npc049Frame += 0.6f;
             if (npc049Frame > 463.0f) npc049Frame = 346.0f;
             if (dist < 200.0f) {
-                /* The doctor's "cure": instant death. */
+                /* It seizes the player. A hazmat suit or SCP-714 buys a
+                 * few seconds - and can be escaped - before the "cure";
+                 * once torn off (timer hits 0) the next grip is fatal
+                 * (source RemoveHazmatTimer / Remove714Timer). */
+                if (wearHazmat && rmHazmatTimer > 0.0f) {
+                    rmHazmatTimer -= 1.5f;
+                    camShake = 1.5f;
+                    if (rmHazmatTimer <= 0.0f) {
+                        wearHazmat = 0;
+                        removeInventoryByName("Hazmat Suit");
+                        snprintf(toastMsg, sizeof(toastMsg),
+                                 "SCP-049 TEARS YOUR HAZMAT SUIT APART");
+                        toastTimer = 200;
+                    }
+                    npc049Frame = 537.0f; /* leaning in */
+                    return;
+                }
+                if (using714 && rm714Timer > 0.0f) {
+                    rm714Timer -= 2.0f;
+                    blurAmount = 0.7f;
+                    if (rm714Timer <= 0.0f) {
+                        using714 = 0;
+                        removeInventoryByName("SCP-714");
+                        snprintf(toastMsg, sizeof(toastMsg),
+                                 "THE JADE RING IS WRENCHED FROM YOUR HAND");
+                        toastTimer = 200;
+                    }
+                    npc049Frame = 537.0f;
+                    return;
+                }
+                /* Unprotected (or protection exhausted): the cure. */
                 audioPlay(snd049Horror, 1.0f, 0.0f);
                 snprintf(deathCause, sizeof(deathCause), "SCP-049");
                 deathTimer = 180;
@@ -4581,6 +4627,15 @@ static void consumeSlot(int slot) {
     if (invSel >= (int)inventoryCount && invSel > 0) invSel--;
 }
 
+static void removeInventoryByName(const char *name) {
+    for (unsigned i = 0; i < inventoryCount; i++) {
+        if (strcmp(ITEM_TEMPLATES[inventory[i]].name, name) == 0) {
+            consumeSlot((int)i);
+            return;
+        }
+    }
+}
+
 static void radioSetChannel(int ch);
 
 /* Use/equip the selected inventory item (the game's right-click).
@@ -4658,6 +4713,11 @@ static const char *useInventoryItem(int slot) {
         return wearVest ? "YOU PUT ON THE BALLISTIC VEST"
                         : "YOU TAKE OFF THE BALLISTIC VEST";
     }
+    if (strcmp(name, "Hazmat Suit") == 0) {
+        wearHazmat = !wearHazmat;
+        return wearHazmat ? "YOU PUT ON THE HAZMAT SUIT"
+                          : "YOU TAKE OFF THE HAZMAT SUIT";
+    }
     if (strcmp(name, "Radio Transceiver") == 0) {
         radioSetChannel(radioChannel >= 3 ? -1 : radioChannel + 1);
         if (radioChannel < 0) return "YOU SWITCH OFF THE RADIO";
@@ -4685,7 +4745,9 @@ static const char *useInventoryItem(int slot) {
         return "SOMEONE'S WALLET. IT'S EMPTY";
     }
     if (strcmp(name, "SCP-714") == 0) {
-        return "THE JADE RING IS TOO SMALL FOR YOUR FINGERS";
+        using714 = !using714;
+        return using714 ? "YOU SLIP ON THE JADE RING. IT WARDS OFF SICKNESS"
+                        : "YOU TAKE OFF THE JADE RING";
     }
     return NULL;
 }
