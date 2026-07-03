@@ -2780,6 +2780,56 @@ static void draw173(const float viewPos[3]) {
     glPopMatrix();
 }
 
+/* A camera-facing (Y-up / cylindrical) textured sprite in the world,
+ * alpha-blended - the port's billboard primitive, e.g. the pocket
+ * dimension's throne of glowing eyes (CreateSprite). Called inside
+ * the 3D pass with the modelview already set to the camera. */
+static void drawBillboard(const float pos[3], float w, float h, GLuint tex,
+                          float alpha) {
+    if (!tex) return;
+    /* Right vector from the camera yaw; up is world +Y. */
+    float rx = cosf(camYaw), rz = sinf(camYaw);
+    float hw = w * 0.5f;
+    GLfloat verts[18] = {
+        pos[0] - rx * hw, pos[1],     pos[2] - rz * hw,
+        pos[0] + rx * hw, pos[1],     pos[2] + rz * hw,
+        pos[0] + rx * hw, pos[1] + h, pos[2] + rz * hw,
+        pos[0] - rx * hw, pos[1],     pos[2] - rz * hw,
+        pos[0] + rx * hw, pos[1] + h, pos[2] + rz * hw,
+        pos[0] - rx * hw, pos[1] + h, pos[2] - rz * hw,
+    };
+    GLfloat uvs[12] = { 0, 1, 1, 1, 1, 0, 0, 1, 1, 0, 0, 0 };
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
+    glDisableClientState(GL_COLOR_ARRAY);
+    glColor4f(1.0f, 1.0f, 1.0f, alpha);
+    glEnable(GL_TEXTURE_2D);
+    glBindTexture(GL_TEXTURE_2D, tex);
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    glDisable(GL_CULL_FACE);
+    glDepthMask(GL_FALSE);
+    glVertexPointer(3, GL_FLOAT, 0, verts);
+    glTexCoordPointer(2, GL_FLOAT, 0, uvs);
+    glDrawArrays(GL_TRIANGLES, 0, 6);
+    glDepthMask(GL_TRUE);
+    glDisable(GL_BLEND);
+    glColor4f(1, 1, 1, 1);
+    glEnableClientState(GL_COLOR_ARRAY);
+}
+
+/* The pocket dimension's throne of eyes, billboarded (positioned
+ * properly once the multi-mesh assembly lands in stage 3). */
+static GLuint pdThroneTex;
+static void drawPocketThrone(void) {
+    if (!inPocket || !pdThroneTex) return;
+    /* For now, across the start room; a pulsing glow. */
+    float t = sinf(pdCircle * 0.05f) * 0.15f + 0.7f;
+    float pos[3] = { PD_GX * ROOM_SPACING, 40.0f,
+                     PD_GY * ROOM_SPACING - 900.0f };
+    drawBillboard(pos, 600.0f, 600.0f, pdThroneTex, t);
+}
+
 static void draw106(const float viewPos[3]) {
     if (!npc106Active || !skin106 || npc106State == N106_DORMANT) return;
     float dx = npc106Pos[0] - viewPos[0], dz = npc106Pos[2] - viewPos[2];
@@ -5068,6 +5118,7 @@ int main(void) {
         loadHudTextures();
         loadMenuTextures();
         texButtonRed = textureGet("keypad_locked.png");
+        pdThroneTex = textureGet("scp_106_eyes.png");
         optionsLoad();
         mkdir(SAVES_DIR, 0777);
         if (audioInit()) {
@@ -5650,6 +5701,7 @@ int main(void) {
             drawItems(camPos);
             draw173(camPos);
             draw106(camPos);
+            drawPocketThrone();
             drawIntroHumans(camPos);
             glDisable(GL_CULL_FACE);
             for (int i = 0; i < activeCount; i++) {
