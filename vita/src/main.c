@@ -2371,7 +2371,6 @@ static int posed372;
 static int npc372Ok;            /* present in this map */
 static int npc372Idle;          /* 1 = hidden, 0 = flitting nearby */
 static float npc372Pos[3];
-static float npc372YawDeg;
 static float npc372Frame;
 static float npc372State;       /* remaining active duration */
 
