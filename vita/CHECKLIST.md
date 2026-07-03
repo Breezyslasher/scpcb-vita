@@ -14,7 +14,7 @@ Updated as features land. States: **done** / **partial** / **missing**.
 | Grid doors between rooms | done | Placement rules, dedup, keycard checkpoints |
 | Room-internal doors (FillRoom) | done | 257 extracted; types, locks, buttonless, keypad codes |
 | Runtime-expression doors | missing | ~30 CreateDoor calls with computed coordinates skipped by the extractor |
-| Elevators | missing | Elevator doors render but do not travel |
+| Elevators | done (adapted) | Riding an elevator (press its call button while at the car) closes the doors, blacks out for the ride with the Moving loop and Close/Open sounds, then teleports the player to the next elevator in the map and opens its doors. The source's cars run to Gate A/B and the maintenance tunnels, which aren't ported, so the port networks the in-map elevator doors into a fast-travel ride instead |
 | Levers, buttons w/ custom parents | partial | 31 levers + 30 standalone buttons render, flip/press with sound; the events they drive are not ported so they are cosmetic-interactive |
 | Decals | partial | CreateDecal ported: textured floor/wall quads (corrosive, blood, blood-drop, pd sets) in a ring buffer with grow/fade/lifetime, alpha/multiply/additive blends. SCP-106 wells up a corrosion pool on spawn and leaves a footfall trail; the player bleeds droplets. Not yet used for the full FillRoom decal scatter or door-surface corrosion |
 | Security cameras / particles / sprites | missing | Cosmetic layers of FillRoom |

@@ -598,6 +598,15 @@ static void appendIntroRoom(void) {
 #define MASK_GY 16
 static int maskRoomIdx = -1;
 static int maskEntries;       /* mask uses this run (re-entry ambush) */
+/* Elevators (Map_Core UpdateElevators). The source's cars run to Gate
+ * A/B and the maintenance tunnels, which aren't ported, so the port
+ * networks the in-map elevator doors: riding one carries the player to
+ * the next elevator with a doors-close / blackout ride / doors-open. */
+enum { ELEV_IDLE = 0, ELEV_CLOSE, ELEV_TRAVEL, ELEV_ARRIVE };
+static int elevState;
+static float elevTimer;
+static float elevDest[3];     /* arrival position */
+static int elevDoorA = -1, elevDoorB = -1; /* doors to open on arrival */
 static int inMask;            /* wearing SCP-1499, in its dimension */
 static float maskReturn[4];   /* pre-mask pos + yaw */
 #define MAX_1499 8
@@ -1176,6 +1185,7 @@ static void regenerateMap(uint32_t seed) {
     inPocket = 0;
     inMask = 0;
     maskEntries = 0;
+    elevState = ELEV_IDLE;
     npc1499Count = 0;
     pdLunging = 0;
     femurTimer = 0.0f;
@@ -1398,6 +1408,7 @@ static int npcAggressive = 0;
 #define SFX_DIR DATA_ROOT "/SFX"
 
 static int sndDoorOpen[3], sndDoorClose[3];
+static int sndElevOpen[3], sndElevClose[3], sndElevMove = -1;
 static int sndBigOpen[3], sndBigClose[3];
 static int sndStep[8], sndRun[7];
 static int sndStepMetal[8], sndRunMetal[8];
@@ -1424,7 +1435,12 @@ static void loadSounds(void) {
         sndBigOpen[i] = audioLoad(p);
         snprintf(p, sizeof(p), SFX_DIR "/Door/BigDoorClose%d.ogg", i);
         sndBigClose[i] = audioLoad(p);
+        snprintf(p, sizeof(p), SFX_DIR "/Door/ElevatorOpen%d.ogg", i);
+        sndElevOpen[i] = audioLoad(p);
+        snprintf(p, sizeof(p), SFX_DIR "/Door/ElevatorClose%d.ogg", i);
+        sndElevClose[i] = audioLoad(p);
     }
+    sndElevMove = audioLoad(SFX_DIR "/General/Elevator/Moving.ogg");
     for (int i = 0; i < 8; i++) {
         snprintf(p, sizeof(p), SFX_DIR "/Step/Step%d.ogg", i);
         sndStep[i] = audioLoad(p);
@@ -4887,6 +4903,76 @@ static void update860(void) {
     if (rayDownWorld(o, 600.0f, &hy)) npc860Pos[1] = hy;
 }
 
+/* ---- elevators ---- */
+
+/* Ride the elevator whose button was just pressed: pick the next
+ * elevator door in the map as the destination and start the sequence. */
+static void elevatorStart(const Door *d) {
+    if (elevState != ELEV_IDLE || d->type != 1) return;
+    int di = (int)(d - doors.items);
+    int dest = -1;
+    for (uint32_t off = 1; off <= doors.count; off++) {
+        int j = (int)(((uint32_t)di + off) % doors.count);
+        if (j != di && doors.items[j].type == 1) { dest = j; break; }
+    }
+    /* Arrival room: the cell the destination door sits in. With only one
+     * elevator the car just returns to this landing. */
+    const Door *dd = (dest >= 0) ? &doors.items[dest] : d;
+    int gx = (int)floorf(dd->x / ROOM_SPACING + 0.5f);
+    int gy = (int)floorf(dd->z / ROOM_SPACING + 0.5f);
+    elevDest[0] = gx * ROOM_SPACING;
+    elevDest[1] = camPos[1];
+    elevDest[2] = gy * ROOM_SPACING;
+    elevDoorA = di;
+    elevDoorB = (dest >= 0) ? dest : di;
+    doors.items[di].open = 0; /* shut for the ride */
+    elevState = ELEV_CLOSE;
+    elevTimer = 0.0f;
+    float dp[3] = { d->x, camPos[1], d->z };
+    audioPlay3D(sndElevClose[rand() % 3], dp, camPos, camYaw, 2500.0f);
+}
+
+static void updateElevator(void) {
+    if (elevState == ELEV_IDLE) return;
+    elevTimer += 1.0f;
+    /* Black out once the doors have shut, through the ride. */
+    if ((elevState == ELEV_CLOSE && elevTimer > 30.0f)
+        || elevState == ELEV_TRAVEL) {
+        blinkFrames = 30;
+    }
+    switch (elevState) {
+        case ELEV_CLOSE:
+            if (elevTimer > 90.0f) {
+                elevState = ELEV_TRAVEL;
+                elevTimer = 0.0f;
+                audioPlay(sndElevMove, 0.8f, 0.0f);
+            }
+            break;
+        case ELEV_TRAVEL:
+            if (elevTimer > 150.0f) {
+                camPos[0] = elevDest[0];
+                camPos[2] = elevDest[2];
+                float o[3] = { camPos[0], 1500.0f, camPos[2] };
+                float hy;
+                camPos[1] = (rayDownWorld(o, 3000.0f, &hy) ? hy : 0.0f)
+                          + EYE_HEIGHT;
+                velY = 0.0f;
+                if (elevDoorB >= 0 && elevDoorB < (int)doors.count) {
+                    doors.items[elevDoorB].open = 1;
+                }
+                audioPlay(sndElevOpen[rand() % 3], 0.9f, 0.0f);
+                elevState = ELEV_ARRIVE;
+                elevTimer = 0.0f;
+            }
+            break;
+        case ELEV_ARRIVE:
+            if (elevTimer > 30.0f) elevState = ELEV_IDLE; /* view fades in */
+            break;
+        default:
+            break;
+    }
+}
+
 /* ---- Tesla gates ---- */
 
 static void teslaSpawn(void) {
@@ -8064,17 +8150,27 @@ int main(void) {
                                      &pressed)) {
                 case DOOR_PRESS_TOGGLED:
                     if (pressed) {
-                        float dpos[3] = { pressed->x, camPos[1], pressed->z };
-                        int v = rand() % 3;
-                        int snd = pressed->heavy
-                                ? (pressed->open ? sndBigOpen[v]
-                                                 : sndBigClose[v])
-                                : (pressed->open ? sndDoorOpen[v]
-                                                 : sndDoorClose[v]);
                         audioPlay(pressed->keycard > 0
                                       ? sndKeycardUse[rand() % 2]
                                       : sndButton[rand() % 2], 0.9f, 0.0f);
-                        audioPlay3D(snd, dpos, camPos, camYaw, 2500.0f);
+                        /* An elevator call takes the ride, not a plain
+                         * open (only when the player is at that car). */
+                        float ed0 = camPos[0] - pressed->x;
+                        float ed2 = camPos[2] - pressed->z;
+                        if (pressed->type == 1 && elevState == ELEV_IDLE
+                            && ed0 * ed0 + ed2 * ed2 < 900.0f * 900.0f) {
+                            elevatorStart(pressed);
+                        } else {
+                            float dpos[3] = { pressed->x, camPos[1],
+                                              pressed->z };
+                            int v = rand() % 3;
+                            int snd = pressed->heavy
+                                    ? (pressed->open ? sndBigOpen[v]
+                                                     : sndBigClose[v])
+                                    : (pressed->open ? sndDoorOpen[v]
+                                                     : sndDoorClose[v]);
+                            audioPlay3D(snd, dpos, camPos, camYaw, 2500.0f);
+                        }
                     }
                     break;
                 case DOOR_PRESS_KEYCARD:
@@ -8121,6 +8217,7 @@ int main(void) {
             update966();
             update1499();
             update860();
+            updateElevator();
             introUpdate();
             if (introPhase < 0 && !inPocket) {
                 updateZoneMusic();
@@ -8207,10 +8304,12 @@ int main(void) {
         StickState look = inputLook();
         StickState move = inputMove();
         if (invOpen || pauseOpen || keypadOpen || deathTimer > 0
-            || introCameraLocked() || npc106State == N106_GRABBING) {
+            || introCameraLocked() || npc106State == N106_GRABBING
+            || elevState != ELEV_IDLE) {
             /* Freeze the camera and player while a menu is open, the
              * death screen is playing, the intro wake-up cinematic drives
-             * the camera, or SCP-106 has the player in its grab. */
+             * the camera, SCP-106 has the player in its grab, or an
+             * elevator ride is under way. */
             look.x = look.y = 0.0f;
             move.x = move.y = 0.0f;
         }
