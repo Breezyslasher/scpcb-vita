@@ -1077,6 +1077,7 @@ static void spawn049(void);
 static void reset049(void);
 static void spawn939(void);
 static void reset939(void);
+static void spawn966(void);
 static void removeInventoryByName(const char *name);
 
 static void regenerateMap(uint32_t seed) {
@@ -1121,6 +1122,7 @@ static void regenerateMap(uint32_t seed) {
         spawn096();
         spawn049();
         spawn939();
+        spawn966();
         eventRng = mapSeed ^ 0xA5A5F00Du;
         spawnItems();
         reset173();
@@ -1640,6 +1642,19 @@ static float npc939YawDeg;
 static float npc939Frame;
 static float npc939Cool;        /* bite cadence */
 
+/* ---- SCP-966: a sleep-stalker invisible to the naked eye - only the
+ * night-vision goggles reveal it. It creeps closer and saps the player's
+ * rest; exhausted and caught, it kills (UpdateNPCType966). ---- */
+static SkinnedMesh *skin966;
+static float skin966Scale = 1.0f;
+static GLuint vbo966;
+static int posed966;
+static int npc966Active;
+static float npc966Pos[3];
+static float npc966YawDeg;
+static float npc966Frame;
+static float npc966Drowsy;      /* insomnia buildup / aggression */
+
 static void buildHumanRT(ModelRT *rt, const char *model, const char *tex) {
     buildModelRT(rt, model, 0, 0, 0, tex);
     if (!rt->ok || !rt->scene) return;
@@ -1700,6 +1715,12 @@ static void buildNpcAssets(void) {
         if (skin939) {
             skinnedBounds(skin939, mn, mx);
             if (mx[1] > mn[1]) skin939Scale = 320.0f / (mx[1] - mn[1]);
+        }
+        B3DModel *m966 = propModelGet("scp_966.b3d");
+        skin966 = m966 ? skinnedCreate(m966) : NULL;
+        if (skin966) {
+            skinnedBounds(skin966, mn, mx);
+            if (mx[1] > mn[1]) skin966Scale = 300.0f / (mx[1] - mn[1]);
         }
     }
     buildHumanRT(&introScientistRT, "class_d.b3d", "scientist.png");
@@ -3079,6 +3100,7 @@ static void draw106(const float viewPos[3]);
 static void draw096(const float viewPos[3]);
 static void draw049(const float viewPos[3]);
 static void draw939(const float viewPos[3]);
+static void draw966(const float viewPos[3]);
 
 static void spawn106Near(void) {
     /* Behind the player, out of the cell if possible, on the floor. */
@@ -4231,6 +4253,94 @@ static void update939(void) {
     }
 }
 
+/* ---- SCP-966 ---- */
+
+static void spawn966(void) {
+    npc966Active = 0;
+    npc966Drowsy = 0.0f;
+    npc966Frame = 2.0f;
+    if (!skin966) return;
+    static const char *ROOMS[] = {
+        "room2_3_hcz", "room2_4_hcz", "room2_hcz", "room3_hcz",
+        "room3_2_hcz", "room4_hcz",
+    };
+    int best = -1;
+    for (uint32_t r = 0; r < map.roomCount && best < 0; r++) {
+        const char *nm = tplList.items[map.rooms[r].templateIndex].name;
+        for (unsigned s = 0; s < sizeof(ROOMS) / sizeof(ROOMS[0]); s++) {
+            if (strcmp(nm, ROOMS[s]) == 0) { best = (int)r; break; }
+        }
+    }
+    if (best < 0) {
+        for (uint32_t r = 0; r < map.roomCount && best < 0; r++) {
+            const char *nm = tplList.items[map.rooms[r].templateIndex].name;
+            if (strncmp(nm, "room2", 5) == 0
+                && (map.rooms[r].gridX * map.rooms[r].gridX
+                    + map.rooms[r].gridY * map.rooms[r].gridY) > 16) {
+                best = (int)r;
+            }
+        }
+    }
+    if (best < 0) return;
+    npc966Pos[0] = map.rooms[best].gridX * ROOM_SPACING;
+    npc966Pos[2] = map.rooms[best].gridY * ROOM_SPACING;
+    npc966Pos[1] = 0.0f;
+    npc966YawDeg = 0.0f;
+    npc966Active = 1;
+}
+
+/* UpdateNPCType966: unseen without night vision, it creeps toward the
+ * player and steals their rest (stamina/sanity). Exhausted and caught,
+ * it kills. The goggles are the counter - watched, it holds back. */
+static void update966(void) {
+    if (!npc966Active || !skin966 || deathTimer > 0 || !walkMode
+        || introPhase >= 0 || inPocket) {
+        return;
+    }
+    float dx = camPos[0] - npc966Pos[0];
+    float dz = camPos[2] - npc966Pos[2];
+    float dist = sqrtf(dx * dx + dz * dz);
+    npc966Frame += 0.2f;
+    if (npc966Frame > 214.0f) npc966Frame = 2.0f;
+
+    /* Watched through the goggles it hangs back; unseen it closes in. */
+    int seen = wearNVG != 0;
+    float speed = seen ? -6.0f : (npc966Drowsy > 300.0f ? 26.0f : 12.0f);
+    if (dist > 220.0f || speed < 0.0f) {
+        float d = dist > 1.0f ? dist : 1.0f;
+        npc966Pos[0] += dx / d * speed;
+        npc966Pos[2] += dz / d * speed;
+        npc966YawDeg = atan2f(dx, dz) * 180.0f / 3.14159265f;
+    }
+    float o[3] = { npc966Pos[0], npc966Pos[1] + 250.0f, npc966Pos[2] };
+    float hy;
+    if (rayDownWorld(o, 600.0f, &hy)) npc966Pos[1] = hy;
+
+    if (dist < 900.0f && !seen) {
+        /* Near and unwatched: it saps rest and sanity, building toward
+         * aggression; the view blurs with drowsiness. */
+        npc966Drowsy += 1.0f;
+        stamina -= 0.5f;
+        if (stamina < 0.0f) stamina = 0.0f;
+        sanity -= 0.12f;
+        if (sanity < 0.0f) sanity = 0.0f;
+        if (blurAmount < 0.3f) blurAmount = 0.3f;
+        if (npc966Drowsy > 60.0f
+            && (int)npc966Drowsy % 360 == 0) {
+            snprintf(toastMsg, sizeof(toastMsg),
+                     "YOUR EYELIDS ARE SO HEAVY...");
+            toastTimer = 150;
+        }
+    } else if (npc966Drowsy > 0.0f) {
+        npc966Drowsy -= 0.5f; /* rest recovers when it is far or watched */
+    }
+    /* Caught while exhausted: it takes you in your sleep. */
+    if (dist < 220.0f && !seen && (stamina < 5.0f || npc966Drowsy > 500.0f)) {
+        snprintf(deathCause, sizeof(deathCause), "SCP-966");
+        deathTimer = 180;
+    }
+}
+
 /* ---- Tesla gates ---- */
 
 static void teslaSpawn(void) {
@@ -4697,6 +4807,29 @@ static void draw939(const float viewPos[3]) {
     }
     drawSkinnedAt(skin939, vbo939, ibos, skin939Scale, npc939Pos,
                   npc939YawDeg);
+}
+
+static void draw966(const float viewPos[3]) {
+    /* Only the night-vision goggles reveal it. */
+    if (!npc966Active || !skin966 || !wearNVG) return;
+    float dx = npc966Pos[0] - viewPos[0], dz = npc966Pos[2] - viewPos[2];
+    if (dx * dx + dz * dz > VIEW_RANGE * VIEW_RANGE) return;
+    GLuint *ibos = skinIBOsFor(skin966);
+    if (!ibos) return;
+    if (!vbo966) glGenBuffers(1, &vbo966);
+    static int poseTick;
+    if (!posed966 || ((poseTick++) & 1) == 0) {
+        skinnedEval(skin966, npc966Frame);
+        uint32_t vc;
+        const SceneVertex *v = skinnedVertices(skin966, &vc);
+        glBindBuffer(GL_ARRAY_BUFFER, vbo966);
+        glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)(vc * sizeof(SceneVertex)),
+                     v, GL_DYNAMIC_DRAW);
+        glBindBuffer(GL_ARRAY_BUFFER, 0);
+        posed966 = 1;
+    }
+    drawSkinnedAt(skin966, vbo966, ibos, skin966Scale, npc966Pos,
+                  npc966YawDeg);
 }
 
 /* ---------------- items and inventory ---------------- */
@@ -7361,6 +7494,7 @@ int main(void) {
             update049();
             update0492();
             update939();
+            update966();
             introUpdate();
             if (introPhase < 0 && !inPocket) {
                 updateZoneMusic();
@@ -7429,6 +7563,7 @@ int main(void) {
                 reset096();
                 reset049();
                 reset939();
+                npc966Drowsy = 0.0f;
                 health = 100.0f;
                 injuries = 0.0f;
                 bloodloss = 0.0f;
@@ -7639,6 +7774,7 @@ int main(void) {
             draw096(camPos);
             draw049(camPos);
             draw939(camPos);
+            draw966(camPos);
             drawArm682();
             drawTeslaArcs(camPos);
             drawPocketPillars();
