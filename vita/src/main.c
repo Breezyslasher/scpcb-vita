@@ -1250,6 +1250,7 @@ static void update173(void) {
 
 static void gameMusicStart(void);
 static void introPlaceHumans(void);
+static int itemTplFind(const char *name);
 
 static int sndIntroAttention = -1, sndIntroExitCell = -1;
 static int sndIntroEscort = -1, sndIntroDone = -1;
@@ -1257,6 +1258,16 @@ static int sndIntroOff = -1, sndIntroVent = -1, sndIntroHorror = -1;
 static int sndIntroBreach = -1;
 static int sndEscortRefuse = -1, sndEscortPissed = -1, sndEscortKill = -1;
 static int sndGunshot[2] = { -1, -1 };
+static int sndEw[2] = { -1, -1 };
+static int sndSee173 = -1, sndWhatThe = -1, sndGasp = -1;
+static int sndBang[3] = { -1, -1, -1 };
+static int sndCommotion[2] = { -1, -1 };
+static int sndScripted = -1;
+
+/* Wake-up cinematic: -1 = "PRESS ANY KEY TO WAKE UP" screen,
+ * 0..900 = eyes-opening camera sequence, >900 = done. */
+static int introCineT = -1;
+static int introDark;   /* chamber lights cut before the breach */
 
 typedef struct {
     ModelRT *rt;         /* static fallback */
@@ -1316,6 +1327,35 @@ static void introStart(void) {
                               "/Room/Intro/Guard/Ulgrin/EscortKill0.ogg");
     sndGunshot[0] = audioLoad(SFX_DIR "/Character/Gunshot0.ogg");
     sndGunshot[1] = audioLoad(SFX_DIR "/Character/Gunshot1.ogg");
+    sndEw[0] = audioLoad(SFX_DIR "/Room/Intro/Ew0.ogg");
+    sndEw[1] = audioLoad(SFX_DIR "/Room/Intro/Ew1.ogg");
+    sndSee173 = audioLoad(SFX_DIR "/Room/Intro/See173.ogg");
+    sndWhatThe = audioLoad(SFX_DIR "/Room/Intro/WhatThe0a.ogg");
+    sndGasp = audioLoad(SFX_DIR "/Room/Intro/ClassD/Gasp.ogg");
+    for (int i = 0; i < 3; i++) {
+        char bp[256];
+        snprintf(bp, sizeof(bp), SFX_DIR "/Room/Intro/Bang%d.ogg", i);
+        sndBang[i] = audioLoad(bp);
+    }
+    {
+        char cp[256];
+        int c = rand() % 14;
+        snprintf(cp, sizeof(cp),
+                 SFX_DIR "/Room/Intro/Commotion/Commotion%d.ogg", c);
+        sndCommotion[0] = audioLoad(cp);
+        snprintf(cp, sizeof(cp),
+                 SFX_DIR "/Room/Intro/Commotion/Commotion%d.ogg",
+                 (c + 7) % 14);
+        sndCommotion[1] = audioLoad(cp);
+        /* The chamber PA line is randomized like the game's
+         * LoadEventSound(Announcement + Rand(0,6)). */
+        snprintf(cp, sizeof(cp),
+                 SFX_DIR "/Room/Intro/IA/Scripted/Announcement%d.ogg",
+                 1 + rand() % 6);
+        sndScripted = audioLoad(cp);
+    }
+    introCineT = -1;
+    introDark = 0;
     escortWp = 0;
     escortWalking = 0;
     escortWarn = 0;
@@ -1484,12 +1524,54 @@ static void introUpdate(void) {
     }
 
     switch (introPhase) {
-        case 0: /* the PA wakes the block */
-            if (introTimer == 90) audioPlay(sndIntroAttention, 1.0f, 0.0f);
-            if (introTimer == 420) {
+        case 0: /* wake up, then the PA rouses the block */
+            if (introCineT < 0) {
+                /* Black screen until any button; the cinematic then
+                 * runs the original 15-second timeline. */
+                introTimer = 0;
+                if (inputHit(ACTION_INTERACT) || inputHit(ACTION_USE_ITEM)
+                    || inputHit(ACTION_CROUCH) || inputHit(ACTION_INVENTORY)
+                    || inputHit(ACTION_MENU)) {
+                    introCineT = 0;
+                }
+                break;
+            }
+            if (introCineT <= 900) {
+                /* Eyes opening on the cell ceiling: pitch eases from
+                 * -70 to level with a sinus wobble while the view
+                 * swings toward the door (UpdateIntro's camera). */
+                float t = introCineT / 60.0f; /* seconds */
+                float rise = t / 5.0f;
+                if (rise > 1.0f) rise = 1.0f;
+                float turn = (t - 10.0f) / 4.0f;
+                if (turn < 0.0f) turn = 0.0f;
+                if (turn > 1.0f) turn = 1.0f;
+                camPitch = ((-70.0f + 70.0f * rise)
+                            + sinf(t * 12.857f) * 5.0f * (1.0f - rise))
+                         * 3.14159265f / 180.0f;
+                camYaw = 3.14159265f * 0.5f + 3.14159265f * 0.5f * turn;
+                if (introCineT == 168) audioPlay(sndEw[0], 1.0f, 0.0f);
+                if (introCineT == 648) audioPlay(sndEw[1], 1.0f, 0.0f);
+                if (introCineT == 780) {
+                    audioPlay(sndStep[rand() % 8], 0.5f, 0.0f);
+                }
+                if (inputHit(ACTION_MENU)) introCineT = 900; /* skip */
+                introCineT++;
+                if (introCineT > 900) {
+                    introTimer = 0;
+                    camPitch = 0.0f;
+                    snprintf(toastMsg, sizeof(toastMsg),
+                             "CHECK YOUR INVENTORY FOR YOUR ORIENTATION"
+                             " LEAFLET");
+                    toastTimer = 300;
+                }
+                break;
+            }
+            if (introTimer == 120) audioPlay(sndIntroAttention, 1.0f, 0.0f);
+            if (introTimer == 480) {
                 audioPlay(sndIntroExitCell, 1.0f, 0.0f);
             }
-            if (introTimer == 540) {
+            if (introTimer == 600) {
                 introPhase = 1; /* cell door opens; route unlocks */
                 snprintf(toastMsg, sizeof(toastMsg),
                          "EXIT YOUR CELL AND FOLLOW THE CORRIDOR");
@@ -1515,14 +1597,33 @@ static void introUpdate(void) {
                 if (introGateDoor >= 0) doors.items[introGateDoor].open = 0;
             }
             break;
-        case 3: /* sealed in with the statue */
-            if (introTimer == 150) {
+        case 3: /* sealed in with the statue (UpdateIntro's chamber
+                 * timeline: PA orders, murmurs, lights cut, the vent,
+                 * panic, pounding, breach) */
+            if (introTimer == 60) audioPlay(sndScripted, 1.0f, 0.0f);
+            if (introTimer == 260) audioPlay(sndCommotion[0], 0.7f, 0.0f);
+            if (introTimer == 420) {
                 audioPlay(sndIntroOff, 1.0f, 0.0f);
                 audioStopMusic();
+                introDark = 1;
             }
-            if (introTimer == 300) audioPlay(sndIntroVent, 1.0f, 0.0f);
-            if (introTimer == 420) {
+            if (introTimer == 520) audioPlay(sndIntroVent, 1.0f, 0.0f);
+            if (introTimer == 610) {
+                audioPlay(sndWhatThe, 1.0f, 0.0f);
+                audioPlay(sndGasp, 0.9f, 0.0f);
+            }
+            if (introTimer == 700) {
                 audioPlay(sndIntroHorror, 1.0f, 0.0f);
+                audioPlay(sndSee173, 1.0f, 0.0f);
+            }
+            if (introTimer == 760) audioPlay(sndBang[0], 1.0f, 0.0f);
+            if (introTimer == 820) {
+                audioPlay(sndBang[1], 1.0f, 0.0f);
+                audioPlay(sndCommotion[1], 0.9f, 0.0f);
+            }
+            if (introTimer == 880) audioPlay(sndBang[2], 1.0f, 0.0f);
+            if (introTimer == 940) {
+                introDark = 0;
                 audioPlay(sndIntroBreach, 1.0f, 0.0f);
                 /* The breach: 173 is loose in the chamber, the gate
                  * reopens, and the player runs. */
@@ -3075,6 +3176,12 @@ static int startNewGame(void) {
     pauseOpen = 0;
     if (introEnabled) {
         introStart();
+        /* You wake with the orientation leaflet (the no-intro path
+         * hands it over on spawn instead). */
+        int leaf = itemTplFind("Class D Orientation Leaflet");
+        if (leaf >= 0 && inventoryCount < (unsigned)invSlotCap) {
+            inventory[inventoryCount++] = leaf;
+        }
     } else {
         introPhase = -1;
         gameMusicStart();
@@ -3566,6 +3673,11 @@ static void menuFrame(int *running) {
     }
 }
 
+/* Player control is held during the wake-up screen and cinematic. */
+static int introCameraLocked(void) {
+    return introPhase == 0 && introCineT <= 900;
+}
+
 /* Back to the main menu (boot, QUIT TO MENU, permadeath). */
 static void enterMenu(void) {
     gameState = 0;
@@ -3845,7 +3957,7 @@ int main(void) {
         /* pausedAtFrameStart: a Cross that activated a menu entry this
          * frame must not also interact with the world. */
         if (haveData && !invOpen && !pauseOpen && !pausedAtFrameStart
-            && inputHit(ACTION_INTERACT)) {
+            && !introCameraLocked() && inputHit(ACTION_INTERACT)) {
             int picked = itemPickupNearest(camPos);
             if (picked >= 0) {
                 snprintf(toastMsg, sizeof(toastMsg), "PICKED UP %s",
@@ -3932,9 +4044,10 @@ int main(void) {
 
         StickState look = inputLook();
         StickState move = inputMove();
-        if (invOpen || pauseOpen || deathTimer > 0) {
-            /* Freeze the camera and player while a menu is open or the
-             * death screen is playing. */
+        if (invOpen || pauseOpen || deathTimer > 0 || introCameraLocked()) {
+            /* Freeze the camera and player while a menu is open, the
+             * death screen is playing, or the intro wake-up cinematic
+             * drives the camera. */
             look.x = look.y = 0.0f;
             move.x = move.y = 0.0f;
         }
@@ -4191,6 +4304,23 @@ int main(void) {
             glPopMatrix();
         }
 
+        /* Chamber lights cut before the breach. */
+        if (introDark && deathTimer == 0) {
+            drawQuad(0, 0, SCREEN_W, SCREEN_H, 0, 0.0f, 0.0f, 0.0f, 0.6f);
+        }
+        /* The intro opens on a black screen until a button wakes the
+         * player up. */
+        if (introPhase == 0 && introCineT < 0) {
+            drawQuad(0, 0, SCREEN_W, SCREEN_H, 0, 0.0f, 0.0f, 0.0f, 1.0f);
+            glPushMatrix();
+            glScalef(2.0f, 2.0f, 1.0f);
+            glColor4f(0.75f, 0.75f, 0.75f, 1.0f);
+            drawText((SCREEN_W / 2.0f - 160.0f) / 2.0f,
+                     (SCREEN_H / 2.0f - 8.0f) / 2.0f,
+                     "PRESS ANY KEY TO WAKE UP");
+            glColor4f(1, 1, 1, 1);
+            glPopMatrix();
+        }
         /* Eyes closed: solid black, but never over an open menu. */
         if (blinkFrames > 0 && !invOpen && !pauseOpen) {
             drawQuad(0, 0, SCREEN_W, SCREEN_H, 0, 0.0f, 0.0f, 0.0f, 1.0f);
