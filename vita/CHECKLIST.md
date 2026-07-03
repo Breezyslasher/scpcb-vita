@@ -82,7 +82,7 @@ Updated as features land. States: **done** / **partial** / **missing**.
 | --- | --- | --- |
 | Intro sequence | done | Wake screen, bunk cinematic, PA/dialog beats, escort, chamber sequence, breach; simplified NPC theatrics |
 | Per-room events (Events_Core, ~100 events) | partial | Framework + 3 self-contained events (173 ambush appearance, the "trick" scare, distant 682 roar); the rest need the unported SCPs/systems |
-| Pocket dimension (dimension_106) | partial | Dragged in on 106 catch; SCP-106 orbits the start room then lunges (fatal); escape the exit before the collapse timer, sanity draining throughout. Start-room only - the source's 8-stage maze (moving-pillar room, throne billboard, trenches, labyrinth) needs sprite + animated-prop rendering the port lacks |
+| Pocket dimension (dimension_106) | partial | Dragged in on 106 catch; SCP-106 orbits the start room then lunges (fatal); escape the exit before the collapse timer, sanity draining throughout. Multi-mesh assembly ported: the eight dimension_106_2 tunnels ring the start room and the dimension_106_3 throne room + dimension_106_4 pillar room load at their FillRoom offsets (rendered + collided), with the throne-of-eyes billboard at its true throne-room spot. Still start-room-bound: the source's 8-state flow (teleporting the player between throne/trenches/labyrinth states) is stage 4 |
 | Endings (Gate A / Gate B) | missing | No gates; facility has no exit condition |
 | MTF sweep / announcements over time | missing | |
 | Tesla gates | missing | |

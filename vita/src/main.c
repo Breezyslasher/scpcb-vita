@@ -605,6 +605,127 @@ static int inPdBounds(float x, float z) {
         && z > oz - 600.0f && z < oz + 600.0f;
 }
 
+/* The pocket dimension's FillRoom sub-meshes (Rooms_Core r_dimension_106):
+ * dimension_106_2 copied eight times into a ring around the start room,
+ * plus dimension_106_3 (the throne room) and dimension_106_4 (the
+ * pillar room) set far along +z. Each unique mesh loads once; instances
+ * share it with their own offset + yaw, overlaid on the base
+ * dimension_106 room exactly like the intro cell overlays the intro
+ * room. Built once and kept for the session. */
+typedef struct {
+    Scene *scene;
+    BatchGL *gl;
+    CollisionWorld *col;
+} PdMesh;
+typedef struct {
+    int mesh;          /* index into pdMesh[] */
+    float off[3];      /* world offset from the PD origin */
+    float yawDeg;      /* Blitz yaw of the instance */
+} PdInstance;
+#define PD_MESH_MAX 3
+#define PD_INST_MAX 12
+static PdMesh pdMesh[PD_MESH_MAX];
+static int pdMeshCount;
+static PdInstance pdInst[PD_INST_MAX];
+static int pdInstCount;
+
+static int buildPocketMesh(const char *path) {
+    if (pdMeshCount >= PD_MESH_MAX) return -1;
+    char err[128];
+    RMesh *mesh = rmeshLoadFile(path, err, sizeof(err));
+    if (!mesh) return -1;
+    Scene *sc = sceneBuild(mesh);
+    if (!sc) { rmeshFree(mesh); return -1; }
+    CollisionWorld *col = collisionBuild(sc, mesh);
+    rmeshFree(mesh);
+    BatchGL *gl = (BatchGL *)calloc(sc->batchCount ? sc->batchCount : 1,
+                                    sizeof(BatchGL));
+    if (!gl) return -1;
+    for (uint32_t i = 0; i < sc->batchCount; i++) {
+        const SceneBatch *b = &sc->batches[i];
+        gl[i].diffuse = textureGet(b->diffuseName);
+        gl[i].lightmap = textureGet(b->lightmapName);
+        glGenBuffers(1, &gl[i].vbo);
+        glBindBuffer(GL_ARRAY_BUFFER, gl[i].vbo);
+        glBufferData(GL_ARRAY_BUFFER,
+                     (GLsizeiptr)(b->vertexCount * sizeof(SceneVertex)),
+                     b->vertices, GL_STATIC_DRAW);
+        glGenBuffers(1, &gl[i].ibo);
+        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, gl[i].ibo);
+        glBufferData(GL_ELEMENT_ARRAY_BUFFER,
+                     (GLsizeiptr)(b->indexCount * sizeof(uint16_t)),
+                     b->indices, GL_STATIC_DRAW);
+    }
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
+    int idx = pdMeshCount++;
+    pdMesh[idx].scene = sc;
+    pdMesh[idx].gl = gl;
+    pdMesh[idx].col = col;
+    return idx;
+}
+
+static void buildPocketComposite(void) {
+    if (pdMeshCount) return; /* built once, kept for the session */
+    int tun = buildPocketMesh(MAP_DIR "/dimension_106_2.rmesh");
+    int throne = buildPocketMesh(MAP_DIR "/dimension_106_3.rmesh");
+    int pillar = buildPocketMesh(MAP_DIR "/dimension_106_4.rmesh");
+    pdInstCount = 0;
+    /* Eight tunnels: Angle = (i-1)*45, offset Cos/Sin * 512 raw around
+     * the origin, RotateEntity yaw = Angle-90. */
+    if (tun >= 0) {
+        for (int k = 0; k < 8 && pdInstCount < PD_INST_MAX; k++) {
+            float ang = (float)k * 45.0f;
+            float a = ang * 3.14159265f / 180.0f;
+            PdInstance *in = &pdInst[pdInstCount++];
+            in->mesh = tun;
+            in->off[0] = cosf(a) * 512.0f;
+            in->off[1] = 0.0f;
+            in->off[2] = sinf(a) * 512.0f;
+            in->yawDeg = ang - 90.0f;
+        }
+    }
+    /* Throne room at r\z + 32 blitz (x256 = 8192 raw); pillar room at
+     * r\z + 64 (16384 raw). Both unrotated. */
+    if (throne >= 0 && pdInstCount < PD_INST_MAX) {
+        PdInstance *in = &pdInst[pdInstCount++];
+        in->mesh = throne;
+        in->off[0] = 0.0f; in->off[1] = 0.0f; in->off[2] = 8192.0f;
+        in->yawDeg = 0.0f;
+    }
+    if (pillar >= 0 && pdInstCount < PD_INST_MAX) {
+        PdInstance *in = &pdInst[pdInstCount++];
+        in->mesh = pillar;
+        in->off[0] = 0.0f; in->off[1] = 0.0f; in->off[2] = 16384.0f;
+        in->yawDeg = 0.0f;
+    }
+}
+
+/* World<->instance-local for a PD sub-mesh. The render path does
+ * glTranslate(PDorigin + off) then glRotatef(-yaw), i.e.
+ * world = R(-yaw) * local + T; these invert it for collision. */
+static void pdInstToLocal(const PdInstance *in, const float w[3],
+                          float l[3]) {
+    float ox = PD_GX * ROOM_SPACING, oz = PD_GY * ROOM_SPACING;
+    float dx = w[0] - (ox + in->off[0]);
+    float dz = w[2] - (oz + in->off[2]);
+    float a = in->yawDeg * 3.14159265f / 180.0f;
+    float c = cosf(a), s = sinf(a);
+    l[0] = c * dx + s * dz;
+    l[1] = w[1] - in->off[1];
+    l[2] = -s * dx + c * dz;
+}
+
+static void pdInstToWorld(const PdInstance *in, const float l[3],
+                          float w[3]) {
+    float ox = PD_GX * ROOM_SPACING, oz = PD_GY * ROOM_SPACING;
+    float a = in->yawDeg * 3.14159265f / 180.0f;
+    float c = cosf(a), s = sinf(a);
+    w[0] = c * l[0] - s * l[2] + ox + in->off[0];
+    w[1] = l[1] + in->off[1];
+    w[2] = s * l[0] + c * l[2] + oz + in->off[2];
+}
+
 static void appendPocketRoom(void) {
     pdRoomIdx = -1;
     int tplIdx = -1;
@@ -626,6 +747,7 @@ static void appendPocketRoom(void) {
     p->angle = 0;
     pdRoomIdx = (int)map.roomCount;
     map.roomCount++;
+    buildPocketComposite();
 }
 
 /* Active set: placements within one cell of the player. */
@@ -737,6 +859,19 @@ static void pushWorld(float pos[3], float radius, int *pushedUp) {
         }
         if (up && pushedUp) *pushedUp = 1;
     }
+    if (pdMeshCount && inPocket) {
+        for (int m = 0; m < pdInstCount; m++) {
+            const PdMesh *pm = &pdMesh[pdInst[m].mesh];
+            if (!pm->col) continue;
+            float local[3];
+            pdInstToLocal(&pdInst[m], pos, local);
+            int up = 0;
+            if (collisionSpherePush(pm->col, local, radius, &up)) {
+                pdInstToWorld(&pdInst[m], local, pos);
+            }
+            if (up && pushedUp) *pushedUp = 1;
+        }
+    }
     for (int i = 0; i < activeCount; i++) {
         const RoomPlacement *p = activeRooms[i];
         const CollisionWorld *col = tplRT[p->templateIndex].col;
@@ -761,6 +896,19 @@ static int rayDownWorld(const float origin[3], float maxDist, float *hitY) {
         if (collisionRayDown(introCellCol, local, maxDist, &y)) {
             best = y;
             hit = 1;
+        }
+    }
+    if (pdMeshCount && inPocket) {
+        for (int m = 0; m < pdInstCount; m++) {
+            const PdMesh *pm = &pdMesh[pdInst[m].mesh];
+            if (!pm->col) continue;
+            float local[3], y;
+            pdInstToLocal(&pdInst[m], origin, local);
+            if (collisionRayDown(pm->col, local, maxDist, &y)) {
+                float wl[3] = { local[0], y, local[2] }, wout[3];
+                pdInstToWorld(&pdInst[m], wl, wout);
+                if (wout[1] > best) { best = wout[1]; hit = 1; }
+            }
         }
     }
     for (int i = 0; i < activeCount; i++) {
@@ -2860,9 +3008,27 @@ static void drawBillboard(const float pos[3], float w, float h, GLuint tex,
     glEnableClientState(GL_COLOR_ARRAY);
 }
 
-/* The pocket dimension's throne of eyes, billboarded (positioned
- * properly once the multi-mesh assembly lands in stage 3). */
+/* The pocket dimension's throne of eyes, billboarded. */
 static GLuint pdThroneTex;
+
+/* The multi-mesh assembly: the eight tunnels ringing the start room
+ * plus the far throne and pillar rooms, each instance overlaid on the
+ * base dimension_106 room. Split into opaque/alpha passes to match the
+ * room batches. */
+static void drawPocketComposite(int alphaPass) {
+    if (!inPocket || !pdMeshCount) return;
+    float ox = PD_GX * ROOM_SPACING, oz = PD_GY * ROOM_SPACING;
+    for (int m = 0; m < pdInstCount; m++) {
+        const PdInstance *in = &pdInst[m];
+        const PdMesh *pm = &pdMesh[in->mesh];
+        glPushMatrix();
+        glTranslatef(ox + in->off[0], in->off[1], oz + in->off[2]);
+        glRotatef(-in->yawDeg, 0.0f, 1.0f, 0.0f);
+        drawBatchSet(pm->scene, pm->gl, alphaPass);
+        glPopMatrix();
+    }
+}
+
 static void drawPocketPillars(void) {
     if (!inPocket || !pdPillarsOn || !pdPillarRT.ok) return;
     float t = (5400.0f - pocketTimer) * 0.03f;
@@ -2877,11 +3043,13 @@ static void drawPocketPillars(void) {
 
 static void drawPocketThrone(void) {
     if (!inPocket || !pdThroneTex) return;
-    /* For now, across the start room; a pulsing glow. */
+    /* Throne of eyes at the head of the throne room (Objects[17]):
+     * dim_3 sits at z + 8192 raw, the sprite 2848 nearer and 1376 up
+     * (r\y + 1376*RoomScale, EntityZ(dim_3) - 2848*RoomScale). */
     float t = sinf(pdCircle * 0.05f) * 0.15f + 0.7f;
-    float pos[3] = { PD_GX * ROOM_SPACING, 40.0f,
-                     PD_GY * ROOM_SPACING - 900.0f };
-    drawBillboard(pos, 600.0f, 600.0f, pdThroneTex, t);
+    float pos[3] = { PD_GX * ROOM_SPACING, 1376.0f,
+                     PD_GY * ROOM_SPACING + 8192.0f - 2848.0f };
+    drawBillboard(pos, 900.0f, 900.0f, pdThroneTex, t);
 }
 
 static void draw106(const float viewPos[3]) {
@@ -5750,6 +5918,7 @@ int main(void) {
                 drawBatchSet(introCellScene, introCellGL, 0);
                 glPopMatrix();
             }
+            drawPocketComposite(0);
             drawDoors(camPos);
             drawFixtures(camPos);
             drawItems(camPos);
@@ -5769,6 +5938,7 @@ int main(void) {
                 drawBatchSet(introCellScene, introCellGL, 1);
                 glPopMatrix();
             }
+            drawPocketComposite(1);
         }
 
         char line1[320];
