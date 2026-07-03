@@ -606,10 +606,9 @@ static float npc1499Home[MAX_1499][3]; /* peaceful post / wander anchor */
 static int npc1499Type[MAX_1499];      /* 0 citizen 1 king-guard 2 king
                                           3 front-guard */
 static int npc1499Active[MAX_1499];
-static float npc1499Frame;    /* shared walk/idle phase */
-static float npc1499KingFrame; /* the king's own (seated) phase */
+static int npc1499Aggro[MAX_1499];     /* this member has turned hostile */
+static float npc1499Frame[MAX_1499];   /* per-member animation phase */
 static int npc1499Count;
-static int mask1499Roused;    /* the congregation has turned hostile */
 static int pdRoomIdx = -1;
 static int inPocket;          /* player is in the pocket dimension */
 static float pocketTimer;     /* frames until it collapses (death) */
@@ -637,6 +636,7 @@ static int snd096Trigger = -1, snd096Scream = -1;
 static int snd049Breath = -1, snd049Horror = -1;
 static int snd049Spot[3] = { -1, -1, -1 }, snd049Search[3] = { -1, -1, -1 };
 static int snd939Attack[3] = { -1, -1, -1 }, snd939Horror = -1;
+static int snd939Lure[3] = { -1, -1, -1 };
 static int snd1499Enter = -1, snd1499Exit = -1, snd1499Trig = -1;
 static int snd1499Idle[4] = { -1, -1, -1, -1 };
 
@@ -1443,6 +1443,8 @@ static void loadSounds(void) {
         char p[128];
         snprintf(p, sizeof(p), SFX_DIR "/SCP/939/0Attack%d.ogg", i);
         snd939Attack[i] = audioLoad(p);
+        snprintf(p, sizeof(p), SFX_DIR "/SCP/939/0Lure%d.ogg", i);
+        snd939Lure[i] = audioLoad(p);
     }
     snd1499Enter = audioLoad(SFX_DIR "/SCP/1499/Enter.ogg");
     snd1499Exit = audioLoad(SFX_DIR "/SCP/1499/Exit.ogg");
@@ -4266,6 +4268,11 @@ static void update939(void) {
         case S939_PATROL:
             npc939Frame += 0.15f;
             if (npc939Frame > 405.0f) npc939Frame = 290.0f;
+            /* It mimics human voices to draw the curious closer. */
+            if (dist < 3500.0f && rand() % 900 == 0) {
+                audioPlay3D(snd939Lure[rand() % 3], npc939Pos, camPos,
+                            camYaw, 3500.0f);
+            }
             if (knows) {
                 npc939State = S939_ALERT;
                 npc939Frame = 175.0f;
@@ -4428,6 +4435,8 @@ static void mask1499Place(int k, float x, float z, int type, float yaw) {
     npc1499Home[k][2] = npc1499Pos[k][2];
     npc1499Type[k] = type;
     npc1499Yaw[k] = yaw;
+    npc1499Aggro[k] = 0;
+    npc1499Frame[k] = type == 2 ? 509.0f : 296.0f;
     npc1499Active[k] = 1;
 }
 
@@ -4448,11 +4457,8 @@ static void enterMaskDimension(void) {
     camPitch = 0.0f;
     velY = 0.0f;
     inMask = 1;
-    mask1499Roused = 0;
     blinkFrames = 20;
     blinkTimer = 100.0f;
-    npc1499Frame = 296.0f;
-    npc1499KingFrame = 509.0f;
     npc1499Count = 0;
     /* The congregation, at the source's church coordinates: the king on
      * the altar, a guard beside him, two guards at the entrance. */
@@ -4471,7 +4477,6 @@ static void enterMaskDimension(void) {
 
 static void leaveMaskDimension(void) {
     inMask = 0;
-    mask1499Roused = 0;
     npc1499Count = 0;
     for (int k = 0; k < MAX_1499; k++) npc1499Active[k] = 0;
     camPos[0] = maskReturn[0];
@@ -4484,69 +4489,86 @@ static void leaveMaskDimension(void) {
     audioPlay(snd1499Exit, 1.0f, 0.0f);
 }
 
-/* The congregation starts peaceful - the king enthroned, guards on post,
- * citizens milling and murmuring - until the player strays too near one
- * of them; then the whole church turns and converges (the king watches
- * from the altar). Contact kills; sanity bleeds throughout. Taking the
- * mask off (the item toggle) is the escape. */
-static void update1499(void) {
-    if (!inMask || deathTimer > 0) return;
-    /* Shared phase: idle shuffle when calm, a run cycle when roused; the
-     * king keeps his own seated animation. */
-    if (mask1499Roused) {
-        npc1499Frame += 0.7f;
-        if (npc1499Frame > 62.0f) npc1499Frame = 1.0f;
-    } else {
-        npc1499Frame += 0.25f;
-        if (npc1499Frame > 320.0f) npc1499Frame = 296.0f;
-    }
-    npc1499KingFrame += 0.15f;
-    if (npc1499KingFrame > 601.0f) npc1499KingFrame = 509.0f;
-
-    /* Straying near any member rouses the whole congregation (source: a
-     * citizen screams and flips the rest to State 1). */
-    if (!mask1499Roused) {
-        for (int k = 0; k < npc1499Count; k++) {
-            if (!npc1499Active[k]) continue;
-            float dx = camPos[0] - npc1499Pos[k][0];
-            float dz = camPos[2] - npc1499Pos[k][2];
-            float thr = npc1499Type[k] == 0 ? 650.0f : 480.0f;
-            if (dx * dx + dz * dz < thr * thr) {
-                mask1499Roused = 1;
-                audioPlay(snd1499Trig, 1.0f, 0.0f);
-                break;
+/* Rouse a member: it screams and, if a citizen, its cry flips the
+ * nearby citizens too (source: a screaming citizen sets every other
+ * PrevState-0 member to State 1). */
+static void mask1499Rouse(int k) {
+    if (npc1499Aggro[k]) return;
+    npc1499Aggro[k] = 1;
+    npc1499Frame[k] = (k & 1) ? 100.0f : 1.0f;
+    audioPlay3D(snd1499Trig, npc1499Pos[k], camPos, camYaw, 4000.0f);
+    if (npc1499Type[k] == 0) {
+        for (int j = 0; j < npc1499Count; j++) {
+            if (j == k || !npc1499Active[j] || npc1499Type[j] != 0) continue;
+            float ex = npc1499Pos[j][0] - npc1499Pos[k][0];
+            float ez = npc1499Pos[j][2] - npc1499Pos[k][2];
+            if (ex * ex + ez * ez < 1600.0f * 1600.0f && !npc1499Aggro[j]) {
+                npc1499Aggro[j] = 1;
+                npc1499Frame[j] = (j & 1) ? 100.0f : 1.0f;
             }
         }
     }
+}
 
+/* The congregation starts peaceful - the king enthroned, guards on post,
+ * citizens milling and murmuring - and each member turns on its own when
+ * the player strays too near (a citizen's scream cascades to its
+ * neighbours). Roused members converge and kill on contact; the king
+ * only watches from the altar. Sanity bleeds; the mask off is the escape. */
+static void update1499(void) {
+    if (!inMask || deathTimer > 0) return;
+    int anyAggro = 0;
     for (int k = 0; k < npc1499Count; k++) {
         if (!npc1499Active[k]) continue;
         float dx = camPos[0] - npc1499Pos[k][0];
         float dz = camPos[2] - npc1499Pos[k][2];
         float d = sqrtf(dx * dx + dz * dz);
-        if (mask1499Roused) {
-            if (npc1499Type[k] == 2) {
-                /* The king does not leave the altar; he only watches. */
-                if (d > 1.0f) {
-                    npc1499Yaw[k] = atan2f(dx, dz) * 180.0f / 3.14159265f;
+        int type = npc1499Type[k];
+
+        /* Rouse when the player is within this member's tolerance. The
+         * king only stirs to a direct approach and never leaves the
+         * altar; guards hold a tight line; citizens spook widest. */
+        if (!npc1499Aggro[k]) {
+            float thr = type == 0 ? 650.0f : type == 2 ? 380.0f : 480.0f;
+            if (d < thr) mask1499Rouse(k);
+        }
+
+        if (npc1499Aggro[k]) {
+            anyAggro = 1;
+            npc1499Yaw[k] = d > 1.0f
+                          ? atan2f(dx, dz) * 180.0f / 3.14159265f
+                          : npc1499Yaw[k];
+            /* Run cycle (source alternates 1..62 / 100..167 by parity). */
+            npc1499Frame[k] += 0.7f;
+            if ((k & 1) == 0) {
+                if (npc1499Frame[k] > 62.0f) npc1499Frame[k] = 1.0f;
+            } else {
+                if (npc1499Frame[k] > 167.0f) npc1499Frame[k] = 100.0f;
+            }
+            if (type == 2) {
+                /* The king stays enthroned; he only glares. */
+            } else {
+                if (d < 200.0f) {
+                    snprintf(deathCause, sizeof(deathCause),
+                             "THE PEOPLE OF SCP-1499");
+                    deathTimer = 180;
+                    return;
                 }
-                continue;
+                float sp = (type == 1 || type == 3) ? 30.0f : 22.0f;
+                if (d > 1.0f) {
+                    npc1499Pos[k][0] += dx / d * sp;
+                    npc1499Pos[k][2] += dz / d * sp;
+                }
             }
-            if (d < 200.0f) {
-                snprintf(deathCause, sizeof(deathCause),
-                         "THE PEOPLE OF SCP-1499");
-                deathTimer = 180;
-                return;
-            }
-            float sp = (npc1499Type[k] == 1 || npc1499Type[k] == 3)
-                     ? 30.0f : 22.0f;  /* guards are quicker */
-            if (d > 1.0f) {
-                npc1499Pos[k][0] += dx / d * sp;
-                npc1499Pos[k][2] += dz / d * sp;
-                npc1499Yaw[k] = atan2f(dx, dz) * 180.0f / 3.14159265f;
-            }
-        } else if (npc1499Type[k] == 0) {
-            /* Citizens drift near their spot and occasionally murmur. */
+        } else if (type == 2) {
+            /* The king: seated idle (509..601), watching. */
+            npc1499Frame[k] += 0.15f;
+            if (npc1499Frame[k] > 601.0f) npc1499Frame[k] = 509.0f;
+            if (d > 1.0f) npc1499Yaw[k] = atan2f(dx, dz) * 180.0f / 3.14159265f;
+        } else if (type == 0) {
+            /* Citizens shuffle-idle, drift near their spot and murmur. */
+            npc1499Frame[k] += 0.25f;
+            if (npc1499Frame[k] > 320.0f) npc1499Frame[k] = 296.0f;
             npc1499Pos[k][0] += sinf(gTick * 0.01f + (float)k) * 0.6f;
             npc1499Pos[k][2] += cosf(gTick * 0.013f + (float)k) * 0.6f;
             npc1499Pos[k][0] += (npc1499Home[k][0] - npc1499Pos[k][0]) * 0.01f;
@@ -4555,18 +4577,18 @@ static void update1499(void) {
                 audioPlay3D(snd1499Idle[rand() % 4], npc1499Pos[k], camPos,
                             camYaw, 3000.0f);
             }
-        } else if (d > 1.0f) {
-            /* Guards and king track the intruder without leaving post. */
-            npc1499Yaw[k] = atan2f(dx, dz) * 180.0f / 3.14159265f;
+        } else {
+            /* Guards on post: idle, tracking the intruder. */
+            npc1499Frame[k] += 0.2f;
+            if (npc1499Frame[k] > 320.0f) npc1499Frame[k] = 296.0f;
+            if (d > 1.0f) npc1499Yaw[k] = atan2f(dx, dz) * 180.0f / 3.14159265f;
         }
-        /* Settle onto the floor (the room finishes loading a frame or
-         * two after arrival, so this can only land once it is active).
-         * Ray from high above so the altar platform is found too. */
+        /* Settle onto the floor (ray from high so the altar is found). */
         float o[3] = { npc1499Pos[k][0], 3000.0f, npc1499Pos[k][2] };
         float hy;
         if (rayDownWorld(o, 6000.0f, &hy)) npc1499Pos[k][1] = hy;
     }
-    sanity -= mask1499Roused ? 0.15f : 0.05f;
+    sanity -= anyAggro ? 0.15f : 0.05f;
     if (sanity < 0.0f) sanity = 0.0f;
 }
 
@@ -5072,36 +5094,23 @@ static void draw1499(const float viewPos[3]) {
     GLuint *ibos = skinIBOsFor(skin1499);
     if (!ibos) return;
     if (!vbo1499) glGenBuffers(1, &vbo1499);
-    uint32_t vc;
-    /* The shared idle/run pose for the citizens and guards. */
-    skinnedEval(skin1499, npc1499Frame);
-    const SceneVertex *v = skinnedVertices(skin1499, &vc);
-    glBindBuffer(GL_ARRAY_BUFFER, vbo1499);
-    glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)(vc * sizeof(SceneVertex)),
-                 v, GL_DYNAMIC_DRAW);
-    glBindBuffer(GL_ARRAY_BUFFER, 0);
+    /* Each member has its own animation phase, so it is skinned per
+     * instance; the king wears his crowned texture. */
     for (int k = 0; k < npc1499Count; k++) {
-        if (!npc1499Active[k] || npc1499Type[k] == 2) continue;
+        if (!npc1499Active[k]) continue;
         float dx = npc1499Pos[k][0] - viewPos[0];
         float dz = npc1499Pos[k][2] - viewPos[2];
         if (dx * dx + dz * dz > VIEW_RANGE * VIEW_RANGE) continue;
-        drawSkinnedAt(skin1499, vbo1499, ibos, skin1499Scale, npc1499Pos[k],
-                      npc1499Yaw[k]);
-    }
-    /* The king: his own seated pose, in his crowned texture. */
-    for (int k = 0; k < npc1499Count; k++) {
-        if (!npc1499Active[k] || npc1499Type[k] != 2) continue;
-        float dx = npc1499Pos[k][0] - viewPos[0];
-        float dz = npc1499Pos[k][2] - viewPos[2];
-        if (dx * dx + dz * dz > VIEW_RANGE * VIEW_RANGE) continue;
-        skinnedEval(skin1499, npc1499KingFrame);
-        v = skinnedVertices(skin1499, &vc);
+        uint32_t vc;
+        skinnedEval(skin1499, npc1499Frame[k]);
+        const SceneVertex *v = skinnedVertices(skin1499, &vc);
         glBindBuffer(GL_ARRAY_BUFFER, vbo1499);
         glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)(vc * sizeof(SceneVertex)),
                      v, GL_DYNAMIC_DRAW);
         glBindBuffer(GL_ARRAY_BUFFER, 0);
         drawSkinnedAtTex(skin1499, vbo1499, ibos, skin1499Scale,
-                         npc1499Pos[k], npc1499Yaw[k], tex1499King);
+                         npc1499Pos[k], npc1499Yaw[k],
+                         npc1499Type[k] == 2 ? tex1499King : 0);
     }
 }
 
