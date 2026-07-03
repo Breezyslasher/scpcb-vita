@@ -1425,6 +1425,13 @@ static GLuint doorCorrTex, doorCorrHeavyTex;
 static ModelRT pdPillarRT;
 static float pdPillar[2][3];  /* world positions, updated per frame */
 static int pdPillarsOn;       /* active this frame */
+/* SCP-682's arm: at a roar's climax a huge reptilian arm smashes
+ * through and sweeps the room (Events_Core scp_682_arm), then retracts. */
+static ModelRT arm682RT;
+static int arm682Active;
+static float arm682Roll;      /* swing angle, 180 -> 360 */
+static float arm682Pos[3];
+static float arm682Yaw;
 static char toastMsg[128];
 static int toastTimer;
 
@@ -1527,6 +1534,8 @@ static void buildDoorAssets(void) {
         = 9.216f;
     buildModelRT(&pdPillarRT, "dimension_106_pillar.b3d", 0, 0, 0, NULL);
     pdPillarRT.scale[0] = pdPillarRT.scale[1] = pdPillarRT.scale[2] = 256.0f;
+    buildModelRT(&arm682RT, "scp_682_arm.b3d", 0, 0, 0, NULL);
+    arm682RT.scale[0] = arm682RT.scale[1] = arm682RT.scale[2] = 40.0f;
     doorCorrTex = textureGet("Door01_Corrosive.png");
     doorCorrHeavyTex = textureGet("containment_doors_Corrosive.png");
     teslaArcTex = textureGet("tesla_overlay.png");
@@ -1909,6 +1918,7 @@ static void navDir(float goalX, float goalZ, float *dirX, float *dirZ) {
  * for the self-contained events the facility can run without the
  * unported SCPs). Deterministic from the map seed so saves match. */
 static void spawnRoomEvents(void) {
+    arm682Active = 0;
     struct { const char *room; int ev; int pct; } TABLE[] = {
         { "room2c_gw_lcz", EV_173_APPEAR, 80 },
         { "room2_6_lcz",   EV_173_APPEAR, 90 },
@@ -2031,12 +2041,44 @@ static void updateRoomEvents(void) {
                 if (roomEventState[r] <= 60.0f) {
                     audioPlay(snd682Roar, 1.0f, 0.0f);
                     camShake = 3.0f;
+                    /* At the climax its arm bursts through and sweeps the
+                     * room (scp_682_arm), then retracts. */
+                    if (arm682RT.ok && !arm682Active && inRoom) {
+                        arm682Active = 1;
+                        arm682Roll = 180.0f;
+                        arm682Pos[0] = cx;
+                        arm682Pos[1] = 300.0f;
+                        arm682Pos[2] = cz;
+                        eventRng = eventRng * 1664525u + 1013904223u;
+                        arm682Yaw = (float)((eventRng >> 16) % 360u);
+                    }
                     roomEventId[r] = EV_NONE;
                 } else if (roomEventState[r] < 200.0f) {
                     camShake = 1.5f; /* rumble builds */
+                } else if (roomEventState[r] < 420.0f) {
+                    camShake = 0.6f; /* a low, distant tremor first */
                 }
             }
         }
+    }
+    /* Animate the arm's sweep: it rolls in through an arc, a glancing
+     * blow shoves and hurts the player mid-swing, then it retracts. */
+    if (arm682Active) {
+        arm682Roll += 5.0f;
+        camShake = 2.5f;
+        float dx = camPos[0] - arm682Pos[0], dz = camPos[2] - arm682Pos[2];
+        float d2 = dx * dx + dz * dz;
+        if (d2 < 800.0f * 800.0f && deathTimer == 0
+            && arm682Roll > 240.0f && arm682Roll < 300.0f) {
+            float b = sqrtf(d2);
+            if (b > 1.0f) {
+                camPos[0] += dx / b * 140.0f;
+                camPos[2] += dz / b * 140.0f;
+            }
+            injuries += 0.02f;
+            blurAmount = 0.6f;
+        }
+        if (arm682Roll >= 360.0f) arm682Active = 0;
     }
     if (camShake > 0.0f) camShake -= 0.05f;
 }
@@ -4264,6 +4306,16 @@ static void drawPocketPillars(void) {
         drawModelRT(&pdPillarRT);
         glPopMatrix();
     }
+}
+
+static void drawArm682(void) {
+    if (!arm682Active || !arm682RT.ok) return;
+    glPushMatrix();
+    glTranslatef(arm682Pos[0], arm682Pos[1], arm682Pos[2]);
+    glRotatef(-arm682Yaw, 0.0f, 1.0f, 0.0f);
+    glRotatef(arm682Roll, 0.0f, 0.0f, 1.0f);
+    drawModelRT(&arm682RT);
+    glPopMatrix();
 }
 
 static void drawPocketThrone(void) {
@@ -7412,6 +7464,7 @@ int main(void) {
             draw106(camPos);
             draw096(camPos);
             draw049(camPos);
+            drawArm682();
             drawTeslaArcs(camPos);
             drawPocketPillars();
             drawPocketThrone();
