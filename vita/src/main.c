@@ -617,6 +617,7 @@ static int sndPdEnter = -1, sndPdExit = -1, sndPdRumble = -1,
 static int snd096Trigger = -1, snd096Scream = -1;
 static int snd049Breath = -1, snd049Horror = -1;
 static int snd049Spot[3] = { -1, -1, -1 }, snd049Search[3] = { -1, -1, -1 };
+static int snd939Attack[3] = { -1, -1, -1 }, snd939Horror = -1;
 
 /* Tesla gates (Events_Core e_tesla): the room2_tesla_* corridors have
  * an electrified gate at their centre that idles, charges, zaps and
@@ -1031,6 +1032,7 @@ static int currentMusicZone = -1;   /* per-zone music tracking */
 static int currentAmbienceId;       /* active room ambience emitter id */
 static int blinkFrames;             /* >0 while eyes closed */
 static float stamina = 100.0f;      /* sprint resource */
+static float playerNoise;           /* 0..1 how loud the player is (SCP-939) */
 static int staminaBlocked;
 static char statusLine[256];
 
@@ -1073,6 +1075,8 @@ static void spawn096(void);
 static void reset096(void);
 static void spawn049(void);
 static void reset049(void);
+static void spawn939(void);
+static void reset939(void);
 static void removeInventoryByName(const char *name);
 
 static void regenerateMap(uint32_t seed) {
@@ -1116,6 +1120,7 @@ static void regenerateMap(uint32_t seed) {
         teslaSpawn();
         spawn096();
         spawn049();
+        spawn939();
         eventRng = mapSeed ^ 0xA5A5F00Du;
         spawnItems();
         reset173();
@@ -1384,6 +1389,12 @@ static void loadSounds(void) {
     snd096Scream = audioLoad(SFX_DIR "/SCP/096/Scream.ogg");
     snd049Breath = audioLoad(SFX_DIR "/SCP/049/Breath.ogg");
     snd049Horror = audioLoad(SFX_DIR "/SCP/049/Horror.ogg");
+    snd939Horror = audioLoad(SFX_DIR "/SCP/939/Horror.ogg");
+    for (int i = 0; i < 3; i++) {
+        char p[128];
+        snprintf(p, sizeof(p), SFX_DIR "/SCP/939/0Attack%d.ogg", i);
+        snd939Attack[i] = audioLoad(p);
+    }
     for (int i = 0; i < 3; i++) {
         char p[128];
         snprintf(p, sizeof(p), SFX_DIR "/SCP/049/Spotted%d.ogg", i);
@@ -1613,6 +1624,22 @@ static float npc0492Yaw[MAX_0492];
 static int npc0492Active[MAX_0492];
 static int npc0492Count;
 
+/* ---- SCP-939: a blind pack predator in room3_storage that hunts by
+ * sound - loud players draw it, a hushed crouch slips past. Bites hurt;
+ * enough bites kill (UpdateNPCType939). Frames: idle 290..405, walk
+ * 644..683, lunge 449..464, bite 18..68. ---- */
+static SkinnedMesh *skin939;
+static float skin939Scale = 1.0f;
+static GLuint vbo939;
+static int posed939;
+enum { S939_PATROL = 0, S939_ALERT, S939_ATTACK };
+static int npc939State;
+static int npc939Active;
+static float npc939Pos[3];
+static float npc939YawDeg;
+static float npc939Frame;
+static float npc939Cool;        /* bite cadence */
+
 static void buildHumanRT(ModelRT *rt, const char *model, const char *tex) {
     buildModelRT(rt, model, 0, 0, 0, tex);
     if (!rt->ok || !rt->scene) return;
@@ -1667,6 +1694,12 @@ static void buildNpcAssets(void) {
         if (skin0492) {
             skinnedBounds(skin0492, mn, mx);
             if (mx[1] > mn[1]) skin0492Scale = 285.0f / (mx[1] - mn[1]);
+        }
+        B3DModel *m939 = propModelGet("scp_939.b3d");
+        skin939 = m939 ? skinnedCreate(m939) : NULL;
+        if (skin939) {
+            skinnedBounds(skin939, mn, mx);
+            if (mx[1] > mn[1]) skin939Scale = 320.0f / (mx[1] - mn[1]);
         }
     }
     buildHumanRT(&introScientistRT, "class_d.b3d", "scientist.png");
@@ -3045,6 +3078,7 @@ static void decalsDraw(void) {
 static void draw106(const float viewPos[3]);
 static void draw096(const float viewPos[3]);
 static void draw049(const float viewPos[3]);
+static void draw939(const float viewPos[3]);
 
 static void spawn106Near(void) {
     /* Behind the player, out of the cell if possible, on the floor. */
@@ -4086,6 +4120,117 @@ static void update0492(void) {
     }
 }
 
+/* ---- SCP-939 ---- */
+
+static void reset939(void) {
+    npc939State = S939_PATROL;
+    npc939Frame = 290.0f;
+    npc939Cool = 0.0f;
+}
+
+static void spawn939(void) {
+    npc939Active = 0;
+    if (!skin939) return;
+    int best = -1;
+    for (uint32_t r = 0; r < map.roomCount; r++) {
+        if (strcmp(tplList.items[map.rooms[r].templateIndex].name,
+                   "room3_storage") == 0) { best = (int)r; break; }
+    }
+    if (best < 0) return;
+    npc939Pos[0] = map.rooms[best].gridX * ROOM_SPACING + 300.0f;
+    npc939Pos[2] = map.rooms[best].gridY * ROOM_SPACING + 300.0f;
+    npc939Pos[1] = 0.0f;
+    npc939YawDeg = 0.0f;
+    reset939();
+    npc939Active = 1;
+}
+
+/* UpdateNPCType939: blind, it locates the player by the noise they make
+ * (playerNoise). Loud + near -> it charges and bites; a still, crouched
+ * player barely registers. Enough bites kill. */
+static void update939(void) {
+    if (!npc939Active || !skin939 || deathTimer > 0 || !walkMode
+        || introPhase >= 0 || inPocket) {
+        return;
+    }
+    /* Only prowls its storage room. */
+    if (strcmp(roomNameAt(camPos), "room3_storage") != 0) {
+        npc939State = S939_PATROL;
+        return;
+    }
+    float dx = camPos[0] - npc939Pos[0];
+    float dz = camPos[2] - npc939Pos[2];
+    float dist = sqrtf(dx * dx + dz * dz);
+    if (npc939Cool > 0.0f) npc939Cool -= 1.0f;
+
+    /* Heard-range grows with the player's noise (SndVolume). */
+    float heard = 400.0f + playerNoise * 3200.0f;
+    int knows = dist < heard || dist < 500.0f;
+
+    switch (npc939State) {
+        case S939_PATROL:
+            npc939Frame += 0.15f;
+            if (npc939Frame > 405.0f) npc939Frame = 290.0f;
+            if (knows) {
+                npc939State = S939_ALERT;
+                npc939Frame = 175.0f;
+                audioPlay3D(snd939Attack[rand() % 3], npc939Pos, camPos,
+                            camYaw, 3000.0f);
+            }
+            break;
+        case S939_ALERT:
+            /* Orients and stalks toward the sound; escalates if still
+             * heard, relaxes if the player goes silent. */
+            npc939Frame += 0.4f;
+            if (npc939Frame > 297.0f) npc939Frame = 175.0f;
+            npc939YawDeg = atan2f(dx, dz) * 180.0f / 3.14159265f;
+            if (dist > 1.0f) {
+                npc939Pos[0] += dx / dist * 22.0f;
+                npc939Pos[2] += dz / dist * 22.0f;
+            }
+            if (dist < 900.0f && playerNoise > 0.2f) {
+                npc939State = S939_ATTACK;
+                npc939Frame = 449.0f;
+                audioPlay(snd939Horror, 1.0f, 0.0f);
+            } else if (!knows) {
+                npc939State = S939_PATROL;
+            }
+            break;
+        case S939_ATTACK: {
+            /* Charge and bite (source lunge 449..464, bite 18..68). */
+            npc939Frame += 0.7f;
+            if (npc939Frame > 464.0f) npc939Frame = 449.0f;
+            npc939YawDeg = atan2f(dx, dz) * 180.0f / 3.14159265f;
+            if (dist > 220.0f) {
+                npc939Pos[0] += dx / dist * 60.0f;
+                npc939Pos[2] += dz / dist * 60.0f;
+            } else if (npc939Cool <= 0.0f) {
+                /* A bite: injures; enough of them kill (Injuries > 4). */
+                injuries += 2.0f;
+                damageFlash = 0.7f;
+                camShake = 2.0f;
+                audioPlay(snd939Attack[rand() % 3], 1.0f, 0.0f);
+                npc939Cool = 45.0f;
+                if (injuries > 4.0f) {
+                    snprintf(deathCause, sizeof(deathCause), "SCP-939");
+                    deathTimer = 180;
+                    return;
+                }
+            }
+            float o[3] = { npc939Pos[0], npc939Pos[1] + 250.0f, npc939Pos[2] };
+            float hy;
+            if (rayDownWorld(o, 600.0f, &hy)) npc939Pos[1] = hy;
+            /* Lose interest if the player goes silent and backs off. */
+            if (dist > heard && dist > 1200.0f && playerNoise < 0.15f) {
+                npc939State = S939_ALERT;
+            }
+            break;
+        }
+        default:
+            break;
+    }
+}
+
 /* ---- Tesla gates ---- */
 
 static void teslaSpawn(void) {
@@ -4530,6 +4675,28 @@ static void draw049(const float viewPos[3]) {
                           npc0492Pos[z], npc0492Yaw[z]);
         }
     }
+}
+
+static void draw939(const float viewPos[3]) {
+    if (!npc939Active || !skin939) return;
+    float dx = npc939Pos[0] - viewPos[0], dz = npc939Pos[2] - viewPos[2];
+    if (dx * dx + dz * dz > VIEW_RANGE * VIEW_RANGE) return;
+    GLuint *ibos = skinIBOsFor(skin939);
+    if (!ibos) return;
+    if (!vbo939) glGenBuffers(1, &vbo939);
+    static int poseTick;
+    if (!posed939 || ((poseTick++) & 1) == 0) {
+        skinnedEval(skin939, npc939Frame);
+        uint32_t vc;
+        const SceneVertex *v = skinnedVertices(skin939, &vc);
+        glBindBuffer(GL_ARRAY_BUFFER, vbo939);
+        glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)(vc * sizeof(SceneVertex)),
+                     v, GL_DYNAMIC_DRAW);
+        glBindBuffer(GL_ARRAY_BUFFER, 0);
+        posed939 = 1;
+    }
+    drawSkinnedAt(skin939, vbo939, ibos, skin939Scale, npc939Pos,
+                  npc939YawDeg);
 }
 
 /* ---------------- items and inventory ---------------- */
@@ -7193,6 +7360,7 @@ int main(void) {
             update096();
             update049();
             update0492();
+            update939();
             introUpdate();
             if (introPhase < 0 && !inPocket) {
                 updateZoneMusic();
@@ -7260,6 +7428,7 @@ int main(void) {
                 npc173LastDist = 1e9f;
                 reset096();
                 reset049();
+                reset939();
                 health = 100.0f;
                 injuries = 0.0f;
                 bloodloss = 0.0f;
@@ -7335,6 +7504,11 @@ int main(void) {
             } else if (sprinting) {
                 speed *= SPRINT_MULT;
             }
+            /* How much noise the player is making (SCP-939 hunts by it):
+             * loud when sprinting, hushed crouch-walking, near-silent
+             * standing still. */
+            playerNoise = !moving ? (crouched ? 0.05f : 0.12f)
+                        : sprinting ? 1.0f : crouched ? 0.25f : 0.6f;
             float mvx = (fwdX * -move.y + cosf(camYaw) * move.x) * speed;
             float mvz = (fwdZ * -move.y + sinf(camYaw) * move.x) * speed;
             camPos[0] += mvx;
@@ -7464,6 +7638,7 @@ int main(void) {
             draw106(camPos);
             draw096(camPos);
             draw049(camPos);
+            draw939(camPos);
             drawArm682();
             drawTeslaArcs(camPos);
             drawPocketPillars();
