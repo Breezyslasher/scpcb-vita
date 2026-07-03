@@ -106,6 +106,13 @@ int templatesLoad(const char *iniPath, RoomTemplateList *out) {
         if (keyEq(key, "Mesh Path")) {
             free(cur->meshPath);
             cur->meshPath = strdup(val);
+            /* rooms.ini uses Windows separators; the port loads from a
+               POSIX/Vita filesystem (e.g. dimension1499\foo.rmesh). */
+            if (cur->meshPath) {
+                for (char *s = cur->meshPath; *s; s++) {
+                    if (*s == '\\') *s = '/';
+                }
+            }
         } else if (keyEq(key, "Shape")) {
             if (keyEq(val, "1")) cur->shape = SHAPE_ROOM1;
             else if (keyEq(val, "2")) cur->shape = SHAPE_ROOM2;
@@ -126,6 +133,10 @@ int templatesLoad(const char *iniPath, RoomTemplateList *out) {
             cur->zones[3] = atoi(val);
         } else if (keyEq(key, "Zone5")) {
             cur->zones[4] = atoi(val);
+        } else if (keyEq(key, "DisableDecals")) {
+            cur->disableDecals = atoi(val);
+            if (cur->disableDecals < 0) cur->disableDecals = 0;
+            if (cur->disableDecals > 3) cur->disableDecals = 3;
         }
     }
     fclose(f);

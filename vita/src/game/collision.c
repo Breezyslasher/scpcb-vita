@@ -322,3 +322,59 @@ int collisionRayDown(const CollisionWorld *w, const float origin[3],
     if (hit) *hitY = origin[1] - best;
     return hit;
 }
+
+int collisionRayHit(const CollisionWorld *w, const float origin[3],
+                    const float dirIn[3], float maxDist) {
+    if (w->triCount == 0) return 0;
+    float len = sqrtf(dirIn[0] * dirIn[0] + dirIn[1] * dirIn[1]
+                      + dirIn[2] * dirIn[2]);
+    if (len < 1e-9f) return 0;
+    float dir[3] = { dirIn[0] / len, dirIn[1] / len, dirIn[2] / len };
+
+    /* Amanatides-Woo voxel traversal over the uniform grid, testing the
+     * triangles in each cell the ray crosses until it hits or leaves. */
+    int cell[3] = { cellIndex(w, origin[0], 0), cellIndex(w, origin[1], 1),
+                    cellIndex(w, origin[2], 2) };
+    int step[3];
+    float tMax[3], tDelta[3];
+    for (int a = 0; a < 3; a++) {
+        float cs = w->cellSize[a];
+        if (cs <= 0.0f) cs = 1.0f;
+        if (dir[a] > 1e-9f) {
+            step[a] = 1;
+            tMax[a] = (w->min[a] + (cell[a] + 1) * cs - origin[a]) / dir[a];
+            tDelta[a] = cs / dir[a];
+        } else if (dir[a] < -1e-9f) {
+            step[a] = -1;
+            tMax[a] = (w->min[a] + cell[a] * cs - origin[a]) / dir[a];
+            tDelta[a] = -cs / dir[a];
+        } else {
+            step[a] = 0;
+            tMax[a] = 1e30f;
+            tDelta[a] = 1e30f;
+        }
+    }
+    float t = 0.0f;
+    for (int guard = 0; guard < GRID_DIM * 3 && t <= maxDist; guard++) {
+        if (cell[0] >= 0 && cell[0] < GRID_DIM && cell[1] >= 0
+            && cell[1] < GRID_DIM && cell[2] >= 0 && cell[2] < GRID_DIM) {
+            const Cell *c = &w->cells[cell[0]][cell[1]][cell[2]];
+            for (uint32_t k = 0; k < c->count; k++) {
+                float tt;
+                if (rayTri(origin, dir, &w->tris[c->tris[k]], &tt)
+                    && tt >= 0.0f && tt <= maxDist) {
+                    return 1;
+                }
+            }
+        }
+        int axis = 0;
+        if (tMax[1] < tMax[0]) axis = 1;
+        if (tMax[2] < tMax[axis]) axis = 2;
+        if (step[axis] == 0) break;
+        cell[axis] += step[axis];
+        t = tMax[axis];
+        tMax[axis] += tDelta[axis];
+        if (cell[axis] < 0 || cell[axis] >= GRID_DIM) break;
+    }
+    return 0;
+}

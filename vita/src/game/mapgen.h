@@ -31,6 +31,9 @@ typedef struct {
     int shape;
     int zones[5];       /* zone numbers this room may appear in (0 unused) */
     int commonness;     /* 0..100 */
+    int disableDecals;  /* 0..3: also gates SCP-106's spawn timer while
+                           the player is in the room (0 full speed, 1 half,
+                           2 quarter, 3 never) */
 } RoomTemplateInfo;
 
 typedef struct {
