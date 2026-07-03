@@ -580,6 +580,50 @@ static void appendIntroRoom(void) {
     buildIntroCell();
 }
 
+/* SCP-106's pocket dimension: a small off-grid room the player is
+ * dragged to when 106 catches them; escape by reaching the exit
+ * before the timer runs out. */
+#define PD_GX -16
+#define PD_GY -16
+static int pdRoomIdx = -1;
+static int inPocket;          /* player is in the pocket dimension */
+static float pocketTimer;     /* frames until it collapses (death) */
+static int npc106Contained;   /* femur breaker: 106 permanently stopped */
+static float femurTimer;      /* femur breaker sequence progress */
+static float pdReturn[4];     /* pre-catch pos + yaw to restore */
+static int sndPdEnter = -1, sndPdExit = -1, sndPdRumble = -1,
+           sndPdExplode = -1;
+
+static int inPdBounds(float x, float z) {
+    if (pdRoomIdx < 0) return 0;
+    float ox = PD_GX * ROOM_SPACING, oz = PD_GY * ROOM_SPACING;
+    return x > ox - 600.0f && x < ox + 600.0f
+        && z > oz - 600.0f && z < oz + 600.0f;
+}
+
+static void appendPocketRoom(void) {
+    pdRoomIdx = -1;
+    int tplIdx = -1;
+    for (uint32_t i = 0; i < tplList.count; i++) {
+        if (strcmp(tplList.items[i].name, "dimension_106") == 0) {
+            tplIdx = (int)i;
+            break;
+        }
+    }
+    if (tplIdx < 0) return;
+    RoomPlacement *grown = (RoomPlacement *)realloc(
+        map.rooms, (map.roomCount + 1) * sizeof(RoomPlacement));
+    if (!grown) return;
+    map.rooms = grown;
+    RoomPlacement *p = &map.rooms[map.roomCount];
+    p->templateIndex = tplIdx;
+    p->gridX = PD_GX;
+    p->gridY = PD_GY;
+    p->angle = 0;
+    pdRoomIdx = (int)map.roomCount;
+    map.roomCount++;
+}
+
 /* Active set: placements within one cell of the player. */
 static const RoomPlacement *activeRooms[16];
 static int activeCount;
@@ -807,11 +851,16 @@ static void spawnPlayer(void) {
 static void spawnRoomEvents(void);
 static void updateRoomEvents(void);
 static void reset106(void);
+static void enterPocketDimension(void);
+static void updatePocketDimension(void);
 
 static void regenerateMap(uint32_t seed) {
     memset(roomVisited, 0, sizeof(roomVisited));
     currentMusicZone = -1;
     currentAmbienceId = 0;
+    inPocket = 0;
+    femurTimer = 0.0f;
+    npc106Contained = 0;
     equippedNav = -1;
     navVisible = 1;
     health = 100.0f;
@@ -830,6 +879,7 @@ static void regenerateMap(uint32_t seed) {
     if (mapGenerate(&tplList, mapSeed, &map)) {
         generateAccessCodes(mapSeed);
         appendIntroRoom();
+        appendPocketRoom();
         doorsGenerate(&map, &tplList, mapSeed ^ 0x9E3779B9u, &doors);
         spawnRoomDoors();
         spawnRoomFixtures();
@@ -1022,6 +1072,7 @@ static int sndAmbience;
 static int sndRattle[3], sndNeckSnap[3], sndStoneDrag;
 static int snd106Corr[3], snd106Wall[3], snd106Decay[4];
 static int snd106Laugh, snd106Breath;
+static int sndFemur = -1;
 static int sndHorrorSpot[2], sndHorrorClose[5], sndDoor173;
 static float stepAccum;
 
@@ -1086,6 +1137,11 @@ static void loadSounds(void) {
     }
     snd106Laugh = audioLoad(SFX_DIR "/SCP/106/Laugh.ogg");
     snd106Breath = audioLoad(SFX_DIR "/SCP/106/Breathing.ogg");
+    sndFemur = audioLoad(SFX_DIR "/Room/106Chamber/FemurBreaker.ogg");
+    sndPdEnter = audioLoad(SFX_DIR "/Room/PocketDimension/Enter.ogg");
+    sndPdExit = audioLoad(SFX_DIR "/Room/PocketDimension/Exit.ogg");
+    sndPdRumble = audioLoad(SFX_DIR "/Room/PocketDimension/Rumble.ogg");
+    sndPdExplode = audioLoad(SFX_DIR "/Room/PocketDimension/Explosion.ogg");
     /* UpdateNPCType173: HorrorSFX[3..4] on spotting it, HorrorSFX
      * [1,2,9,10,12] on a very close encounter. */
     sndHorrorSpot[0] = audioLoad(SFX_DIR "/Horror/Horror3.ogg");
@@ -1390,6 +1446,7 @@ static void try173OpenDoor(void) {
  * gaps between rooms are void. */
 static int roomExistsAt(float x, float z) {
     if (inIntroBounds(x, z)) return 1;
+    if (inPdBounds(x, z)) return 1;
     int gx = (int)floorf(x / ROOM_SPACING + 0.5f);
     int gy = (int)floorf(z / ROOM_SPACING + 0.5f);
     for (uint32_t i = 0; i < map.roomCount; i++) {
@@ -1654,7 +1711,7 @@ static void updateRoomEvents(void) {
 }
 
 static void update173(void) {
-    if (!npc173Active || deathTimer > 0 || !walkMode) return;
+    if (!npc173Active || deathTimer > 0 || !walkMode || inPocket) return;
     float dx = camPos[0] - npc173Pos[0];
     float dz = camPos[2] - npc173Pos[2];
     float dist = sqrtf(dx * dx + dz * dz);
@@ -2469,7 +2526,7 @@ static void spawn106Near(void) {
 }
 
 static void reset106(void) {
-    npc106Active = skin106 != NULL;
+    npc106Active = skin106 != NULL && !npc106Contained;
     npc106State = N106_DORMANT;
     /* First appearance a while into the run (source idles ~22000+
      * frames; scaled down so it turns up within a session). */
@@ -2479,8 +2536,73 @@ static void reset106(void) {
     npc106Pos[1] = -5000.0f;
 }
 
+/* ---- pocket dimension escape ---- */
+static void enterPocketDimension(void) {
+    if (pdRoomIdx < 0) return;
+    pdReturn[0] = camPos[0];
+    pdReturn[1] = camPos[1];
+    pdReturn[2] = camPos[2];
+    pdReturn[3] = camYaw;
+    float ox = PD_GX * ROOM_SPACING, oz = PD_GY * ROOM_SPACING;
+    camPos[0] = ox - 400.0f;
+    camPos[2] = oz - 400.0f;
+    float o[3] = { camPos[0], 1500.0f, camPos[2] };
+    float hy;
+    camPos[1] = (rayDownWorld(o, 3000.0f, &hy) ? hy : 0.0f) + EYE_HEIGHT;
+    camYaw = 2.35f; /* face the far exit corner */
+    camPitch = 0.0f;
+    velY = 0.0f;
+    inPocket = 1;
+    pocketTimer = 5400.0f; /* ~90 s */
+    blinkFrames = 20;
+    blinkTimer = 100.0f;
+    audioPlay(sndPdEnter, 1.0f, 0.0f);
+    audioLoopAmbience(sndPdRumble, 0.6f);
+}
+
+static void leavePocketDimension(int escaped) {
+    inPocket = 0;
+    audioLoopAmbience(-1, 0.0f);
+    if (escaped) {
+        audioPlay(sndPdExit, 1.0f, 0.0f);
+        camPos[0] = pdReturn[0];
+        camPos[1] = pdReturn[1];
+        camPos[2] = pdReturn[2];
+        camYaw = pdReturn[3];
+        velY = 0.0f;
+        snprintf(toastMsg, sizeof(toastMsg), "YOU ESCAPED THE POCKET"
+                 " DIMENSION");
+        toastTimer = 240;
+        gameMusicStart();
+    } else {
+        audioPlay(sndPdExplode, 1.0f, 0.0f);
+        snprintf(deathCause, sizeof(deathCause), "THE POCKET DIMENSION");
+        deathTimer = 180;
+    }
+}
+
+static void updatePocketDimension(void) {
+    if (!inPocket || deathTimer > 0) return;
+    pocketTimer -= 1.0f;
+    if (pocketTimer <= 0.0f) {
+        leavePocketDimension(0);
+        return;
+    }
+    /* Exit at the far corner; reaching it escapes. */
+    float ex = PD_GX * ROOM_SPACING + 400.0f;
+    float ez = PD_GY * ROOM_SPACING + 400.0f;
+    float dx = camPos[0] - ex, dz = camPos[2] - ez;
+    if (dx * dx + dz * dz < 200.0f * 200.0f) {
+        leavePocketDimension(1);
+        return;
+    }
+    /* Fall out of the bottom: also collapses. */
+    if (camPos[1] < -4000.0f) leavePocketDimension(0);
+}
+
 static void update106(void) {
-    if (!npc106Active || deathTimer > 0 || !walkMode || introPhase >= 0) {
+    if (!npc106Active || deathTimer > 0 || !walkMode || introPhase >= 0
+        || inPocket) {
         return;
     }
     float dx = camPos[0] - npc106Pos[0];
@@ -2509,11 +2631,15 @@ static void update106(void) {
             npc106Frame += 0.7f;
             if (npc106Frame > 333.0f) npc106Frame = 284.0f;
             if (dist < 150.0f && sameLevel) {
-                /* Caught: dragged under. */
-                snprintf(deathCause, sizeof(deathCause), "SCP-106");
+                /* Caught: dragged into the pocket dimension. */
                 audioPlay(snd106Laugh, 1.0f, 0.0f);
-                audioPlay(sndHorror11, 1.0f, 0.0f);
-                deathTimer = 180;
+                if (pdRoomIdx >= 0) {
+                    enterPocketDimension();
+                } else {
+                    snprintf(deathCause, sizeof(deathCause), "SCP-106");
+                    audioPlay(sndHorror11, 1.0f, 0.0f);
+                    deathTimer = 180;
+                }
                 reset106();
                 return;
             }
@@ -5036,6 +5162,16 @@ int main(void) {
                         snprintf(toastMsg, sizeof(toastMsg),
                                  "IT WON'T BUDGE");
                         toastTimer = 120;
+                    } else if (!bt->btnId && femurTimer <= 0.0f
+                               && !npc106Contained
+                               && strcmp(roomNameAt(camPos),
+                                         "cont1_106") == 0) {
+                        /* The femur breaker: lure and recontain 106. */
+                        femurTimer = 1.0f;
+                        audioPlay(sndFemur, 1.0f, 0.0f);
+                        snprintf(toastMsg, sizeof(toastMsg),
+                                 "THE FEMUR BREAKER ACTIVATES...");
+                        toastTimer = 200;
                     }
                 }
             } else if (picked >= 0) {
@@ -5093,10 +5229,24 @@ int main(void) {
             update173();
             update106();
             introUpdate();
-            if (introPhase < 0) {
+            if (introPhase < 0 && !inPocket) {
                 updateZoneMusic();
                 updateRoomAmbience();
                 updateRoomEvents();
+            }
+            updatePocketDimension();
+            if (femurTimer > 0.0f) {
+                femurTimer += 1.0f;
+                if (femurTimer >= 900.0f) { /* ~15 s later */
+                    femurTimer = 0.0f;
+                    npc106Contained = 1;
+                    npc106Active = 0;
+                    npc106State = N106_DORMANT;
+                    npc106Pos[1] = -5000.0f;
+                    snprintf(toastMsg, sizeof(toastMsg),
+                             "SCP-106 HAS BEEN RECONTAINED");
+                    toastTimer = 300;
+                }
             }
             itemSpin += 1.0f;
             if (itemSpin >= 360.0f) itemSpin -= 360.0f;

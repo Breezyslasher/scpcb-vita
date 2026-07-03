@@ -70,7 +70,7 @@ Updated as features land. States: **done** / **partial** / **missing**.
 | SCP-173 | done | Freeze-on-sight, blink interplay, last-seen search, TeleportCloser, door opening, kill + camera wrench, horror stings, head tracking |
 | Skeletal animation engine | done | B3D BONE/KEYS/ANIM, CPU skin, VBO path |
 | Intro guards / Class-Ds | done | Source roster, idles, walking escort, gunfire enforcement |
-| SCP-106 | partial | Roaming hunter: dormant timer, spawns behind the player, pursues with corridor pathing + phase-behind teleport, corrosion/laugh/breathing cues, drag-under kill; no femur breaker / pocket dimension room |
+| SCP-106 | partial | Roaming hunter (spawn/pursue/phase-behind/cues); femur-breaker recontainment in cont1_106 stops it for the run; catch drags you to the pocket dimension. No lure Class-D / magnets detail |
 | SCP-682 | partial | Roar set-piece via the e_682_roar event (countdown + roar + camera shake); no roaming battle |
 | SCP-096, 049, 049-2, 939, 966, 860-1, 1499-1 | missing | |
 | Guards/MTF in gameplay | missing | Only intro figures |
@@ -82,6 +82,7 @@ Updated as features land. States: **done** / **partial** / **missing**.
 | --- | --- | --- |
 | Intro sequence | done | Wake screen, bunk cinematic, PA/dialog beats, escort, chamber sequence, breach; simplified NPC theatrics |
 | Per-room events (Events_Core, ~100 events) | partial | Framework + 3 self-contained events (173 ambush appearance, the "trick" scare, distant 682 roar); the rest need the unported SCPs/systems |
+| Pocket dimension (dimension_106) | partial | Dragged in on 106 catch; escape by reaching the exit before it collapses, or die; Enter/Exit/Rumble/Explosion sounds. Simplified single-room maze |
 | Endings (Gate A / Gate B) | missing | No gates; facility has no exit condition |
 | MTF sweep / announcements over time | missing | |
 | Tesla gates | missing | |
