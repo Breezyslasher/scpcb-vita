@@ -1667,6 +1667,7 @@ static void spawn966(void);
 static void spawn860(void);
 static void reset860(void);
 static void removeInventoryByName(const char *name);
+static void consumeSlot(int slot);
 static void spawn079(void);
 static void spawn895(void);
 static void spawn012(void);
