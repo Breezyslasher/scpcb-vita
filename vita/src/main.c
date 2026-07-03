@@ -758,6 +758,8 @@ static int snd079Speech = -1, snd079Refuse = -1;
 /* SCP-895 camera coffin (cont1_895): the slumped guard's idle murmur and
  * scream. */
 static int snd895Idle[3] = { -1, -1, -1 }, snd895Scream[3] = { -1, -1, -1 };
+/* SCP-205 (cont1_205): the shadow demon's horror cue. */
+static int snd205Horror = -1;
 static GLuint teslaArcTex;
 static float teslaFlash;       /* white screen flash when it zaps nearby */
 
@@ -1667,6 +1669,7 @@ static void spawn079(void);
 static void spawn895(void);
 static void spawn012(void);
 static void spawn372(void);
+static void spawn205(void);
 
 static void regenerateMap(uint32_t seed) {
     memset(roomVisited, 0, sizeof(roomVisited));
@@ -1725,6 +1728,7 @@ static void regenerateMap(uint32_t seed) {
         spawn895();
         spawn012();
         spawn372();
+        spawn205();
         eventRng = mapSeed ^ 0xA5A5F00Du;
         spawnItems();
         spawnRoomDecals();
@@ -2057,6 +2061,7 @@ static void loadSounds(void) {
         snprintf(p, sizeof(p), SFX_DIR "/Room/895Chamber/GuardScream%d.ogg", i);
         snd895Scream[i] = audioLoad(p);
     }
+    snd205Horror = audioLoad(SFX_DIR "/SCP/205/Horror.ogg");
     sndAmbience = audioLoad(SFX_DIR "/Ambient/Room ambience/rumble.ogg");
     audioLoopAmbience(sndAmbience, 0.30f);
 }
@@ -2374,6 +2379,20 @@ static float npc372Pos[3];
 static float npc372Frame;
 static float npc372State;       /* remaining active duration */
 
+/* ---- SCP-205: the shadow demon of the lamps (cont1_205). It rises and
+ * looms in the chamber while the player is there, seen chiefly on the
+ * observation monitor the camera feeds. ---- */
+static SkinnedMesh *skin205;
+static float skin205Scale = 1.0f;
+static GLuint vbo205;
+static int posed205;
+static int npc205Ok;
+static float npc205Pos[3];      /* demon spawn (world) */
+static float npc205Yaw;
+static float npc205Frame;
+static float npc205Rise;        /* 0..1 how far it has risen/loomed */
+static float npc205Horror;      /* horror-cue cadence */
+
 /* ---- SCP-1499-1: the hooded people of the mask dimension. They roam
  * and, once roused, converge and kill on contact (UpdateNPCType1499_1).
  * Shared walk phase, drawn per instance. ---- */
@@ -2483,6 +2502,12 @@ static void buildNpcAssets(void) {
         if (skin372) {
             skinnedBounds(skin372, mn, mx);
             if (mx[1] > mn[1]) skin372Scale = 200.0f / (mx[1] - mn[1]);
+        }
+        B3DModel *m205 = propModelGet("scp_205_demon.b3d");
+        skin205 = m205 ? skinnedCreate(m205) : NULL;
+        if (skin205) {
+            skinnedBounds(skin205, mn, mx);
+            if (mx[1] > mn[1]) skin205Scale = 300.0f / (mx[1] - mn[1]);
         }
     }
     buildHumanRT(&introScientistRT, "class_d.b3d", "scientist.png");
@@ -6357,6 +6382,79 @@ static void draw372(const float viewPos[3]) {
                   (float)((gTick * 2) % 360));
 }
 
+/* ---- SCP-205: the shadow demon (cont1_205) ---- */
+
+static void spawn205(void) {
+    npc205Ok = 0;
+    npc205Rise = 0.0f;
+    npc205Frame = 0.0f;
+    npc205Horror = 0.0f;
+    if (!skin205) return;
+    for (uint32_t r = 0; r < map.roomCount; r++) {
+        const RoomPlacement *p = &map.rooms[r];
+        if (strcmp(tplList.items[p->templateIndex].name, "cont1_205") != 0) {
+            continue;
+        }
+        /* Demons' spawnpoint (source local -1536,730,192). */
+        float local[3] = { -1536.0f, 730.0f, 192.0f }, w[3];
+        localToWorld(p, local, w);
+        npc205Pos[0] = w[0]; npc205Pos[1] = w[1]; npc205Pos[2] = w[2];
+        npc205Yaw = (float)(p->angle * 90) - 90.0f;
+        npc205Ok = 1;
+        break;
+    }
+}
+
+/* e_cont1_205: while the player is in the chamber the shadow demon rises
+ * and looms, moaning (Horror.ogg) and gnawing at sanity. Seen mainly on
+ * the observation monitor the camera feeds. The rising-woman set-piece
+ * and the lethal grab are approximated as a dread swell. */
+static void update205(void) {
+    if (!npc205Ok || !skin205) return;
+    int inChamber = strcmp(roomNameAt(camPos), "cont1_205") == 0;
+    npc205Frame += 1.5f;
+    if (npc205Frame > 300.0f) npc205Frame = 1.0f;
+    if (inChamber) {
+        if (npc205Rise < 1.0f) npc205Rise += 0.0015f;
+        sanity -= 0.03f;
+        if (sanity < -1000.0f) sanity = -1000.0f;
+        npc205Horror += 1.0f;
+        if (npc205Horror > 360.0f) {
+            npc205Horror = 0.0f;
+            if (snd205Horror >= 0) {
+                audioPlay3D(snd205Horror, npc205Pos, camPos, camYaw, 2000.0f);
+            }
+        }
+    } else if (npc205Rise > 0.0f) {
+        npc205Rise -= 0.004f;
+        if (npc205Rise < 0.0f) npc205Rise = 0.0f;
+    }
+}
+
+static void draw205(const float viewPos[3]) {
+    if (!npc205Ok || npc205Rise <= 0.01f || !skin205) return;
+    float dx = npc205Pos[0] - viewPos[0], dz = npc205Pos[2] - viewPos[2];
+    if (dx * dx + dz * dz > VIEW_RANGE * VIEW_RANGE) return;
+    GLuint *ibos = skinIBOsFor(skin205);
+    if (!ibos) return;
+    if (!vbo205) glGenBuffers(1, &vbo205);
+    static int poseTick;
+    if (!posed205 || ((poseTick++) & 1) == 0) {
+        skinnedEval(skin205, npc205Frame);
+        uint32_t vc;
+        const SceneVertex *v = skinnedVertices(skin205, &vc);
+        glBindBuffer(GL_ARRAY_BUFFER, vbo205);
+        glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)(vc * sizeof(SceneVertex)),
+                     v, GL_DYNAMIC_DRAW);
+        glBindBuffer(GL_ARRAY_BUFFER, 0);
+        posed205 = 1;
+    }
+    /* Rises up out of the floor as npc205Rise grows. */
+    float p[3] = { npc205Pos[0], npc205Pos[1] - 260.0f + npc205Rise * 260.0f,
+                   npc205Pos[2] };
+    drawSkinnedAt(skin205, vbo205, ibos, skin205Scale, p, npc205Yaw);
+}
+
 /* ---------------- items and inventory ---------------- */
 
 /* Templates and per-room spawns generated from the Blitz sources by
@@ -7582,7 +7680,16 @@ static void renderCameraFeed(void) {
 
     const WorldCamera *c = &worldCameras[best];
     float eyeY = c->y - 21.0f;
-    float dx = camPos[0] - c->x, dz = camPos[2] - c->z, dy = camPos[1] - eyeY;
+    /* Aim at the player, except the cont1_205 observation camera aims at
+     * the shadow demon so it shows on the monitor. */
+    float tx = camPos[0], ty = camPos[1], tz = camPos[2];
+    if (npc205Ok) {
+        float cx = c->x - npc205Pos[0], cz = c->z - npc205Pos[2];
+        if (cx * cx + cz * cz < 1600.0f * 1600.0f) {
+            tx = npc205Pos[0]; ty = npc205Pos[1] + 90.0f; tz = npc205Pos[2];
+        }
+    }
+    float dx = tx - c->x, dz = tz - c->z, dy = ty - eyeY;
     float horiz = sqrtf(dx * dx + dz * dz);
     if (horiz < 1.0f) horiz = 1.0f;
     float yaw = atan2f(dx, -dz) * (180.0f / 3.14159265f);
@@ -7609,6 +7716,9 @@ static void renderCameraFeed(void) {
     glFrontFace(GL_CW);
     glColor4f(1, 1, 1, 1);
     for (int i = 0; i < activeCount; i++) drawRoomBatches(activeRooms[i], 0);
+    /* SCP-205's shadow demon is seen chiefly here, on the monitor. */
+    float feedEye[3] = { c->x, eyeY, c->z };
+    draw205(feedEye);
 
     if (!monFeedTex) {
         glGenTextures(1, &monFeedTex);
@@ -9612,6 +9722,7 @@ int main(void) {
             update895();
             update012();
             update372();
+            update205();
             update173();
             update106();
             update096();
@@ -9910,6 +10021,7 @@ int main(void) {
             draw079(camPos);
             draw895(camPos);
             draw372(camPos);
+            draw205(camPos);
             drawItems(camPos);
             draw173(camPos);
             draw106(camPos);
