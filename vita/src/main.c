@@ -31,6 +31,7 @@
 #include "game/mapgen.h"
 #include "input.h"
 #include "render/scene.h"
+#include "render/skin.h"
 
 #define STB_EASY_FONT_IMPLEMENTATION
 #include "render/stb_easy_font.h"
@@ -903,6 +904,10 @@ static void drawModelRT(const ModelRT *rt);
 static ModelRT npc173RT, npc173HeadRT;
 static ModelRT introGuardRT, introClassDRT, introScientistRT,
                introFranklinRT;
+/* Skinned skeletons, shared per model; each figure evals its own
+ * frame right before drawing. */
+static SkinnedMesh *skinGuard, *skinClassD;
+static float skinGuardScale = 1.0f, skinClassDScale = 1.0f;
 
 static void buildHumanRT(ModelRT *rt, const char *model, const char *tex) {
     buildModelRT(rt, model, 0, 0, 0, tex);
@@ -920,6 +925,21 @@ static float npc173YOff; /* lifts the model so its base sits on the floor */
 static void buildNpcAssets(void) {
     buildHumanRT(&introGuardRT, "guard.b3d", NULL);
     buildHumanRT(&introClassDRT, "class_d.b3d", NULL);
+    {
+        B3DModel *gm = propModelGet("guard.b3d");
+        B3DModel *dm = propModelGet("class_d.b3d");
+        skinGuard = gm ? skinnedCreate(gm) : NULL;
+        skinClassD = dm ? skinnedCreate(dm) : NULL;
+        float mn[3], mx[3];
+        if (skinGuard) {
+            skinnedBounds(skinGuard, mn, mx);
+            if (mx[1] > mn[1]) skinGuardScale = 285.0f / (mx[1] - mn[1]);
+        }
+        if (skinClassD) {
+            skinnedBounds(skinClassD, mn, mx);
+            if (mx[1] > mn[1]) skinClassDScale = 285.0f / (mx[1] - mn[1]);
+        }
+    }
     buildHumanRT(&introScientistRT, "class_d.b3d", "scientist.png");
     buildHumanRT(&introFranklinRT, "class_d.b3d", "Franklin.png");
     buildModelRT(&npc173RT, "scp_173_body.b3d", 0, 0, 0, NULL);
@@ -1383,29 +1403,82 @@ static void introUpdate(void) {
  * guards outside the cell, inmates, the observation-room staff.
  * Static figures - the port has no NPC animation. */
 typedef struct {
-    ModelRT *rt;
-    float x, y, z;   /* intro-room local, raw units */
+    ModelRT *rt;         /* static fallback */
+    float x, y, z;       /* intro-room local, raw units */
     float yawDeg;
+    SkinnedMesh *skin;   /* NULL = draw the static model */
+    float skinScale;
+    const char *texOverride;
+    float animStart, animEnd, animSpeed; /* frames, frames/game-tick */
+    float frame;
 } IntroHuman;
 
 static IntroHuman INTRO_HUMANS[8];
 static int introHumanCount;
 
 static void introPlaceHumans(void) {
+    /* AnimateNPC idle loops: guard state 7 = 77..201 @0.2,
+     * Class-D idle = 210..235 @0.1; the scientist sits at a fixed
+     * frame like SetNPCFrame(182). */
     IntroHuman defs[8] = {
         /* Positions from UpdateIntro (block corridor floor y=0). */
-        { &introGuardRT, -4205.0f, 0.0f, 870.0f, 180.0f },  /* Ulgrin */
-        { &introGuardRT, -3985.0f, 0.0f, 786.0f, 135.0f },
-        { &introGuardRT, -8064.0f, 0.0f, 1096.0f, 180.0f }, /* radio guy */
-        { &introClassDRT, -3550.0f, 0.0f, 800.0f, 0.0f },   /* inmate */
-        { &introGuardRT, 328.0f, 480.0f, 1072.0f, 180.0f }, /* balcony */
-        { &introFranklinRT, -3424.0f, -100.0f, -2208.0f, 0.0f },
-        { &introScientistRT, -3073.0f, -315.0f, -2165.0f, 45.0f },
-        { &introGuardRT, -4000.0f, 0.0f, 950.0f, 160.0f },
+        { &introGuardRT, -4205.0f, 0.0f, 870.0f, 180.0f,
+          NULL, 1, NULL, 77, 201, 0.2f, 77 },                /* Ulgrin */
+        { &introGuardRT, -3985.0f, 0.0f, 786.0f, 135.0f,
+          NULL, 1, NULL, 77, 201, 0.2f, 120 },
+        { &introGuardRT, -8064.0f, 0.0f, 1096.0f, 180.0f,
+          NULL, 1, NULL, 77, 201, 0.2f, 160 },               /* radio guy */
+        { &introClassDRT, -3550.0f, 0.0f, 800.0f, 0.0f,
+          NULL, 1, NULL, 210, 235, 0.1f, 210 },              /* inmate */
+        { &introGuardRT, 328.0f, 480.0f, 1072.0f, 180.0f,
+          NULL, 1, NULL, 77, 201, 0.2f, 40 },                /* balcony */
+        { &introFranklinRT, -3424.0f, -100.0f, -2208.0f, 0.0f,
+          NULL, 1, "Franklin.png", 210, 235, 0.1f, 222 },
+        { &introScientistRT, -3073.0f, -315.0f, -2165.0f, 45.0f,
+          NULL, 1, "scientist.png", 182, 182, 0.0f, 182 },
+        { &introGuardRT, -4000.0f, 0.0f, 950.0f, 160.0f,
+          NULL, 1, NULL, 77, 201, 0.2f, 90 },
     };
+    for (int i = 0; i < 8; i++) {
+        if (defs[i].rt == &introGuardRT) {
+            defs[i].skin = skinGuard;
+            defs[i].skinScale = skinGuardScale;
+        } else {
+            defs[i].skin = skinClassD;
+            defs[i].skinScale = skinClassDScale;
+        }
+    }
     introHumanCount = 0;
     for (int i = 0; i < 8; i++) {
-        if (defs[i].rt->ok) INTRO_HUMANS[introHumanCount++] = defs[i];
+        if (defs[i].skin || defs[i].rt->ok) {
+            INTRO_HUMANS[introHumanCount++] = defs[i];
+        }
+    }
+}
+
+/* Draw a posed skeleton with client arrays (the buffer changes every
+ * frame, so VBOs would just be re-uploads). */
+static void drawSkinnedHuman(IntroHuman *h) {
+    skinnedEval(h->skin, h->frame);
+    uint32_t vcount;
+    const SceneVertex *verts = skinnedVertices(h->skin, &vcount);
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
+    glVertexPointer(3, GL_FLOAT, sizeof(SceneVertex), &verts[0].x);
+    glColorPointer(4, GL_UNSIGNED_BYTE, sizeof(SceneVertex), &verts[0].r);
+    glTexCoordPointer(2, GL_FLOAT, sizeof(SceneVertex), &verts[0].du);
+    for (uint32_t b = 0; b < skinnedBatchCount(h->skin); b++) {
+        const SkinBatch *batch = skinnedBatch(h->skin, b);
+        GLuint tex = textureGet(h->texOverride ? h->texOverride
+                                               : batch->textureName);
+        if (tex) {
+            glEnable(GL_TEXTURE_2D);
+            glBindTexture(GL_TEXTURE_2D, tex);
+        } else {
+            glDisable(GL_TEXTURE_2D);
+        }
+        glDrawElements(GL_TRIANGLES, (GLsizei)batch->indexCount,
+                       GL_UNSIGNED_SHORT, batch->indices);
     }
 }
 
@@ -1413,15 +1486,27 @@ static void drawIntroHumans(const float viewPos[3]) {
     /* Only during the escort; the breach clears the block. */
     if (introPhase < 0 || introPhase >= 4) return;
     for (int i = 0; i < introHumanCount; i++) {
-        const IntroHuman *h = &INTRO_HUMANS[i];
+        IntroHuman *h = &INTRO_HUMANS[i];
         float wx = INTRO_GX * ROOM_SPACING + h->x;
         float wz = INTRO_GY * ROOM_SPACING + h->z;
         float dx = wx - viewPos[0], dz = wz - viewPos[2];
         if (dx * dx + dz * dz > VIEW_RANGE * VIEW_RANGE) continue;
+
+        /* Advance the idle loop. */
+        if (h->animSpeed > 0.0f) {
+            h->frame += h->animSpeed;
+            if (h->frame > h->animEnd) h->frame = h->animStart;
+        }
+
         glPushMatrix();
         glTranslatef(wx, h->y, wz);
         glRotatef(-h->yawDeg + 180.0f, 0.0f, 1.0f, 0.0f);
-        drawModelRT(h->rt);
+        if (h->skin) {
+            glScalef(h->skinScale, h->skinScale, h->skinScale);
+            drawSkinnedHuman(h);
+        } else {
+            drawModelRT(h->rt);
+        }
         glPopMatrix();
     }
 }

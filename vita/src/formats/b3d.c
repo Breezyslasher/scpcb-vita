@@ -37,6 +37,8 @@ static bool isTag(const Chunk *c, const char *tag) {
 static void freeNode(B3DNode *n) {
     if (!n) return;
     free(n->name);
+    free(n->weights);
+    free(n->keys);
     if (n->mesh) {
         free(n->mesh->vertices);
         for (uint32_t i = 0; i < n->mesh->triSetCount; i++) {
@@ -191,6 +193,11 @@ static bool parseTris(Reader *r, const Chunk *c, B3DMesh *mesh) {
     return rdOk(r);
 }
 
+/* ANIM appears inside the animated NODE; stashed here and picked up
+ * by b3dLoadMemory after the tree parse. */
+static int32_t gAnimFrames;
+static float gAnimFps;
+
 static B3DMesh *parseMesh(Reader *r, const Chunk *c) {
     B3DMesh *mesh = (B3DMesh *)calloc(1, sizeof(B3DMesh));
     if (!mesh) return NULL;
@@ -217,6 +224,67 @@ fail:
     free(mesh->triSets);
     free(mesh);
     return NULL;
+}
+
+static bool parseKeys(Reader *r, const Chunk *c, B3DNode *n) {
+    int32_t flags = rdI32(r);
+    if (!rdOk(r) || (flags & ~7) != 0) return false;
+    size_t entry = 4 + ((flags & 1) ? 12 : 0) + ((flags & 2) ? 12 : 0)
+                 + ((flags & 4) ? 16 : 0);
+    size_t payload = c->end - r->pos;
+    if (entry == 4 || payload % entry != 0) return false;
+    size_t count = payload / entry;
+    if (count > MAX_COUNT) return false;
+
+    B3DKey *grown = (B3DKey *)realloc(
+        n->keys, (n->keyCount + count) * sizeof(B3DKey));
+    if (!grown) return false;
+    n->keys = grown;
+    n->keyFlags |= flags;
+    for (size_t i = 0; i < count; i++) {
+        B3DKey *k = &n->keys[n->keyCount + i];
+        memset(k, 0, sizeof(*k));
+        k->scale[0] = k->scale[1] = k->scale[2] = 1.0f;
+        k->rotation[0] = 1.0f;
+        k->frame = rdI32(r);
+        if (flags & 1) {
+            k->position[0] = rdF32(r);
+            k->position[1] = rdF32(r);
+            k->position[2] = rdF32(r);
+        }
+        if (flags & 2) {
+            k->scale[0] = rdF32(r);
+            k->scale[1] = rdF32(r);
+            k->scale[2] = rdF32(r);
+        }
+        if (flags & 4) {
+            k->rotation[0] = rdF32(r);
+            k->rotation[1] = rdF32(r);
+            k->rotation[2] = rdF32(r);
+            k->rotation[3] = rdF32(r);
+        }
+    }
+    if (!rdOk(r)) return false;
+    n->keyCount += (uint32_t)count;
+    return true;
+}
+
+static bool parseBone(Reader *r, const Chunk *c, B3DNode *n) {
+    n->isBone = 1;
+    size_t payload = c->end - r->pos;
+    if (payload % 8 != 0) return false;
+    size_t count = payload / 8;
+    if (count > MAX_COUNT) return false;
+    if (count == 0) return true;
+    n->weights = (B3DBoneWeight *)calloc(count, sizeof(B3DBoneWeight));
+    if (!n->weights) return false;
+    for (size_t i = 0; i < count; i++) {
+        n->weights[i].vertexId = rdI32(r);
+        n->weights[i].weight = rdF32(r);
+    }
+    if (!rdOk(r)) return false;
+    n->weightCount = (uint32_t)count;
+    return true;
 }
 
 static B3DNode *parseNode(Reader *r, const Chunk *c, int depth) {
@@ -246,6 +314,15 @@ static B3DNode *parseNode(Reader *r, const Chunk *c, int depth) {
         if (isTag(&sub, "MESH")) {
             n->mesh = parseMesh(r, &sub);
             if (!n->mesh) goto fail;
+        } else if (isTag(&sub, "KEYS")) {
+            if (!parseKeys(r, &sub, n)) goto fail;
+        } else if (isTag(&sub, "BONE")) {
+            if (!parseBone(r, &sub, n)) goto fail;
+        } else if (isTag(&sub, "ANIM")) {
+            rdI32(r); /* flags, unused */
+            gAnimFrames = rdI32(r);
+            gAnimFps = rdF32(r);
+            if (gAnimFps <= 0.0f) gAnimFps = 60.0f;
         } else if (isTag(&sub, "NODE")) {
             B3DNode *child = parseNode(r, &sub, depth + 1);
             if (!child) goto fail;
@@ -258,8 +335,7 @@ static B3DNode *parseNode(Reader *r, const Chunk *c, int depth) {
             n->children = grown;
             n->children[n->childCount++] = child;
         }
-        /* ANIM, KEYS, BONE and anything unknown: skip. */
-        r->pos = sub.end;
+        r->pos = sub.end; /* skip anything unknown / trailing bytes */
     }
     if (!rdOk(r)) goto fail;
     return n;
@@ -286,6 +362,8 @@ B3DModel *b3dLoadMemory(const void *data, size_t size, char *err, size_t errLen)
         return NULL;
     }
     m->version = rdI32(&r);
+    gAnimFrames = 0;
+    gAnimFps = 60.0f;
 
     while (rdOk(&r) && r.pos < root.end) {
         Chunk sub;
@@ -321,6 +399,8 @@ B3DModel *b3dLoadMemory(const void *data, size_t size, char *err, size_t errLen)
         b3dFree(m);
         return NULL;
     }
+    m->animFrames = gAnimFrames;
+    m->animFps = gAnimFps;
     return m;
 }
 
