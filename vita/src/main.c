@@ -614,6 +614,7 @@ static int sndMagnetUp = -1, sndMagnetDown = -1;
 static float pdReturn[4];     /* pre-catch pos + yaw to restore */
 static int sndPdEnter = -1, sndPdExit = -1, sndPdRumble = -1,
            sndPdExplode = -1;
+static int snd096Trigger = -1, snd096Scream = -1;
 
 /* Tesla gates (Events_Core e_tesla): the room2_tesla_* corridors have
  * an electrified gate at their centre that idles, charges, zaps and
@@ -1552,7 +1553,6 @@ static float npc096Pos[3];
 static float npc096YawDeg;
 static float npc096Frame;
 static float npc096ScreamTimer; /* frames spent screaming before it runs */
-static int snd096Trigger = -1, snd096Scream = -1;
 
 static void buildHumanRT(ModelRT *rt, const char *model, const char *tex) {
     buildModelRT(rt, model, 0, 0, 0, tex);
