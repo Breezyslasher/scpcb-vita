@@ -1250,6 +1250,7 @@ static void update173(void) {
 
 static void gameMusicStart(void);
 static void introPlaceHumans(void);
+static int itemTplFind(const char *name);
 
 static int sndIntroAttention = -1, sndIntroExitCell = -1;
 static int sndIntroEscort = -1, sndIntroDone = -1;
