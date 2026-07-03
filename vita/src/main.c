@@ -422,6 +422,15 @@ static void spawnRoomDoors(void) {
     }
 }
 
+/* ---- per-room event system (Events_Core) ---- */
+enum { EV_NONE = 0, EV_173_APPEAR, EV_TRICK, EV_682_ROAR };
+#define MAX_EVENT_ROOMS 1024
+static int roomEventId[MAX_EVENT_ROOMS];
+static float roomEventState[MAX_EVENT_ROOMS];
+static float camShake;          /* decays; jitters the view rotation */
+static uint32_t eventRng;        /* per-run event RNG */
+static int sndHorror11 = -1, snd682Roar = -1;
+
 /* Room levers and standalone buttons (room_fixtures.h). Cosmetic +
  * interactive fixtures: levers flip on/off, buttons depress and
  * click. World coords via the same room transform as items/doors. */
@@ -482,6 +491,7 @@ static void spawnRoomFixtures(void) {
         }
     }
 }
+
 
 /* ---- intro sequence (cont1_173_intro, "placed automatically in all
  * maps" per rooms.ini): the Class-D cell block and 173's chamber on
@@ -780,6 +790,7 @@ static float npc173LastDist = 1e9f;
 static float npc173WanderYawDeg;
 static int deathTimer;          /* >0: death screen counting down */
 
+
 static void reset173(void);
 
 static void spawnItems(void);
@@ -792,6 +803,9 @@ static void spawnPlayer(void) {
     camPitch = 0.0f;
     velY = 0.0f;
 }
+
+static void spawnRoomEvents(void);
+static void updateRoomEvents(void);
 
 static void regenerateMap(uint32_t seed) {
     memset(roomVisited, 0, sizeof(roomVisited));
@@ -818,6 +832,8 @@ static void regenerateMap(uint32_t seed) {
         doorsGenerate(&map, &tplList, mapSeed ^ 0x9E3779B9u, &doors);
         spawnRoomDoors();
         spawnRoomFixtures();
+        spawnRoomEvents();
+        eventRng = mapSeed ^ 0xA5A5F00Du;
         spawnItems();
         reset173();
         snprintf(statusLine, sizeof(statusLine), "map seed %u: %u rooms %u doors",
@@ -1037,6 +1053,8 @@ static void loadSounds(void) {
     }
     sndDoorLock = audioLoad(SFX_DIR "/Interact/DoorLock.ogg");
     sndLever = audioLoad(SFX_DIR "/Interact/LeverFlip.ogg");
+    sndHorror11 = audioLoad(SFX_DIR "/Horror/Horror11.ogg");
+    snd682Roar = audioLoad(SFX_DIR "/SCP/682/Roar.ogg");
     for (int i = 0; i < 4; i++) {
         snprintf(p, sizeof(p), SFX_DIR "/Character/D9341/Damage%d.ogg", i);
         sndDamage[i] = audioLoad(p);
@@ -1460,6 +1478,142 @@ static void navDir(float goalX, float goalZ, float *dirX, float *dirZ) {
     if (d < 1.0f) { *dirX = 0.0f; *dirZ = 0.0f; return; }
     *dirX = ddx / d;
     *dirZ = ddz / d;
+}
+
+/* Assign per-room events (a port of Loading_Core's CreateEvent calls
+ * for the self-contained events the facility can run without the
+ * unported SCPs). Deterministic from the map seed so saves match. */
+static void spawnRoomEvents(void) {
+    struct { const char *room; int ev; int pct; } TABLE[] = {
+        { "room2c_gw_lcz", EV_173_APPEAR, 80 },
+        { "room2_6_lcz",   EV_173_APPEAR, 90 },
+        { "room2_4_lcz",   EV_173_APPEAR, 60 },
+        { "room2_4_hcz",   EV_173_APPEAR, 60 },
+        { "room2_6_hcz",   EV_173_APPEAR, 50 },
+        { "room3_2_ez",    EV_173_APPEAR, 80 },
+        { "room3_3_ez",    EV_173_APPEAR, 60 },
+        { "room2_lcz",     EV_TRICK,      15 },
+        { "room2_3_lcz",   EV_TRICK,      15 },
+        { "room2_5_hcz",   EV_682_ROAR,   50 },
+        { "room3_hcz",     EV_682_ROAR,   50 },
+        { "room2_5_ez",    EV_682_ROAR,   50 },
+    };
+    int n = (int)(sizeof(TABLE) / sizeof(TABLE[0]));
+    uint32_t rng = mapSeed ^ 0x51ED2C0Bu;
+    for (uint32_t r = 0; r < map.roomCount && r < MAX_EVENT_ROOMS; r++) {
+        roomEventId[r] = EV_NONE;
+        roomEventState[r] = 0.0f;
+        const char *nm = tplList.items[map.rooms[r].templateIndex].name;
+        for (int i = 0; i < n; i++) {
+            if (strcmp(TABLE[i].room, nm) != 0) continue;
+            rng = rng * 1664525u + 1013904223u;
+            if ((int)((rng >> 16) % 100u) < TABLE[i].pct) {
+                roomEventId[r] = TABLE[i].ev;
+            }
+            break;
+        }
+    }
+}
+
+/* The scripted SCP-173 ambush spot for e_173_appearing, per room
+ * template (room-local raw units from Events_Core). */
+static int event173Spot(const char *nm, uint32_t *rng, float out[3]) {
+    if (!strcmp(nm, "room2_4_lcz") || !strcmp(nm, "room2_4_hcz")
+        || !strcmp(nm, "room2_6_hcz")) {
+        out[0] = 640.0f; out[1] = 100.0f; out[2] = -896.0f; return 1;
+    }
+    if (!strcmp(nm, "room2_6_lcz")) {
+        out[0] = -832.0f; out[1] = 100.0f; out[2] = 0.0f; return 1;
+    }
+    if (!strcmp(nm, "room2c_gw_lcz")) {
+        out[0] = -410.0f; out[1] = 100.0f; out[2] = 410.0f; return 1;
+    }
+    if (!strcmp(nm, "room3_2_ez") || !strcmp(nm, "room3_3_ez")) {
+        *rng = *rng * 1664525u + 1013904223u;
+        int k = (int)((*rng >> 18) % 3u);
+        static const float S[3][3] = {
+            { 736.0f, -512.0f, -400.0f },
+            { -552.0f, -512.0f, -528.0f },
+            { 736.0f, -512.0f, 272.0f },
+        };
+        out[0] = S[k][0]; out[1] = S[k][1]; out[2] = S[k][2];
+        return 1;
+    }
+    return 0;
+}
+
+/* Run the event of the room the player is in or approaching. */
+static void updateRoomEvents(void) {
+    if (introPhase >= 0 || deathTimer > 0) return;
+    int pcell = cellIndexAt(camPos[0], camPos[2]);
+    for (uint32_t r = 0; r < map.roomCount && r < MAX_EVENT_ROOMS; r++) {
+        int ev = roomEventId[r];
+        if (ev == EV_NONE) continue;
+        const RoomPlacement *p = &map.rooms[r];
+        float cx = p->gridX * ROOM_SPACING, cz = p->gridY * ROOM_SPACING;
+        float dx = camPos[0] - cx, dz = camPos[2] - cz;
+        float dist = sqrtf(dx * dx + dz * dz);
+        int inRoom = (pcell == (int)r);
+
+        if (ev == EV_173_APPEAR) {
+            /* Player nearing the room but not yet in it: pop 173 into
+             * the scripted spot if it is idle, unseen and far. */
+            if (dist < 1536.0f && !inRoom && npc173Active
+                && !playerSees173()) {
+                float pdx = camPos[0] - npc173Pos[0];
+                float pdz = camPos[2] - npc173Pos[2];
+                if (pdx * pdx + pdz * pdz > 1536.0f * 1536.0f) {
+                    const char *nm =
+                        tplList.items[p->templateIndex].name;
+                    float local[3], w[3];
+                    if (event173Spot(nm, &eventRng, local)) {
+                        localToWorld(p, local, w);
+                        npc173Pos[0] = w[0];
+                        npc173Pos[2] = w[2];
+                        float o[3] = { w[0], camPos[1] + 200.0f, w[2] };
+                        float hy;
+                        npc173Pos[1] = rayDownWorld(o, 3000.0f, &hy)
+                                     ? hy : camPos[1] - EYE_HEIGHT;
+                        roomEventId[r] = EV_NONE; /* one-shot */
+                    }
+                }
+            }
+        } else if (ev == EV_TRICK) {
+            /* Deep in the room: a blink, a horror sting, and a shove
+             * back the way you came - once. */
+            if (inRoom && dist < 512.0f) {
+                blinkFrames = 18;
+                blinkTimer = 100.0f;
+                audioPlay(sndHorror11, 1.0f, 0.0f);
+                float b = sqrtf(dx * dx + dz * dz);
+                if (b > 1.0f) {
+                    camPos[0] += dx / b * 256.0f;
+                    camPos[2] += dz / b * 256.0f;
+                }
+                camYaw += 3.14159265f;
+                roomEventId[r] = EV_NONE;
+            }
+        } else if (ev == EV_682_ROAR) {
+            /* Arm a countdown on entry; roar + shake when it fires. */
+            if (roomEventState[r] == 0.0f) {
+                if (inRoom) {
+                    eventRng = eventRng * 1664525u + 1013904223u;
+                    roomEventState[r] =
+                        600.0f + (float)((eventRng >> 16) % 900u);
+                }
+            } else {
+                roomEventState[r] -= 1.0f;
+                if (roomEventState[r] <= 60.0f) {
+                    audioPlay(snd682Roar, 1.0f, 0.0f);
+                    camShake = 3.0f;
+                    roomEventId[r] = EV_NONE;
+                } else if (roomEventState[r] < 200.0f) {
+                    camShake = 1.5f; /* rumble builds */
+                }
+            }
+        }
+    }
+    if (camShake > 0.0f) camShake -= 0.05f;
 }
 
 static void update173(void) {
@@ -4749,6 +4903,7 @@ int main(void) {
             if (introPhase < 0) {
                 updateZoneMusic();
                 updateRoomAmbience();
+                updateRoomEvents();
             }
             itemSpin += 1.0f;
             if (itemSpin >= 360.0f) itemSpin -= 360.0f;
@@ -4950,8 +5105,13 @@ int main(void) {
             applyDebugState();
             glMatrixMode(GL_MODELVIEW);
             glLoadIdentity();
-            glRotatef(camPitch * 180.0f / 3.14159265f, 1, 0, 0);
-            glRotatef(camYaw * 180.0f / 3.14159265f, 0, 1, 0);
+            float shP = 0.0f, shY = 0.0f;
+            if (camShake > 0.0f) {
+                shP = sinf(fpsFrames * 1.7f) * camShake;
+                shY = sinf(fpsFrames * 2.3f) * camShake;
+            }
+            glRotatef(camPitch * 180.0f / 3.14159265f + shP, 1, 0, 0);
+            glRotatef(camYaw * 180.0f / 3.14159265f + shY, 0, 1, 0);
             glTranslatef(-camPos[0], -camPos[1], -camPos[2]);
 
             glColor4f(1, 1, 1, 1);

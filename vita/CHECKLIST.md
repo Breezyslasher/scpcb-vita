@@ -80,7 +80,7 @@ Updated as features land. States: **done** / **partial** / **missing**.
 | Feature | Status | Notes |
 | --- | --- | --- |
 | Intro sequence | done | Wake screen, bunk cinematic, PA/dialog beats, escort, chamber sequence, breach; simplified NPC theatrics |
-| Per-room events (Events_Core, ~100 events) | missing | 173 chamber post-intro, 914 tests, 106 victim, tesla gates, room ambushes, etc. |
+| Per-room events (Events_Core, ~100 events) | partial | Framework + 3 self-contained events (173 ambush appearance, the "trick" scare, distant 682 roar); the rest need the unported SCPs/systems |
 | Endings (Gate A / Gate B) | missing | No gates; facility has no exit condition |
 | MTF sweep / announcements over time | missing | |
 | Tesla gates | missing | |
