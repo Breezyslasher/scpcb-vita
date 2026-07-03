@@ -430,6 +430,8 @@ enum { EV_NONE = 0, EV_173_APPEAR, EV_TRICK, EV_682_ROAR };
 static int roomEventId[MAX_EVENT_ROOMS];
 static float roomEventState[MAX_EVENT_ROOMS];
 static float camShake;          /* decays; jitters the view rotation */
+static float cameraZoom;         /* FOV narrowing (deg) - 106's dread pulse */
+static unsigned gTick;           /* gameplay frame counter (effect phases) */
 static uint32_t eventRng;        /* per-run event RNG */
 static int sndHorror11 = -1, snd682Roar = -1;
 
@@ -1079,7 +1081,11 @@ static void regenerateMap(uint32_t seed) {
 static void setPerspective(void) {
     float zNear = 4.0f;
     float zFar = VIEW_RANGE * 3.0f;
-    float fovY = 60.0f * 3.14159265f / 180.0f;
+    /* SCP-106 zooms the lens in unnervingly when it is watching
+     * (me\CurrCameraZoom); clamp so it never crosses over. */
+    float fov = 60.0f - cameraZoom;
+    if (fov < 25.0f) fov = 25.0f;
+    float fovY = fov * 3.14159265f / 180.0f;
     float top = zNear * tanf(fovY * 0.5f);
     float right = top * ((float)SCREEN_W / (float)SCREEN_H);
     glMatrixMode(GL_PROJECTION);
@@ -1341,6 +1347,10 @@ static ModelRT oneSidedRT, door914RT;
 static ModelRT buttonRT, buttonKeycardRT;
 static ModelRT buttonKeypadRT, buttonScannerRT, buttonElevatorRT;
 static ModelRT leverBaseRT, leverHandleRT;
+/* SCP-106 rots the doors it passes (UpdateNPCType106 swaps the panel /
+ * frame texture): Door01_Corrosive for sliding doors, containment for
+ * heavy. Loaded with the door assets. */
+static GLuint doorCorrTex, doorCorrHeavyTex;
 /* Pocket dimension's flying pillars: animated props that orbit and
  * kill on contact (PD_FourWayRoom). */
 static ModelRT pdPillarRT;
@@ -1448,6 +1458,8 @@ static void buildDoorAssets(void) {
         = 9.216f;
     buildModelRT(&pdPillarRT, "dimension_106_pillar.b3d", 0, 0, 0, NULL);
     pdPillarRT.scale[0] = pdPillarRT.scale[1] = pdPillarRT.scale[2] = 256.0f;
+    doorCorrTex = textureGet("Door01_Corrosive.png");
+    doorCorrHeavyTex = textureGet("containment_doors_Corrosive.png");
 }
 
 static void drawModelRT(const ModelRT *rt);
@@ -3198,11 +3210,14 @@ static void updatePocketDimension(void) {
             pdEventState += 1.0f;
             float tx = bx, ty = 1376.0f, tz = bz + 8192.0f - 2848.0f;
             float target[3] = { tx, ty, tz };
-            /* The throne drags the camera to it and drains sanity. */
+            /* The throne drags the camera to it and drains sanity, the
+             * lens pulsing inward the nearer you kneel. */
             pdLookAt(target, 0.06f);
             injuries += 0.00025f;
             sanity -= 0.25f;
             if (sanity < -1000.0f) sanity = -1000.0f;
+            float pz = (sinf(gTick * 0.05f) + 1.0f) * 12.0f;
+            if (cameraZoom < pz) cameraZoom = pz;
             float ddx = camPos[0] - tx, ddz = camPos[2] - tz;
             if (ddx * ddx + ddz * ddz >= 2000.0f * 2000.0f) {
                 pdState = PD_FOURWAY;
@@ -3336,8 +3351,11 @@ static void update106(void) {
 
     switch (npc106State) {
         case N106_DORMANT:
-            /* SCP-268 hides you; time still passes but no spawn. */
-            npc106Timer -= wear268 ? 0.3f : 1.0f;
+            /* SCP-268 hides you; time still passes but no spawn. On the
+             * aggressive difficulties (Keter/Apollyon) the spawn timer
+             * counts down twice as fast (source: fps\Factor *
+             * (1 + AggressiveNPCs)). */
+            npc106Timer -= (wear268 ? 0.3f : 1.0f) * (1.0f + npcAggressive);
             if (npc106Timer <= 0.0f) spawn106Near();
             break;
         case N106_SPAWNING:
@@ -3385,6 +3403,42 @@ static void update106(void) {
             float o[3] = { npc106Pos[0], npc106Pos[1] + 250.0f, npc106Pos[2] };
             float hy;
             if (rayDownWorld(o, 600.0f, &hy)) npc106Pos[1] = hy;
+
+            /* Dread-zoom: close and facing the player, the lens pulses
+             * inward (source me\CurrCameraZoom, Sin(MilliSec/20)). */
+            if (dist < 2100.0f) {
+                float vx = sinf(camYaw), vz = -cosf(camYaw);
+                float inFront = dist > 1.0f
+                              ? (-dx * vx - dz * vz) / dist : 1.0f;
+                if (inFront > 0.25f) {
+                    float prox = (2100.0f - dist) / 2100.0f;
+                    float pulse = (sinf(gTick * 0.06f) + 1.0f) * 9.0f
+                                * prox;
+                    if (cameraZoom < pulse) cameraZoom = pulse;
+                }
+            }
+
+            /* Corrode the doors it passes (source: within 144 of the
+             * player, a closed door frame within ~0.5 of 106; office /
+             * wooden / big / 914 are immune). */
+            if (dist < 3072.0f) {
+                for (uint32_t di = 0; di < doors.count; di++) {
+                    Door *dr = &doors.items[di];
+                    if (dr->corroded || dr->openState > 1.0f) continue;
+                    if (dr->type == 3 || dr->type == 4 || dr->type == 5
+                        || dr->type == 7) {
+                        continue;
+                    }
+                    float ex = dr->x - npc106Pos[0];
+                    float ez = dr->z - npc106Pos[2];
+                    if (ex * ex + ez * ez < 256.0f * 256.0f) {
+                        dr->corroded = 1;
+                        audioPlay3D(snd106Corr[rand() % 3], npc106Pos,
+                                    camPos, camYaw, 1500.0f);
+                        break;
+                    }
+                }
+            }
 
             /* Occasional corrosion/breathing cues. */
             if (rand() % 180 == 0) {
@@ -3606,6 +3660,51 @@ static void draw106(const float viewPos[3]) {
     glBindBuffer(GL_ARRAY_BUFFER, 0);
     glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
     glPopMatrix();
+
+    /* The trailing "second body" (n\OBJ2): a faded duplicate that wells
+     * up behind it at distance / in fog (source shows OBJ2 beyond
+     * CameraFogDist*0.6, rotated yaw-180, up 0.946 back -0.165, alpha by
+     * distance). Reuses the posed VBO with a flat, dim, alpha color. */
+    float distSq = dx * dx + dz * dz;
+    if (distSq > 1300.0f * 1300.0f) {
+        float a = (sqrtf(distSq) - 1300.0f) / 2200.0f;
+        if (a > 0.55f) a = 0.55f;
+        if (a > 0.02f) {
+            glEnable(GL_BLEND);
+            glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+            glDepthMask(GL_FALSE);
+            glDisableClientState(GL_COLOR_ARRAY);
+            glColor4f(0.55f, 0.5f, 0.55f, a);
+            glPushMatrix();
+            glTranslatef(npc106Pos[0], npc106Pos[1] + 242.0f, npc106Pos[2]);
+            glRotatef(-npc106YawDeg, 0.0f, 1.0f, 0.0f); /* yaw-180 vs body */
+            glTranslatef(0.0f, 0.0f, -42.0f);
+            glScalef(skin106Scale, skin106Scale, skin106Scale);
+            glBindBuffer(GL_ARRAY_BUFFER, vbo106);
+            glVertexPointer(3, GL_FLOAT, sizeof(SceneVertex), VTX_OFF(x));
+            glTexCoordPointer(2, GL_FLOAT, sizeof(SceneVertex), VTX_OFF(du));
+            for (uint32_t b = 0; b < skinnedBatchCount(skin106); b++) {
+                const SkinBatch *batch = skinnedBatch(skin106, b);
+                GLuint tex = textureGet(batch->textureName);
+                if (tex) {
+                    glEnable(GL_TEXTURE_2D);
+                    glBindTexture(GL_TEXTURE_2D, tex);
+                } else {
+                    glDisable(GL_TEXTURE_2D);
+                }
+                glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, ibos[b]);
+                glDrawElements(GL_TRIANGLES, (GLsizei)batch->indexCount,
+                               GL_UNSIGNED_SHORT, NULL);
+            }
+            glBindBuffer(GL_ARRAY_BUFFER, 0);
+            glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
+            glPopMatrix();
+            glColor4f(1, 1, 1, 1);
+            glEnableClientState(GL_COLOR_ARRAY);
+            glDepthMask(GL_TRUE);
+            glDisable(GL_BLEND);
+        }
+    }
 }
 
 /* ---------------- items and inventory ---------------- */
@@ -4556,11 +4655,21 @@ static void drawModelRTTinted(const ModelRT *rt, GLuint texOverride) {
     for (uint32_t i = 0; i < n; i++) rt->gl[i].diffuse = saved[i];
 }
 
+/* A door frame/panel, swapped to a corroded texture when SCP-106 has
+ * rotted it. */
+static void drawDoorPart(const ModelRT *rt, GLuint corr) {
+    if (corr) drawModelRTTinted(rt, corr);
+    else drawModelRT(rt);
+}
+
 static void drawDoors(const float viewPos[3]) {
     for (uint32_t i = 0; i < doors.count; i++) {
         const Door *d = &doors.items[i];
         float dx = d->x - viewPos[0], dz = d->z - viewPos[2];
         if (dx * dx + dz * dz > VIEW_RANGE * VIEW_RANGE) continue;
+
+        GLuint corr = d->corroded
+                    ? (d->type == 2 ? doorCorrHeavyTex : doorCorrTex) : 0;
 
         glPushMatrix();
         glTranslatef(d->x, d->y, d->z);
@@ -4580,7 +4689,7 @@ static void drawDoors(const float viewPos[3]) {
             case 7: p1 = &door914RT; single = 1; break;
             default: break;
         }
-        drawModelRT(frame);
+        drawDoorPart(frame, corr);
 
         float slide = doorSlide(d);
         if (hinged) {
@@ -4589,19 +4698,19 @@ static void drawDoors(const float viewPos[3]) {
             glTranslatef(-92.0f, 0.0f, 0.0f);
             glRotatef(-d->openState * 0.5f, 0.0f, 1.0f, 0.0f);
             glTranslatef(92.0f, 0.0f, 0.0f);
-            drawModelRT(p1);
+            drawDoorPart(p1, corr);
             glPopMatrix();
         } else {
             glPushMatrix();
             glTranslatef(slide, 0.0f, 0.0f);
-            drawModelRT(p1);
+            drawDoorPart(p1, corr);
             glPopMatrix();
 
             if (!single) {
                 glPushMatrix();
                 glRotatef(180.0f, 0.0f, 1.0f, 0.0f);
                 glTranslatef(slide, 0.0f, 0.0f);
-                drawModelRT(p2);
+                drawDoorPart(p2, corr);
                 glPopMatrix();
             }
         }
@@ -6183,6 +6292,11 @@ int main(void) {
             }
         }
         if (haveData && !pauseOpen) {
+            /* The dread-zoom eases back each frame; 106 (and the throne)
+             * re-ramp it while they hold the player's gaze. */
+            gTick++;
+            cameraZoom *= 0.9f;
+            if (cameraZoom < 0.05f) cameraZoom = 0.0f;
             doorsUpdate(&doors);
             update173();
             update106();

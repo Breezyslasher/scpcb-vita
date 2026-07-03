@@ -29,6 +29,7 @@ typedef struct {
     int code;          /* >0 = keypad door: the 4-digit code */
     int nobuttons;     /* FillRoom removed the buttons */
     int denials;       /* failed button presses (debug force-open) */
+    int corroded;      /* SCP-106 rotted the surface (texture swap) */
 } Door;
 
 typedef struct {
