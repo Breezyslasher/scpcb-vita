@@ -54,6 +54,7 @@ unsigned int _newlib_heap_size_user = 220 * 1024 * 1024;
 #define HUD_DIR DATA_ROOT "/GFX/HUD"
 #define INV_ICONS_DIR DATA_ROOT "/GFX/Items/Inventory Icons"
 #define NPCS_DIR DATA_ROOT "/GFX/NPCs"
+#define DECALS_DIR DATA_ROOT "/GFX/Decals"
 #define MENU_DIR DATA_ROOT "/GFX/Menu"
 #define ROOMS_INI DATA_ROOT "/Data/rooms.ini"
 
@@ -92,10 +93,11 @@ static GLuint textureGet(const char *name) {
     }
 
     GLuint handle = 0;
-    const char *dirs[8] = { MAP_DIR, MAP_TEXTURES_DIR, PROPS_DIR, ITEMS_DIR,
-                            ITEMS_HUD_DIR, HUD_DIR, INV_ICONS_DIR, NPCS_DIR };
+    const char *dirs[9] = { MAP_DIR, MAP_TEXTURES_DIR, PROPS_DIR, ITEMS_DIR,
+                            ITEMS_HUD_DIR, HUD_DIR, INV_ICONS_DIR, NPCS_DIR,
+                            DECALS_DIR };
     char path[1024];
-    if (textureResolve(name, dirs, 8, path, sizeof(path))) {
+    if (textureResolve(name, dirs, 9, path, sizeof(path))) {
         char err[128];
         TextureImage *img = textureLoadFile(path, TEXTURE_CAP, err, sizeof(err));
         if (img) {
@@ -2690,6 +2692,167 @@ static void drawIntroHumans(const float viewPos[3]) {
     }
 }
 
+/* ---- decals: ground/wall splats (Map_Core CreateDecal) ----
+ * A decal is a textured, alpha-blended quad laid on a surface (pitch 90
+ * lies it flat on the floor). SCP-106 leaves a corrosion trail; the
+ * player bleeds droplets; the pocket dimension is strewn with pd
+ * decals. Textures live in GFX/Decals. World size: the Blitz quad spans
+ * -1..1 (2 units) scaled by Size, so a port half-extent = Size * 256
+ * raw units. Held in a fixed ring buffer - the oldest is overwritten. */
+enum {
+    DECAL_CORROSIVE_1 = 0, DECAL_CORROSIVE_2 = 1,
+    DECAL_BLOOD_1 = 2, DECAL_BLOOD_6 = 7,
+    DECAL_PD_1 = 8, DECAL_PD_6 = 13,
+    DECAL_BLOOD_DROP_1 = 16, DECAL_BLOOD_DROP_2 = 17,
+    DECAL_ID_MAX = 18
+};
+
+typedef struct {
+    int used;
+    int id;
+    float pos[3];
+    float pitch, yaw, roll;   /* Blitz euler degrees */
+    float size, sizeChange, maxSize;
+    float alpha, alphaChange;
+    int blend;                /* 1 alpha, 2 multiply, 3 additive */
+    float timer;              /* corrosive: child-spawn cadence */
+    float life;               /* -1 = forever, else frames remaining */
+} Decal;
+
+#define MAX_DECALS 256
+static Decal decals[MAX_DECALS];
+static int decalHead;
+static GLuint decalTex[DECAL_ID_MAX];
+static int decalsLoaded;
+
+static void decalsInit(void) {
+    if (decalsLoaded) return;
+    decalsLoaded = 1;
+    char name[64];
+    for (int i = 0; i < 2; i++) {
+        snprintf(name, sizeof(name), "corrosive_decal(%d).png", i);
+        decalTex[DECAL_CORROSIVE_1 + i] = textureGet(name);
+    }
+    for (int i = 0; i < 6; i++) {
+        snprintf(name, sizeof(name), "blood_decal(%d).png", i);
+        decalTex[DECAL_BLOOD_1 + i] = textureGet(name);
+    }
+    for (int i = 0; i < 6; i++) {
+        snprintf(name, sizeof(name), "pd_decal(%d).png", i);
+        decalTex[DECAL_PD_1 + i] = textureGet(name);
+    }
+    for (int i = 0; i < 2; i++) {
+        snprintf(name, sizeof(name), "blood_drop_decal(%d).png", i);
+        decalTex[DECAL_BLOOD_DROP_1 + i] = textureGet(name);
+    }
+}
+
+/* Full form; call sites tune sizeChange/life afterward. */
+static Decal *decalSpawn(int id, float x, float y, float z, float pitch,
+                         float yaw, float roll, float size, float alpha,
+                         int blend) {
+    if (id < 0 || id >= DECAL_ID_MAX || !decalTex[id]) return NULL;
+    Decal *d = &decals[decalHead];
+    decalHead = (decalHead + 1) % MAX_DECALS;
+    d->used = 1;
+    d->id = id;
+    d->pos[0] = x; d->pos[1] = y; d->pos[2] = z;
+    d->pitch = pitch; d->yaw = yaw; d->roll = roll;
+    d->size = size; d->sizeChange = 0.0f; d->maxSize = size > 1.0f ? size : 1.0f;
+    d->alpha = alpha; d->alphaChange = 0.0f;
+    d->blend = blend;
+    d->timer = 0.0f;
+    d->life = -1.0f;
+    return d;
+}
+
+/* A flat corrosion splat on the floor at (x,z), random spin. */
+static void decalCorrosion(float x, float y, float z, float size,
+                           float alpha) {
+    Decal *d = decalSpawn(DECAL_CORROSIVE_1, x, y + 0.5f, z, 90.0f,
+                          (float)(rand() % 360), 0.0f, size, alpha, 1);
+    if (d) {
+        d->sizeChange = -0.00002f * 256.0f; /* very slow shrink */
+        d->life = 5400.0f;
+    }
+}
+
+static void decalsUpdate(void) {
+    for (int i = 0; i < MAX_DECALS; i++) {
+        Decal *d = &decals[i];
+        if (!d->used) continue;
+        if (d->sizeChange != 0.0f) {
+            d->size += d->sizeChange;
+            if (d->sizeChange > 0.0f && d->size >= d->maxSize) {
+                d->size = d->maxSize;
+                d->sizeChange = 0.0f;
+            }
+        }
+        if (d->alphaChange != 0.0f) {
+            d->alpha += d->alphaChange;
+            if (d->alpha > 1.0f) d->alpha = 1.0f;
+        }
+        if (d->life > 0.0f) {
+            d->life -= 1.0f;
+            /* fade out the last second of life */
+            if (d->life < 60.0f) d->alpha = d->life / 60.0f;
+        }
+        if (d->size <= 0.0f || d->alpha <= 0.0f || d->life == 0.0f) {
+            d->used = 0;
+        }
+    }
+}
+
+static void decalsDraw(void) {
+    int any = 0;
+    for (int i = 0; i < MAX_DECALS; i++) if (decals[i].used) { any = 1; break; }
+    if (!any) return;
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
+    glDisableClientState(GL_COLOR_ARRAY);
+    glEnable(GL_TEXTURE_2D);
+    glEnable(GL_BLEND);
+    glEnable(GL_ALPHA_TEST);
+    glAlphaFunc(GL_GREATER, 0.02f);
+    glDisable(GL_CULL_FACE);
+    glDepthMask(GL_FALSE);
+    static const GLfloat uvs[12] = { 0, 0, 1, 0, 1, 1, 0, 0, 1, 1, 0, 1 };
+    glTexCoordPointer(2, GL_FLOAT, 0, uvs);
+    for (int i = 0; i < MAX_DECALS; i++) {
+        Decal *d = &decals[i];
+        if (!d->used) continue;
+        float ddx = d->pos[0] - camPos[0], ddz = d->pos[2] - camPos[2];
+        if (ddx * ddx + ddz * ddz > VIEW_RANGE * VIEW_RANGE) continue;
+        GLuint tex = decalTex[d->id];
+        if (!tex) continue;
+        switch (d->blend) {
+            case 2: glBlendFunc(GL_DST_COLOR, GL_ZERO); break;      /* mul */
+            case 3: glBlendFunc(GL_SRC_ALPHA, GL_ONE); break;       /* add */
+            default: glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+        }
+        glBindTexture(GL_TEXTURE_2D, tex);
+        glColor4f(1.0f, 1.0f, 1.0f, d->alpha);
+        float h = d->size * 256.0f;
+        GLfloat v[18] = {
+            -h,  h, 0.0f,   h,  h, 0.0f,   h, -h, 0.0f,
+            -h,  h, 0.0f,   h, -h, 0.0f,  -h, -h, 0.0f,
+        };
+        glPushMatrix();
+        glTranslatef(d->pos[0], d->pos[1], d->pos[2]);
+        glRotatef(-d->yaw, 0.0f, 1.0f, 0.0f);
+        glRotatef(d->pitch, 1.0f, 0.0f, 0.0f);
+        glRotatef(d->roll, 0.0f, 0.0f, 1.0f);
+        glVertexPointer(3, GL_FLOAT, 0, v);
+        glDrawArrays(GL_TRIANGLES, 0, 6);
+        glPopMatrix();
+    }
+    glColor4f(1, 1, 1, 1);
+    glDepthMask(GL_TRUE);
+    glDisable(GL_ALPHA_TEST);
+    glDisable(GL_BLEND);
+    glEnableClientState(GL_COLOR_ARRAY);
+}
+
 /* ---- SCP-106 ---- */
 static void draw106(const float viewPos[3]);
 
@@ -2707,6 +2870,16 @@ static void spawn106Near(void) {
     npc106State = N106_SPAWNING;
     npc106Frame = 111.0f;
     audioPlay(snd106Decay[rand() % 4], 1.0f, 0.0f);
+    /* A corrosion pool wells up under it as it materializes (source
+     * State 2: CreateDecal CORROSIVE_1, size 0.05, growing to full). */
+    Decal *pool = decalSpawn(DECAL_CORROSIVE_1, sx, npc106Pos[1] + 0.5f, sz,
+                             90.0f, (float)(rand() % 360), 0.0f, 0.05f, 0.85f,
+                             1);
+    if (pool) {
+        pool->sizeChange = 0.0015f;
+        pool->maxSize = 1.0f;
+        pool->life = 7200.0f;
+    }
 }
 
 static void reset106(void) {
@@ -2907,8 +3080,13 @@ static void pdChase106(float speed) {
     float o[3] = { npc106Pos[0], npc106Pos[1] + 250.0f, npc106Pos[2] };
     float hy;
     if (rayDownWorld(o, 6000.0f, &hy)) npc106Pos[1] = hy;
+    float prevFrame = npc106Frame;
     npc106Frame += 0.7f;
     if (npc106Frame > 333.0f) npc106Frame = 284.0f;
+    if ((prevFrame <= 286.0f && npc106Frame > 286.0f)
+        || (prevFrame <= 311.0f && npc106Frame > 311.0f)) {
+        decalCorrosion(npc106Pos[0], npc106Pos[1], npc106Pos[2], 0.12f, 0.8f);
+    }
 }
 
 static void pdKill(const char *cause) {
@@ -3170,8 +3348,17 @@ static void update106(void) {
             break;
         case N106_CHASING: {
             /* Walk cycle 284..333. */
+            float prevFrame = npc106Frame;
             npc106Frame += 0.7f;
             if (npc106Frame > 333.0f) npc106Frame = 284.0f;
+            /* Corrosive footprints on each footfall (source frames
+             * 286 / 311), leaving 106's trademark trail. */
+            if (dist < 2500.0f
+                && ((prevFrame <= 286.0f && npc106Frame > 286.0f)
+                    || (prevFrame <= 311.0f && npc106Frame > 311.0f))) {
+                decalCorrosion(npc106Pos[0], npc106Pos[1], npc106Pos[2],
+                               0.1f, 0.8f);
+            }
             if (dist < 150.0f && sameLevel) {
                 /* Caught: dragged into the pocket dimension. */
                 audioPlay(snd106Laugh, 1.0f, 0.0f);
@@ -3912,6 +4099,16 @@ static void updatePlayerCondition(void) {
         /* Wounds clot slowly on their own. */
         injuries -= 0.0025f;
         if (injuries < 0.0f) injuries = 0.0f;
+        /* Bleeding leaves droplets underfoot as the player moves. */
+        if (bloodloss > 4.0f && walkMode && rand() % 40 == 0) {
+            float fy;
+            float o[3] = { camPos[0], camPos[1], camPos[2] };
+            float gy = rayDownWorld(o, 3000.0f, &fy) ? fy
+                                                     : camPos[1] - EYE_HEIGHT;
+            decalSpawn(DECAL_BLOOD_DROP_1 + rand() % 2, camPos[0], gy + 0.5f,
+                       camPos[2], 90.0f, (float)(rand() % 360), 0.0f,
+                       0.05f + 0.03f * (bloodloss / 100.0f), 0.9f, 1);
+        }
         if (bloodloss >= 100.0f) {
             snprintf(deathCause, sizeof(deathCause), "BLOOD LOSS");
             deathTimer = 180;
@@ -5625,6 +5822,7 @@ int main(void) {
             loadSounds();
             optionsApply();
         }
+        decalsInit();
         /* Boot to the title menu; the world is generated when the
          * player starts or loads a game. */
         srand((unsigned)sceKernelGetProcessTimeWide());
@@ -5946,6 +6144,7 @@ int main(void) {
             }
             updatePocketDimension();
             updatePlayerCondition();
+            decalsUpdate();
             if (femurTimer > 0.0f) {
                 femurTimer += 1.0f;
                 /* Lure phase: 106 rises out of the pit to feed. */
@@ -6197,6 +6396,7 @@ int main(void) {
                 glPopMatrix();
             }
             drawPocketComposite(0);
+            decalsDraw();
             drawDoors(camPos);
             drawFixtures(camPos);
             drawItems(camPos);

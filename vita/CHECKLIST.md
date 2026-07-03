@@ -16,7 +16,8 @@ Updated as features land. States: **done** / **partial** / **missing**.
 | Runtime-expression doors | missing | ~30 CreateDoor calls with computed coordinates skipped by the extractor |
 | Elevators | missing | Elevator doors render but do not travel |
 | Levers, buttons w/ custom parents | partial | 31 levers + 30 standalone buttons render, flip/press with sound; the events they drive are not ported so they are cosmetic-interactive |
-| Security cameras / decals / particles / sprites | missing | Cosmetic layers of FillRoom |
+| Decals | partial | CreateDecal ported: textured floor/wall quads (corrosive, blood, blood-drop, pd sets) in a ring buffer with grow/fade/lifetime, alpha/multiply/additive blends. SCP-106 wells up a corrosion pool on spawn and leaves a footfall trail; the player bleeds droplets. Not yet used for the full FillRoom decal scatter or door-surface corrosion |
+| Security cameras / particles / sprites | missing | Cosmetic layers of FillRoom |
 | Lightmap blend model | partial | Source multiplies (TextureBlend 5/2) with AmbientLightRoomTex; port adds the lightmap additively |
 | Glass / alpha surfaces | done | Alpha-blended like LoadRMesh's Alpha mesh |
 | Fog / HideDistance | partial | Fixed black fog; source varies HideDistance per area/event |
@@ -70,7 +71,7 @@ Updated as features land. States: **done** / **partial** / **missing**.
 | SCP-173 | done | Freeze-on-sight, blink interplay, last-seen search, TeleportCloser, door opening, kill + camera wrench, horror stings, head tracking |
 | Skeletal animation engine | done | B3D BONE/KEYS/ANIM, CPU skin, VBO path |
 | Intro guards / Class-Ds | done | Source roster, idles, walking escort, gunfire enforcement |
-| SCP-106 | partial | Roaming hunter; femur-breaker recontainment now gated on the magnet lever, with 106 lured up to feed then contained; catch drags you to the pocket dimension |
+| SCP-106 | partial | Roaming hunter; femur-breaker recontainment now gated on the magnet lever, with 106 lured up to feed then contained; catch drags you to the pocket dimension; leaves a corrosion pool on spawn and a footfall trail. Missing vs source: the grab/head-wrench attack (teleports on contact instead), the trailing OBJ2 back-body, door-surface corrosion, the blur/camera-zoom dread pulse, and difficulty/room-modulated spawn timing |
 | SCP-682 | partial | Roar set-piece via the e_682_roar event (countdown + roar + camera shake); no roaming battle |
 | SCP-096, 049, 049-2, 939, 966, 860-1, 1499-1 | missing | |
 | Guards/MTF in gameplay | missing | Only intro figures |
