@@ -1062,6 +1062,8 @@ static void reset106(void);
 static void enterPocketDimension(void);
 static void updatePocketDimension(void);
 static void teslaSpawn(void);
+static void spawn096(void);
+static void reset096(void);
 
 static void regenerateMap(uint32_t seed) {
     memset(roomVisited, 0, sizeof(roomVisited));
@@ -1098,6 +1100,7 @@ static void regenerateMap(uint32_t seed) {
         spawnRoomFixtures();
         spawnRoomEvents();
         teslaSpawn();
+        spawn096();
         eventRng = mapSeed ^ 0xA5A5F00Du;
         spawnItems();
         reset173();
@@ -1362,6 +1365,8 @@ static void loadSounds(void) {
     sndPdExit = audioLoad(SFX_DIR "/Room/PocketDimension/Exit.ogg");
     sndPdRumble = audioLoad(SFX_DIR "/Room/PocketDimension/Rumble.ogg");
     sndPdExplode = audioLoad(SFX_DIR "/Room/PocketDimension/Explosion.ogg");
+    snd096Trigger = audioLoad(SFX_DIR "/SCP/096/Triggered.ogg");
+    snd096Scream = audioLoad(SFX_DIR "/SCP/096/Scream.ogg");
     sndTeslaIdle = audioLoad(SFX_DIR "/Room/Tesla/Idle.ogg");
     sndTeslaWind = audioLoad(SFX_DIR "/Room/Tesla/WindUp.ogg");
     sndTeslaShock = audioLoad(SFX_DIR "/Room/Tesla/Shock.ogg");
@@ -1532,6 +1537,23 @@ static float npc106Frame;
 static float npc106Timer;      /* dormant spawn countdown */
 static int npc106Cool;         /* teleport-behind cooldown */
 
+/* ---- SCP-096: harmless while unseen; looking at its face enrages it,
+ * and after a scream it sprints down and kills you (UpdateNPCType096).
+ * Anim frames from the source: sit 936..1263, get-up 193..311, scream
+ * 1471..1556, run 737..935. ---- */
+static SkinnedMesh *skin096;
+static float skin096Scale = 1.0f;
+static GLuint vbo096;
+static int posed096;
+enum { S096_IDLE = 0, S096_TRIGGERED, S096_CHASE };
+static int npc096State;
+static int npc096Active;
+static float npc096Pos[3];
+static float npc096YawDeg;
+static float npc096Frame;
+static float npc096ScreamTimer; /* frames spent screaming before it runs */
+static int snd096Trigger = -1, snd096Scream = -1;
+
 static void buildHumanRT(ModelRT *rt, const char *model, const char *tex) {
     buildModelRT(rt, model, 0, 0, 0, tex);
     if (!rt->ok || !rt->scene) return;
@@ -1567,6 +1589,13 @@ static void buildNpcAssets(void) {
         if (skin106) {
             skinnedBounds(skin106, mn, mx);
             if (mx[1] > mn[1]) skin106Scale = 300.0f / (mx[1] - mn[1]);
+        }
+        B3DModel *m096 = propModelGet("scp_096.b3d");
+        skin096 = m096 ? skinnedCreate(m096) : NULL;
+        if (skin096) {
+            skinnedBounds(skin096, mn, mx);
+            /* Taller than 106 - it's a lanky ~2.4 m creature. */
+            if (mx[1] > mn[1]) skin096Scale = 460.0f / (mx[1] - mn[1]);
         }
     }
     buildHumanRT(&introScientistRT, "class_d.b3d", "scientist.png");
@@ -2910,6 +2939,7 @@ static void decalsDraw(void) {
 
 /* ---- SCP-106 ---- */
 static void draw106(const float viewPos[3]);
+static void draw096(const float viewPos[3]);
 
 static void spawn106Near(void) {
     /* Behind the player, out of the cell if possible, on the floor. */
@@ -3580,6 +3610,161 @@ static void update106(void) {
     }
 }
 
+/* ---- SCP-096 ---- */
+
+static void reset096(void) {
+    /* Calm it back to sitting where it stands (a respawn / new run). */
+    npc096State = S096_IDLE;
+    npc096Frame = 936.0f;
+    npc096ScreamTimer = 0.0f;
+}
+
+static void spawn096(void) {
+    npc096Active = 0;
+    if (!skin096) return;
+    /* Its containment / HCZ rooms (e_096_spawn). Fall back to any large
+     * room3/room4 if the zone split hasn't placed an HCZ variant. */
+    static const char *SPAWN_ROOMS[] = {
+        "room2_3_hcz", "room2_4_hcz", "room2_5_hcz", "room2_hcz",
+        "room3_hcz", "room3_2_hcz", "room3_3_hcz", "room4_hcz",
+        "room4_2_hcz",
+    };
+    int best = -1;
+    for (uint32_t r = 0; r < map.roomCount && best < 0; r++) {
+        const char *nm = tplList.items[map.rooms[r].templateIndex].name;
+        for (unsigned s = 0; s < sizeof(SPAWN_ROOMS) / sizeof(SPAWN_ROOMS[0]);
+             s++) {
+            if (strcmp(nm, SPAWN_ROOMS[s]) == 0) { best = (int)r; break; }
+        }
+    }
+    if (best < 0) {
+        for (uint32_t r = 0; r < map.roomCount && best < 0; r++) {
+            const char *nm = tplList.items[map.rooms[r].templateIndex].name;
+            if (strncmp(nm, "room3", 5) == 0 || strncmp(nm, "room4", 5) == 0) {
+                best = (int)r;
+            }
+        }
+    }
+    if (best < 0) return;
+    npc096Pos[0] = map.rooms[best].gridX * ROOM_SPACING;
+    npc096Pos[2] = map.rooms[best].gridY * ROOM_SPACING;
+    npc096Pos[1] = 0.0f;
+    npc096State = S096_IDLE;
+    npc096Frame = 936.0f;
+    npc096YawDeg = 0.0f;
+    npc096ScreamTimer = 0.0f;
+    npc096Active = 1;
+}
+
+/* UpdateNPCType096: sits harmless until the player looks at its face,
+ * then gets up, screams, and sprints down the player, killing on
+ * contact. Looking away after the trigger does not stop it. */
+static void update096(void) {
+    if (!npc096Active || !skin096 || deathTimer > 0 || !walkMode
+        || introPhase >= 0 || inPocket) {
+        return;
+    }
+    float dx = camPos[0] - npc096Pos[0];
+    float dz = camPos[2] - npc096Pos[2];
+    float dist = sqrtf(dx * dx + dz * dz);
+
+    /* IsLooking: 096 on screen (in the view cone), within sight range,
+     * and the player is not mid-blink. */
+    int looking = 0;
+    if (dist < 4200.0f && blinkFrames == 0) {
+        float vx = sinf(camYaw), vz = -cosf(camYaw);
+        float facing = dist > 1.0f ? (-dx * vx - dz * vz) / dist : 1.0f;
+        if (facing > 0.55f) looking = 1;
+    }
+
+    switch (npc096State) {
+        case S096_IDLE:
+            /* Sit and cover its face (936..1263), harmless. */
+            npc096Frame += 0.1f;
+            if (npc096Frame > 1263.0f) npc096Frame = 936.0f;
+            if (looking && dist < 3400.0f) {
+                npc096State = S096_TRIGGERED;
+                npc096Frame = 193.0f;
+                npc096ScreamTimer = 0.0f;
+                npc096YawDeg = atan2f(dx, dz) * 180.0f / 3.14159265f;
+                audioPlay(snd096Trigger, 1.0f, 0.0f);
+                cameraZoom = 10.0f;
+            }
+            break;
+        case S096_TRIGGERED:
+            /* Get up (193..311), then scream in place (1471..1556) for a
+             * while before it charges. Source screams ~26 s; compressed
+             * to ~8 s so the port stays playable. */
+            npc096ScreamTimer += 1.0f;
+            npc096YawDeg = atan2f(dx, dz) * 180.0f / 3.14159265f;
+            if (npc096Frame < 311.0f) {
+                npc096Frame += 0.5f;
+            } else {
+                npc096Frame += 0.4f;
+                if (npc096Frame > 1556.0f) npc096Frame = 1471.0f;
+                if ((int)npc096ScreamTimer == 40) {
+                    audioPlay(snd096Scream, 1.0f, 0.0f);
+                }
+            }
+            if (npc096ScreamTimer > 480.0f) {
+                npc096State = S096_CHASE;
+                npc096Frame = 737.0f;
+                audioPlay(snd096Scream, 0.9f, 0.0f);
+            }
+            break;
+        case S096_CHASE: {
+            /* Run cycle 737..935; sprint toward the player. */
+            npc096Frame += 0.8f;
+            if (npc096Frame > 935.0f) npc096Frame = 737.0f;
+            if (dist < 190.0f) {
+                /* Caught: a savage kill (source: shake 30, blur, blood
+                 * decals, death "096"). */
+                camShake = 5.0f;
+                blurAmount = 0.9f;
+                float feet = camPos[1] - EYE_HEIGHT;
+                for (int i = 0; i < 8; i++) {
+                    float a = (float)(rand() % 628) / 100.0f;
+                    float rr = 40.0f + (float)(rand() % 160);
+                    decalSpawn(DECAL_BLOOD_DROP_1 + rand() % 2,
+                               camPos[0] + cosf(a) * rr, feet + 0.5f,
+                               camPos[2] + sinf(a) * rr, 90.0f,
+                               (float)(rand() % 360), 0.0f,
+                               0.1f + (float)(rand() % 25) / 100.0f, 0.9f, 1);
+                }
+                audioPlay(snd096Scream, 1.0f, 0.0f);
+                snprintf(deathCause, sizeof(deathCause), "SCP-096");
+                deathTimer = 180;
+                return;
+            }
+            float ndx, ndz, wp[2];
+            if (navNextCell(npc096Pos[0], npc096Pos[2], camPos[0], camPos[2],
+                            wp)) {
+                ndx = wp[0] - npc096Pos[0];
+                ndz = wp[1] - npc096Pos[2];
+            } else {
+                ndx = dx;
+                ndz = dz;
+            }
+            float d = sqrtf(ndx * ndx + ndz * ndz);
+            if (d > 1.0f) { ndx /= d; ndz /= d; }
+            npc096Pos[0] += ndx * 78.0f;   /* Speed 6.0 -> a fast sprint */
+            npc096Pos[2] += ndz * 78.0f;
+            npc096YawDeg = atan2f(ndx, ndz) * 180.0f / 3.14159265f;
+            float o[3] = { npc096Pos[0], npc096Pos[1] + 250.0f, npc096Pos[2] };
+            float hy;
+            if (rayDownWorld(o, 600.0f, &hy)) npc096Pos[1] = hy;
+            /* The dread-zoom pulses while it bears down (me\CurrCameraZoom). */
+            if (dist < 3000.0f) {
+                float pz = (sinf(gTick * 0.05f) + 1.0f) * 8.0f;
+                if (cameraZoom < pz) cameraZoom = pz;
+            }
+            break;
+        }
+        default:
+            break;
+    }
+}
+
 /* ---- Tesla gates ---- */
 
 static void teslaSpawn(void) {
@@ -3898,6 +4083,46 @@ static void draw106(const float viewPos[3]) {
             glDisable(GL_BLEND);
         }
     }
+}
+
+static void draw096(const float viewPos[3]) {
+    if (!npc096Active || !skin096) return;
+    float dx = npc096Pos[0] - viewPos[0], dz = npc096Pos[2] - viewPos[2];
+    if (dx * dx + dz * dz > VIEW_RANGE * VIEW_RANGE) return;
+    GLuint *ibos = skinIBOsFor(skin096);
+    if (!ibos) return;
+    if (!vbo096) glGenBuffers(1, &vbo096);
+    static int poseTick;
+    if (!posed096 || ((poseTick++) & 1) == 0) {
+        skinnedEval(skin096, npc096Frame);
+        uint32_t vc;
+        const SceneVertex *verts = skinnedVertices(skin096, &vc);
+        glBindBuffer(GL_ARRAY_BUFFER, vbo096);
+        glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)(vc * sizeof(SceneVertex)),
+                     verts, GL_DYNAMIC_DRAW);
+        glBindBuffer(GL_ARRAY_BUFFER, 0);
+        posed096 = 1;
+    }
+    glPushMatrix();
+    glTranslatef(npc096Pos[0], npc096Pos[1], npc096Pos[2]);
+    glRotatef(-npc096YawDeg + 180.0f, 0.0f, 1.0f, 0.0f);
+    glScalef(skin096Scale, skin096Scale, skin096Scale);
+    glBindBuffer(GL_ARRAY_BUFFER, vbo096);
+    glVertexPointer(3, GL_FLOAT, sizeof(SceneVertex), VTX_OFF(x));
+    glColorPointer(4, GL_UNSIGNED_BYTE, sizeof(SceneVertex), VTX_OFF(r));
+    glTexCoordPointer(2, GL_FLOAT, sizeof(SceneVertex), VTX_OFF(du));
+    for (uint32_t b = 0; b < skinnedBatchCount(skin096); b++) {
+        const SkinBatch *batch = skinnedBatch(skin096, b);
+        GLuint tex = textureGet(batch->textureName);
+        if (tex) { glEnable(GL_TEXTURE_2D); glBindTexture(GL_TEXTURE_2D, tex); }
+        else glDisable(GL_TEXTURE_2D);
+        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, ibos[b]);
+        glDrawElements(GL_TRIANGLES, (GLsizei)batch->indexCount,
+                       GL_UNSIGNED_SHORT, NULL);
+    }
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
+    glPopMatrix();
 }
 
 /* ---------------- items and inventory ---------------- */
@@ -6542,6 +6767,7 @@ int main(void) {
             doorsUpdate(&doors);
             update173();
             update106();
+            update096();
             introUpdate();
             if (introPhase < 0 && !inPocket) {
                 updateZoneMusic();
@@ -6607,6 +6833,7 @@ int main(void) {
                 npc173WasMoving = 0;
                 npc173EnemyX = npc173EnemyZ = 0.0f;
                 npc173LastDist = 1e9f;
+                reset096();
                 health = 100.0f;
                 injuries = 0.0f;
                 bloodloss = 0.0f;
@@ -6809,6 +7036,7 @@ int main(void) {
             drawItems(camPos);
             draw173(camPos);
             draw106(camPos);
+            draw096(camPos);
             drawTeslaArcs(camPos);
             drawPocketPillars();
             drawPocketThrone();
