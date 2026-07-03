@@ -590,6 +590,8 @@ static int inPocket;          /* player is in the pocket dimension */
 static float pocketTimer;     /* frames until it collapses (death) */
 static int npc106Contained;   /* femur breaker: 106 permanently stopped */
 static float femurTimer;      /* femur breaker sequence progress */
+static float femurSpot[3];    /* world pos of the breaker pit */
+static int sndMagnetUp = -1, sndMagnetDown = -1;
 static float pdReturn[4];     /* pre-catch pos + yaw to restore */
 static int sndPdEnter = -1, sndPdExit = -1, sndPdRumble = -1,
            sndPdExplode = -1;
@@ -1138,6 +1140,8 @@ static void loadSounds(void) {
     snd106Laugh = audioLoad(SFX_DIR "/SCP/106/Laugh.ogg");
     snd106Breath = audioLoad(SFX_DIR "/SCP/106/Breathing.ogg");
     sndFemur = audioLoad(SFX_DIR "/Room/106Chamber/FemurBreaker.ogg");
+    sndMagnetUp = audioLoad(SFX_DIR "/Room/106Chamber/MagnetUp.ogg");
+    sndMagnetDown = audioLoad(SFX_DIR "/Room/106Chamber/MagnetDown.ogg");
     sndPdEnter = audioLoad(SFX_DIR "/Room/PocketDimension/Enter.ogg");
     sndPdExit = audioLoad(SFX_DIR "/Room/PocketDimension/Exit.ogg");
     sndPdRumble = audioLoad(SFX_DIR "/Room/PocketDimension/Rumble.ogg");
@@ -2602,7 +2606,7 @@ static void updatePocketDimension(void) {
 
 static void update106(void) {
     if (!npc106Active || deathTimer > 0 || !walkMode || introPhase >= 0
-        || inPocket) {
+        || inPocket || femurTimer > 0.0f) {
         return;
     }
     float dx = camPos[0] - npc106Pos[0];
@@ -5151,6 +5155,10 @@ int main(void) {
                     lv->on = !lv->on;
                     float lp[3] = { lv->x, camPos[1], lv->z };
                     audioPlay3D(sndLever, lp, camPos, camYaw, 1200.0f);
+                    if (strcmp(roomNameAt(camPos), "cont1_106") == 0) {
+                        audioPlay(lv->on ? sndMagnetUp : sndMagnetDown,
+                                  0.8f, 0.0f);
+                    }
                 } else {
                     WorldButton *bt = &worldButtons[fx];
                     bt->press = 1.0f;
@@ -5166,12 +5174,33 @@ int main(void) {
                                && !npc106Contained
                                && strcmp(roomNameAt(camPos),
                                          "cont1_106") == 0) {
-                        /* The femur breaker: lure and recontain 106. */
-                        femurTimer = 1.0f;
-                        audioPlay(sndFemur, 1.0f, 0.0f);
-                        snprintf(toastMsg, sizeof(toastMsg),
-                                 "THE FEMUR BREAKER ACTIVATES...");
-                        toastTimer = 200;
+                        /* The femur breaker: the magnet (a chamber
+                         * lever) must be engaged first (source: the
+                         * button does nothing until EventState2). */
+                        int magnetOn = 0;
+                        for (int li = 0; li < worldLeverCount; li++) {
+                            float lx = worldLevers[li].x - bt->x;
+                            float lz = worldLevers[li].z - bt->z;
+                            if (lx * lx + lz * lz < 2500.0f * 2500.0f
+                                && worldLevers[li].on) {
+                                magnetOn = 1;
+                                break;
+                            }
+                        }
+                        if (!magnetOn) {
+                            snprintf(toastMsg, sizeof(toastMsg),
+                                     "ENGAGE THE MAGNET FIRST (THE LEVER)");
+                            toastTimer = 200;
+                        } else {
+                            femurTimer = 1.0f;
+                            femurSpot[0] = bt->x;
+                            femurSpot[1] = bt->y;
+                            femurSpot[2] = bt->z;
+                            audioPlay(sndFemur, 1.0f, 0.0f);
+                            snprintf(toastMsg, sizeof(toastMsg),
+                                     "THE FEMUR BREAKER ACTIVATES...");
+                            toastTimer = 200;
+                        }
                     }
                 }
             } else if (picked >= 0) {
@@ -5237,7 +5266,20 @@ int main(void) {
             updatePocketDimension();
             if (femurTimer > 0.0f) {
                 femurTimer += 1.0f;
-                if (femurTimer >= 900.0f) { /* ~15 s later */
+                /* Lure phase: 106 rises out of the pit to feed. */
+                if (femurTimer > 300.0f && femurTimer < 840.0f) {
+                    npc106Active = 1;
+                    npc106State = N106_SPAWNING;
+                    npc106Pos[0] = femurSpot[0];
+                    npc106Pos[2] = femurSpot[2];
+                    float rise = (femurTimer - 300.0f) / 540.0f;
+                    npc106Pos[1] = femurSpot[1] - 280.0f + rise * 280.0f;
+                    npc106Frame = 110.0f; /* feeding pose */
+                    if (femurTimer < 320.0f) {
+                        audioPlay(snd106Decay[rand() % 4], 1.0f, 0.0f);
+                    }
+                }
+                if (femurTimer >= 900.0f) {
                     femurTimer = 0.0f;
                     npc106Contained = 1;
                     npc106Active = 0;
