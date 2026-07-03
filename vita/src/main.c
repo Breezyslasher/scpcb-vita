@@ -1689,6 +1689,7 @@ static float npc0492Pos[MAX_0492][3];
 static float npc0492Yaw[MAX_0492];
 static int npc0492Active[MAX_0492];
 static int npc0492Count;
+static float npc0492Cool;       /* shared bite cadence */
 
 /* ---- SCP-939: a blind pack predator in room3_storage that hunts by
  * sound - loud players draw it, a hushed crouch slips past. Bites hurt;
@@ -3392,9 +3393,11 @@ static int pdOrbit106(float cx, float cz) {
         if (npc106Frame > 333.0f || npc106Frame < 284.0f) {
             npc106Frame = 284.0f;
         }
-        npc106YawDeg = -atan2f(camPos[0] - npc106Pos[0],
-                               camPos[2] - npc106Pos[2])
-                     * 180.0f / 3.14159265f + 180.0f;
+        /* Store the raw heading; draw106 applies the -yaw+180 render
+         * transform (baking it in here double-rotated the model). */
+        npc106YawDeg = atan2f(camPos[0] - npc106Pos[0],
+                              camPos[2] - npc106Pos[2])
+                     * 180.0f / 3.14159265f;
         /* After a long dwell (~70*65 frames) it may pounce. */
         if (pdEventState > 4550.0f && rand() % 800 == 0) {
             pdLunging = 1;
@@ -3409,7 +3412,7 @@ static int pdOrbit106(float cx, float cz) {
     if (d > 1.0f) {
         npc106Pos[0] += dx / d * 40.0f;
         npc106Pos[2] += dz / d * 40.0f;
-        npc106YawDeg = -atan2f(dx, dz) * 180.0f / 3.14159265f + 180.0f;
+        npc106YawDeg = atan2f(dx, dz) * 180.0f / 3.14159265f;
     }
     npc106Frame += 0.7f;
     if (npc106Frame > 333.0f) npc106Frame = 284.0f;
@@ -4018,9 +4021,10 @@ static void update096(void) {
             float o[3] = { npc096Pos[0], npc096Pos[1] + 250.0f, npc096Pos[2] };
             float hy;
             if (rayDownWorld(o, 600.0f, &hy)) npc096Pos[1] = hy;
-            /* The dread-zoom pulses while it bears down (me\CurrCameraZoom). */
+            /* The dread-zoom pulses while it bears down (me\CurrCameraZoom,
+             * Sin(MilliSec/20)*10). */
             if (dist < 3000.0f) {
-                float pz = (sinf(gTick * 0.05f) + 1.0f) * 8.0f;
+                float pz = (sinf(gTick * 0.05f) + 1.0f) * 10.0f;
                 if (cameraZoom < pz) cameraZoom = pz;
             }
             break;
@@ -4099,8 +4103,8 @@ static void doctorStep(const float from[3], float speed, float out[3]) {
 }
 
 /* UpdateNPCType049: idles until active, then walks the player down and
- * kills on contact (the hazmat/714 delays are not ported - no such item
- * effects yet). Phases closer when far, like 173/106. */
+ * "cures" on contact; a hazmat suit or SCP-714 delays that (and can be
+ * torn off). Phases closer when far, like 173/106. */
 static void update049(void) {
     if (!npc049Active || !skin049 || deathTimer > 0 || !walkMode
         || introPhase >= 0 || inPocket || inMask) {
@@ -4220,6 +4224,7 @@ static void update0492(void) {
     }
     npc0492Frame += 0.5f;
     if (npc0492Frame > 794.0f) npc0492Frame = 705.0f;
+    if (npc0492Cool > 0.0f) npc0492Cool -= 1.0f;
     /* Only shamble once 049 itself is on the hunt. */
     if (npc049State == S049_IDLE) return;
     for (int z = 0; z < npc0492Count; z++) {
@@ -4227,10 +4232,16 @@ static void update0492(void) {
         float dx = camPos[0] - npc0492Pos[z][0];
         float dz = camPos[2] - npc0492Pos[z][2];
         if (dx * dx + dz * dz < 200.0f * 200.0f) {
-            audioPlay(snd049Horror, 0.9f, 0.0f);
-            snprintf(deathCause, sizeof(deathCause), "SCP-049-2");
-            deathTimer = 180;
-            return;
+            /* They maul rather than instakill (source injures on each
+             * bite; enough of them bleed you out). */
+            if (npc0492Cool <= 0.0f) {
+                injuries += 1.6f;
+                damageFlash = 0.6f;
+                camShake = 1.5f;
+                audioPlay(snd049Horror, 0.9f, 0.0f);
+                npc0492Cool = 45.0f;
+            }
+            continue;
         }
         float step[3];
         doctorStep(npc0492Pos[z], 24.0f, step);
@@ -4288,6 +4299,11 @@ static void update939(void) {
     float dz = camPos[2] - npc939Pos[2];
     float dist = sqrtf(dx * dx + dz * dz);
     if (npc939Cool > 0.0f) npc939Cool -= 1.0f;
+    /* Keep it on the floor in every state (it used to only settle while
+     * attacking, so it floated when idle/alert). */
+    float go[3] = { npc939Pos[0], npc939Pos[1] + 250.0f, npc939Pos[2] };
+    float ghy;
+    if (rayDownWorld(go, 600.0f, &ghy)) npc939Pos[1] = ghy;
 
     /* Heard-range grows with the player's noise (SndVolume). */
     float heard = 400.0f + playerNoise * 3200.0f;
@@ -4412,39 +4428,46 @@ static void update966(void) {
     npc966Frame += 0.2f;
     if (npc966Frame > 214.0f) npc966Frame = 2.0f;
 
-    /* Watched through the goggles it hangs back; unseen it closes in. */
+    /* Faithful to the source: 966 does NOT tire the player - a *tired*
+     * player rouses IT. Aggression builds while the player is exhausted
+     * and unwatched, and eases when rested or watched through the
+     * goggles (source: me\Stamina < 10 raises n\State3 toward attack). */
     int seen = wearNVG != 0;
-    float speed = seen ? -6.0f : (npc966Drowsy > 300.0f ? 26.0f : 12.0f);
-    if (dist > 220.0f || speed < 0.0f) {
-        float d = dist > 1.0f ? dist : 1.0f;
-        npc966Pos[0] += dx / d * speed;
-        npc966Pos[2] += dz / d * speed;
+    if (!seen && stamina < 15.0f) {
+        npc966Drowsy += 1.0f;
+    } else if (npc966Drowsy > 0.0f) {
+        npc966Drowsy -= 0.2f;
+    }
+    int aggro = npc966Drowsy > 300.0f;
+
+    /* Watched, it backs away; unseen it creeps closer - and rushes once
+     * roused. Moves every frame (it used to freeze at the kill boundary
+     * and hover there). */
+    float speed = seen ? -8.0f : (aggro ? 26.0f : 10.0f);
+    if (dist > 1.0f) {
+        npc966Pos[0] += dx / dist * speed;
+        npc966Pos[2] += dz / dist * speed;
         npc966YawDeg = atan2f(dx, dz) * 180.0f / 3.14159265f;
     }
     float o[3] = { npc966Pos[0], npc966Pos[1] + 250.0f, npc966Pos[2] };
     float hy;
     if (rayDownWorld(o, 600.0f, &hy)) npc966Pos[1] = hy;
 
+    /* Near and unwatched, it steals your rest - draining sanity and
+     * blurring the view - but it never touches your stamina. */
     if (dist < 900.0f && !seen) {
-        /* Near and unwatched: it saps rest and sanity, building toward
-         * aggression; the view blurs with drowsiness. */
-        npc966Drowsy += 1.0f;
-        stamina -= 0.5f;
-        if (stamina < 0.0f) stamina = 0.0f;
         sanity -= 0.12f;
         if (sanity < 0.0f) sanity = 0.0f;
         if (blurAmount < 0.3f) blurAmount = 0.3f;
-        if (npc966Drowsy > 60.0f
-            && (int)npc966Drowsy % 360 == 0) {
+        if (aggro && (int)npc966Drowsy % 360 == 0) {
             snprintf(toastMsg, sizeof(toastMsg),
                      "YOUR EYELIDS ARE SO HEAVY...");
             toastTimer = 150;
         }
-    } else if (npc966Drowsy > 0.0f) {
-        npc966Drowsy -= 0.5f; /* rest recovers when it is far or watched */
     }
-    /* Caught while exhausted: it takes you in your sleep. */
-    if (dist < 220.0f && !seen && (stamina < 5.0f || npc966Drowsy > 500.0f)) {
+    /* Caught, unwatched, while exhausted or fully roused: it takes you
+     * in your sleep. */
+    if (dist < 200.0f && !seen && (aggro || stamina < 5.0f)) {
         snprintf(deathCause, sizeof(deathCause), "SCP-966");
         deathTimer = 180;
     }
@@ -4680,32 +4703,38 @@ static void update860(void) {
     if (dist > 1.0f) {
         npc860YawDeg = atan2f(dx, dz) * 180.0f / 3.14159265f;
     }
-    if (dist < 180.0f) {
-        snprintf(deathCause, sizeof(deathCause), "SCP-860-1");
-        audioPlay(sndHorror11, 1.0f, 0.0f);
-        deathTimer = 180;
-        return;
-    }
-    /* Watched? (in the view cone, in range, eyes open). */
+    /* Watched? (in the view cone, in range, eyes open). Like the source,
+     * it never moves or harms the player while it is being looked at -
+     * only in the dark, once it has actually reached you, does it kill. */
     int seen = 0;
     if (blinkFrames == 0 && dist < 4500.0f) {
         float vx = sinf(camYaw), vz = -cosf(camYaw);
         float facing = dist > 1.0f ? (-dx * vx - dz * vz) / dist : 1.0f;
         if (facing > 0.4f) seen = 1;
     }
-    if (seen) {
-        if (npc860Cool > 0) npc860Cool--;
-        return; /* frozen while watched */
+    if (npc860Cool > 0) npc860Cool--;
+    if (seen) return; /* frozen while watched - safe */
+    if (dist < 180.0f) {
+        snprintf(deathCause, sizeof(deathCause), "SCP-860-1");
+        audioPlay(sndHorror11, 1.0f, 0.0f);
+        deathTimer = 180;
+        return;
     }
-    /* Unwatched: it closes fast, and now and then lurches much nearer. */
+    /* Unwatched: it closes fast, and now and then lurches much nearer -
+     * always landing behind the player, out of view. */
     if (dist > 1.0f) {
         npc860Pos[0] += dx / dist * 44.0f;
         npc860Pos[2] += dz / dist * 44.0f;
     }
-    if (npc860Cool > 0) npc860Cool--;
     if (npc860Cool == 0 && dist > 1400.0f) {
-        npc860Pos[0] = camPos[0] - dx / dist * 900.0f;
-        npc860Pos[2] = camPos[2] - dz / dist * 900.0f;
+        /* Recompute from the post-step position so the lurch lands the
+         * intended distance behind the player. */
+        float bx = camPos[0] - npc860Pos[0], bz = camPos[2] - npc860Pos[2];
+        float bd = sqrtf(bx * bx + bz * bz);
+        if (bd > 1.0f) {
+            npc860Pos[0] = camPos[0] - bx / bd * 900.0f;
+            npc860Pos[2] = camPos[2] - bz / bd * 900.0f;
+        }
         npc860Cool = 120;
         audioPlay3D(sndStep[rand() % 4], npc860Pos, camPos, camYaw, 3000.0f);
     }
