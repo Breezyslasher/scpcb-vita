@@ -806,6 +806,58 @@ static void pdInstToWorld(const PdInstance *in, const float l[3],
     w[2] = s * l[0] + c * l[2] + oz + in->off[2];
 }
 
+/* The maintenance tunnels: the source builds a 19x19 procedural grid of
+ * tunnel tiles below the facility, reached by room2_mt's elevators. That
+ * whole sub-map is not ported; instead a single self-contained tunnel
+ * cross (mt4.rmesh) is overlaid off-grid as a real destination the cars
+ * ride down to, with a return elevator. Built once, kept for the run. */
+#define MT_GX -20
+#define MT_GY -24
+static Scene *mtScene;
+static BatchGL *mtGL;
+static CollisionWorld *mtCol;
+static int mtReturnDoor = -1;
+static float mtEntr[3];        /* facility room2_mt landing */
+static int mtEntrOK;
+
+static int inMtBounds(float x, float z) {
+    if (!mtScene) return 0;
+    float ox = MT_GX * ROOM_SPACING, oz = MT_GY * ROOM_SPACING;
+    return x > ox - 1200.0f && x < ox + 1200.0f
+        && z > oz - 1200.0f && z < oz + 1200.0f;
+}
+
+static void buildMtComposite(void) {
+    if (mtScene) return;
+    char err[128];
+    RMesh *mesh = rmeshLoadFile(MAP_DIR "/mt4.rmesh", err, sizeof(err));
+    if (!mesh) return;
+    mtScene = sceneBuild(mesh);
+    if (!mtScene) { rmeshFree(mesh); return; }
+    mtCol = collisionBuild(mtScene, mesh);
+    rmeshFree(mesh);
+    mtGL = (BatchGL *)calloc(mtScene->batchCount ? mtScene->batchCount : 1,
+                             sizeof(BatchGL));
+    if (!mtGL) return;
+    for (uint32_t i = 0; i < mtScene->batchCount; i++) {
+        const SceneBatch *b = &mtScene->batches[i];
+        mtGL[i].diffuse = textureGet(b->diffuseName);
+        mtGL[i].lightmap = textureGet(b->lightmapName);
+        glGenBuffers(1, &mtGL[i].vbo);
+        glBindBuffer(GL_ARRAY_BUFFER, mtGL[i].vbo);
+        glBufferData(GL_ARRAY_BUFFER,
+                     (GLsizeiptr)(b->vertexCount * sizeof(SceneVertex)),
+                     b->vertices, GL_STATIC_DRAW);
+        glGenBuffers(1, &mtGL[i].ibo);
+        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, mtGL[i].ibo);
+        glBufferData(GL_ELEMENT_ARRAY_BUFFER,
+                     (GLsizeiptr)(b->indexCount * sizeof(uint16_t)),
+                     b->indices, GL_STATIC_DRAW);
+    }
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
+}
+
 static void appendPocketRoom(void) {
     pdRoomIdx = -1;
     int tplIdx = -1;
@@ -904,6 +956,30 @@ static void appendGateRooms(void) {
             gateBEntr[1] = 0.0f;
             gateBEntr[2] = map.rooms[i].gridY * ROOM_SPACING;
             gateBEntrOK = 1;
+        }
+    }
+}
+
+/* Build the maintenance-tunnel overlay, give it a return elevator, and
+ * record the facility room2_mt landing so those cars ride to it and
+ * back. Call after the grid doors are generated. */
+static void setupMaintenanceTunnel(void) {
+    buildMtComposite();
+    mtReturnDoor = -1;
+    mtEntrOK = 0;
+    if (mtScene) {
+        doorsAddInternal(&doors, MT_GX * ROOM_SPACING, 0.0f,
+                         MT_GY * ROOM_SPACING, 0, 1, 0, 0, 0, 0, 0);
+        mtReturnDoor = (int)doors.count - 1;
+    }
+    for (uint32_t i = 0; i < map.roomCount; i++) {
+        if (strcmp(tplList.items[map.rooms[i].templateIndex].name,
+                   "room2_mt") == 0) {
+            mtEntr[0] = map.rooms[i].gridX * ROOM_SPACING;
+            mtEntr[1] = 0.0f;
+            mtEntr[2] = map.rooms[i].gridY * ROOM_SPACING;
+            mtEntrOK = 1;
+            break;
         }
     }
 }
@@ -1032,6 +1108,17 @@ static void pushWorld(float pos[3], float radius, int *pushedUp) {
         }
         if (up && pushedUp) *pushedUp = 1;
     }
+    if (mtCol && inMtBounds(pos[0], pos[2])) {
+        float local[3] = { pos[0] - MT_GX * ROOM_SPACING, pos[1],
+                           pos[2] - MT_GY * ROOM_SPACING };
+        int up = 0;
+        if (collisionSpherePush(mtCol, local, radius, &up)) {
+            pos[0] = local[0] + MT_GX * ROOM_SPACING;
+            pos[1] = local[1];
+            pos[2] = local[2] + MT_GY * ROOM_SPACING;
+        }
+        if (up && pushedUp) *pushedUp = 1;
+    }
     if (pdMeshCount && inPocket) {
         for (int m = 0; m < pdInstCount; m++) {
             const PdMesh *pm = &pdMesh[pdInst[m].mesh];
@@ -1067,6 +1154,15 @@ static int rayDownWorld(const float origin[3], float maxDist, float *hitY) {
                            origin[2] - INTRO_GY * ROOM_SPACING };
         float y;
         if (collisionRayDown(introCellCol, local, maxDist, &y)) {
+            best = y;
+            hit = 1;
+        }
+    }
+    if (mtCol && inMtBounds(origin[0], origin[2])) {
+        float local[3] = { origin[0] - MT_GX * ROOM_SPACING, origin[1],
+                           origin[2] - MT_GY * ROOM_SPACING };
+        float y;
+        if (collisionRayDown(mtCol, local, maxDist, &y) && y > best) {
             best = y;
             hit = 1;
         }
@@ -1286,6 +1382,7 @@ static void regenerateMap(uint32_t seed) {
         doorsGenerate(&map, &tplList, mapSeed ^ 0x9E3779B9u, &doors);
         spawnRoomDoors();
         appendGateRooms();
+        setupMaintenanceTunnel();
         spawnRoomFixtures();
         spawnRoomEvents();
         teslaSpawn();
@@ -4996,6 +5093,14 @@ static void elevatorStart(const Door *d) {
         elevDest[0] = gateBEntr[0];
         elevDest[2] = gateBEntr[2];
         elevDoorB = di;
+    } else if (strcmp(here, "room2_mt") == 0 && mtScene) {
+        elevDest[0] = MT_GX * ROOM_SPACING;
+        elevDest[2] = MT_GY * ROOM_SPACING;
+        elevDoorB = mtReturnDoor;
+    } else if (inMtBounds(camPos[0], camPos[2]) && mtEntrOK) {
+        elevDest[0] = mtEntr[0];
+        elevDest[2] = mtEntr[2];
+        elevDoorB = di;
     } else {
         int dest = -1;
         for (uint32_t off = 1; off <= doors.count; off++) {
@@ -8578,6 +8683,13 @@ int main(void) {
                 drawBatchSet(introCellScene, introCellGL, 0);
                 glPopMatrix();
             }
+            if (mtGL && inMtBounds(camPos[0], camPos[2])) {
+                glPushMatrix();
+                glTranslatef(MT_GX * ROOM_SPACING, 0.0f,
+                             MT_GY * ROOM_SPACING);
+                drawBatchSet(mtScene, mtGL, 0);
+                glPopMatrix();
+            }
             drawPocketComposite(0);
             decalsDraw();
             drawDoors(camPos);
@@ -8605,6 +8717,13 @@ int main(void) {
                 glTranslatef(INTRO_GX * ROOM_SPACING, 0.0f,
                              INTRO_GY * ROOM_SPACING);
                 drawBatchSet(introCellScene, introCellGL, 1);
+                glPopMatrix();
+            }
+            if (mtGL && inMtBounds(camPos[0], camPos[2])) {
+                glPushMatrix();
+                glTranslatef(MT_GX * ROOM_SPACING, 0.0f,
+                             MT_GY * ROOM_SPACING);
+                drawBatchSet(mtScene, mtGL, 1);
                 glPopMatrix();
             }
             drawPocketComposite(1);
