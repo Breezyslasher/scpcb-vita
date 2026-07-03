@@ -2185,55 +2185,38 @@ static void updateRoomEvents(void) {
                 roomEventId[r] = EV_NONE;
             }
         } else if (ev == EV_682_ROAR) {
-            /* Arm a countdown on entry; roar + shake when it fires. */
+            /* e_682_roar is a pure audio + camera scare: 682 is never
+             * seen and deals NO damage. A distant tremor builds, it
+             * roars partway through, the shake peaks, then it fades. The
+             * countdown only advances while the player is in the room.
+             * (The arm bursting through belongs to the Gate B ending,
+             * not this event; it is not triggered here.) */
             if (roomEventState[r] == 0.0f) {
                 if (inRoom) {
                     eventRng = eventRng * 1664525u + 1013904223u;
                     roomEventState[r] =
                         600.0f + (float)((eventRng >> 16) % 900u);
                 }
-            } else {
+            } else if (inRoom) {
+                float prev = roomEventState[r];
                 roomEventState[r] -= 1.0f;
-                if (roomEventState[r] <= 60.0f) {
+                if (prev > 300.0f && roomEventState[r] <= 300.0f) {
                     audioPlay(snd682Roar, 1.0f, 0.0f);
-                    camShake = 3.0f;
-                    /* At the climax its arm bursts through and sweeps the
-                     * room (scp_682_arm), then retracts. */
-                    if (arm682RT.ok && !arm682Active && inRoom) {
-                        arm682Active = 1;
-                        arm682Roll = 180.0f;
-                        arm682Pos[0] = cx;
-                        arm682Pos[1] = 300.0f;
-                        arm682Pos[2] = cz;
-                        eventRng = eventRng * 1664525u + 1013904223u;
-                        arm682Yaw = (float)((eventRng >> 16) % 360u);
-                    }
-                    roomEventId[r] = EV_NONE;
-                } else if (roomEventState[r] < 200.0f) {
-                    camShake = 1.5f; /* rumble builds */
-                } else if (roomEventState[r] < 420.0f) {
-                    camShake = 0.6f; /* a low, distant tremor first */
                 }
+                if (roomEventState[r] < 300.0f && roomEventState[r] > 120.0f) {
+                    camShake = 2.5f;   /* the roar's aftermath */
+                } else if (roomEventState[r] < 520.0f) {
+                    camShake = 0.6f;   /* a low, distant tremor first */
+                }
+                if (roomEventState[r] <= 0.0f) roomEventId[r] = EV_NONE;
             }
         }
     }
-    /* Animate the arm's sweep: it rolls in through an arc, a glancing
-     * blow shoves and hurts the player mid-swing, then it retracts. */
+    /* The arm sweep (reserved for the Gate B ending; dormant during the
+     * roar event). It rolls in through an arc, then retracts. */
     if (arm682Active) {
         arm682Roll += 5.0f;
         camShake = 2.5f;
-        float dx = camPos[0] - arm682Pos[0], dz = camPos[2] - arm682Pos[2];
-        float d2 = dx * dx + dz * dz;
-        if (d2 < 800.0f * 800.0f && deathTimer == 0
-            && arm682Roll > 240.0f && arm682Roll < 300.0f) {
-            float b = sqrtf(d2);
-            if (b > 1.0f) {
-                camPos[0] += dx / b * 140.0f;
-                camPos[2] += dz / b * 140.0f;
-            }
-            injuries += 0.02f;
-            blurAmount = 0.6f;
-        }
         if (arm682Roll >= 360.0f) arm682Active = 0;
     }
     if (camShake > 0.0f) camShake -= 0.05f;
