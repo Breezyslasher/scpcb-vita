@@ -1122,6 +1122,8 @@ static void reset049(void);
 static void spawn939(void);
 static void reset939(void);
 static void spawn966(void);
+static void spawn860(void);
+static void reset860(void);
 static void removeInventoryByName(const char *name);
 
 static void regenerateMap(uint32_t seed) {
@@ -1170,6 +1172,7 @@ static void regenerateMap(uint32_t seed) {
         spawn049();
         spawn939();
         spawn966();
+        spawn860();
         eventRng = mapSeed ^ 0xA5A5F00Du;
         spawnItems();
         reset173();
@@ -1606,6 +1609,8 @@ static void buildDoorAssets(void) {
     pdPillarRT.scale[0] = pdPillarRT.scale[1] = pdPillarRT.scale[2] = 256.0f;
     buildModelRT(&arm682RT, "scp_682_arm.b3d", 0, 0, 0, NULL);
     arm682RT.scale[0] = arm682RT.scale[1] = arm682RT.scale[2] = 40.0f;
+    buildModelRT(&tree860RT, "tree.b3d", 0, 0, 0, NULL);
+    tree860RT.scale[0] = tree860RT.scale[1] = tree860RT.scale[2] = 256.0f;
     doorCorrTex = textureGet("Door01_Corrosive.png");
     doorCorrHeavyTex = textureGet("containment_doors_Corrosive.png");
     teslaArcTex = textureGet("tesla_overlay.png");
@@ -1721,6 +1726,23 @@ static GLuint vbo1499;
 static int posed1499;
 static GLuint tex1499King;      /* the king's distinct texture */
 
+/* ---- SCP-860-1: the thing in the forest room (cont2_860_1). It only
+ * moves while unwatched - looked at (or blinked away from) it freezes -
+ * and kills on contact. Trees dot the room (UpdateNPCType860_2). ---- */
+static SkinnedMesh *skin860;
+static float skin860Scale = 1.0f;
+static GLuint vbo860;
+static int posed860;
+static int npc860Active;
+static float npc860Pos[3];
+static float npc860YawDeg;
+static float npc860Frame;
+static int npc860Cool;
+static ModelRT tree860RT;
+#define MAX_TREES 14
+static float tree860Pos[MAX_TREES][3];
+static int tree860Count;
+
 static void buildHumanRT(ModelRT *rt, const char *model, const char *tex) {
     buildModelRT(rt, model, 0, 0, 0, tex);
     if (!rt->ok || !rt->scene) return;
@@ -1794,6 +1816,12 @@ static void buildNpcAssets(void) {
             skinnedBounds(skin1499, mn, mx);
             if (mx[1] > mn[1]) skin1499Scale = 285.0f / (mx[1] - mn[1]);
             tex1499King = textureGet("scp_1499_1_king.png");
+        }
+        B3DModel *m860 = propModelGet("scp_860_2.b3d");
+        skin860 = m860 ? skinnedCreate(m860) : NULL;
+        if (skin860) {
+            skinnedBounds(skin860, mn, mx);
+            if (mx[1] > mn[1]) skin860Scale = 320.0f / (mx[1] - mn[1]);
         }
     }
     buildHumanRT(&introScientistRT, "class_d.b3d", "scientist.png");
@@ -3176,6 +3204,7 @@ static void draw049(const float viewPos[3]);
 static void draw939(const float viewPos[3]);
 static void draw966(const float viewPos[3]);
 static void draw1499(const float viewPos[3]);
+static void draw860(const float viewPos[3]);
 
 static void spawn106Near(void) {
     /* Behind the player, out of the cell if possible, on the floor. */
@@ -4592,6 +4621,99 @@ static void update1499(void) {
     if (sanity < 0.0f) sanity = 0.0f;
 }
 
+/* ---- SCP-860-1 (the forest room cont2_860_1) ---- */
+
+static void reset860(void) {
+    npc860Frame = 2.0f;
+    npc860Cool = 0;
+}
+
+static void spawn860(void) {
+    npc860Active = 0;
+    tree860Count = 0;
+    if (!skin860) return;
+    int best = -1;
+    for (uint32_t r = 0; r < map.roomCount; r++) {
+        if (strcmp(tplList.items[map.rooms[r].templateIndex].name,
+                   "cont2_860_1") == 0) { best = (int)r; break; }
+    }
+    if (best < 0) return;
+    float ox = map.rooms[best].gridX * ROOM_SPACING;
+    float oz = map.rooms[best].gridY * ROOM_SPACING;
+    npc860Pos[0] = ox;
+    npc860Pos[2] = oz - 700.0f;
+    npc860Pos[1] = 0.0f;
+    npc860YawDeg = 0.0f;
+    reset860();
+    npc860Active = 1;
+    /* Scatter trees through the room (deterministic from the seed so the
+     * copse is stable). */
+    uint32_t rng = mapSeed ^ 0x8601860Bu;
+    for (int t = 0; t < MAX_TREES; t++) {
+        rng = rng * 1664525u + 1013904223u;
+        float tx = ox + (float)((int)((rng >> 8) % 1600u) - 800);
+        rng = rng * 1664525u + 1013904223u;
+        float tz = oz + (float)((int)((rng >> 8) % 1600u) - 800);
+        /* Keep a clear path down the middle. */
+        if (tx > ox - 200.0f && tx < ox + 200.0f) continue;
+        tree860Pos[tree860Count][0] = tx;
+        tree860Pos[tree860Count][1] = 0.0f;
+        tree860Pos[tree860Count][2] = tz;
+        tree860Count++;
+    }
+}
+
+/* UpdateNPCType860_2: it advances only while the player is not looking
+ * at it (or is mid-blink) and freezes the instant it is watched - the
+ * forest stalker. Contact in the dark is fatal. */
+static void update860(void) {
+    if (!npc860Active || !skin860 || deathTimer > 0 || !walkMode
+        || introPhase >= 0 || inPocket || inMask) {
+        return;
+    }
+    if (strcmp(roomNameAt(camPos), "cont2_860_1") != 0) return;
+    float dx = camPos[0] - npc860Pos[0];
+    float dz = camPos[2] - npc860Pos[2];
+    float dist = sqrtf(dx * dx + dz * dz);
+    npc860Frame += 0.3f;
+    if (npc860Frame > 40.0f) npc860Frame = 2.0f;
+    if (dist > 1.0f) {
+        npc860YawDeg = atan2f(dx, dz) * 180.0f / 3.14159265f;
+    }
+    if (dist < 180.0f) {
+        snprintf(deathCause, sizeof(deathCause), "SCP-860-1");
+        audioPlay(sndHorror11, 1.0f, 0.0f);
+        deathTimer = 180;
+        return;
+    }
+    /* Watched? (in the view cone, in range, eyes open). */
+    int seen = 0;
+    if (blinkFrames == 0 && dist < 4500.0f) {
+        float vx = sinf(camYaw), vz = -cosf(camYaw);
+        float facing = dist > 1.0f ? (-dx * vx - dz * vz) / dist : 1.0f;
+        if (facing > 0.4f) seen = 1;
+    }
+    if (seen) {
+        if (npc860Cool > 0) npc860Cool--;
+        return; /* frozen while watched */
+    }
+    /* Unwatched: it closes fast, and now and then lurches much nearer. */
+    if (dist > 1.0f) {
+        npc860Pos[0] += dx / dist * 44.0f;
+        npc860Pos[2] += dz / dist * 44.0f;
+    }
+    if (npc860Cool > 0) npc860Cool--;
+    if (npc860Cool == 0 && dist > 1400.0f) {
+        npc860Pos[0] = camPos[0] - dx / dist * 900.0f;
+        npc860Pos[2] = camPos[2] - dz / dist * 900.0f;
+        npc860Cool = 120;
+        audioPlay3D(sndStep[rand() % 4], npc860Pos, camPos, camYaw, 3000.0f);
+    }
+    float o[3] = { npc860Pos[0], npc860Pos[1] + 250.0f, npc860Pos[2] };
+    float hy;
+    if (rayDownWorld(o, 600.0f, &hy)) npc860Pos[1] = hy;
+}
+
 /* ---- Tesla gates ---- */
 
 static void teslaSpawn(void) {
@@ -5112,6 +5234,44 @@ static void draw1499(const float viewPos[3]) {
                          npc1499Pos[k], npc1499Yaw[k],
                          npc1499Type[k] == 2 ? tex1499King : 0);
     }
+}
+
+static void draw860(const float viewPos[3]) {
+    if (!npc860Active) return;
+    if (strcmp(roomNameAt(camPos), "cont2_860_1") != 0) return;
+    /* The copse of trees. */
+    if (tree860RT.ok) {
+        for (int t = 0; t < tree860Count; t++) {
+            float dx = tree860Pos[t][0] - viewPos[0];
+            float dz = tree860Pos[t][2] - viewPos[2];
+            if (dx * dx + dz * dz > VIEW_RANGE * VIEW_RANGE) continue;
+            glPushMatrix();
+            glTranslatef(tree860Pos[t][0], tree860Pos[t][1], tree860Pos[t][2]);
+            glRotatef((float)(t * 47 % 360), 0.0f, 1.0f, 0.0f);
+            drawModelRT(&tree860RT);
+            glPopMatrix();
+        }
+    }
+    /* The stalker itself. */
+    if (!skin860) return;
+    float dx = npc860Pos[0] - viewPos[0], dz = npc860Pos[2] - viewPos[2];
+    if (dx * dx + dz * dz > VIEW_RANGE * VIEW_RANGE) return;
+    GLuint *ibos = skinIBOsFor(skin860);
+    if (!ibos) return;
+    if (!vbo860) glGenBuffers(1, &vbo860);
+    static int poseTick;
+    if (!posed860 || ((poseTick++) & 1) == 0) {
+        skinnedEval(skin860, npc860Frame);
+        uint32_t vc;
+        const SceneVertex *v = skinnedVertices(skin860, &vc);
+        glBindBuffer(GL_ARRAY_BUFFER, vbo860);
+        glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)(vc * sizeof(SceneVertex)),
+                     v, GL_DYNAMIC_DRAW);
+        glBindBuffer(GL_ARRAY_BUFFER, 0);
+        posed860 = 1;
+    }
+    drawSkinnedAt(skin860, vbo860, ibos, skin860Scale, npc860Pos,
+                  npc860YawDeg);
 }
 
 /* ---------------- items and inventory ---------------- */
@@ -7787,6 +7947,7 @@ int main(void) {
             update939();
             update966();
             update1499();
+            update860();
             introUpdate();
             if (introPhase < 0 && !inPocket) {
                 updateZoneMusic();
@@ -7855,6 +8016,7 @@ int main(void) {
                 reset096();
                 reset049();
                 reset939();
+                reset860();
                 npc966Drowsy = 0.0f;
                 inMask = 0;
                 npc1499Count = 0;
@@ -8070,6 +8232,7 @@ int main(void) {
             draw939(camPos);
             draw966(camPos);
             draw1499(camPos);
+            draw860(camPos);
             drawArm682();
             drawTeslaArcs(camPos);
             drawPocketPillars();
