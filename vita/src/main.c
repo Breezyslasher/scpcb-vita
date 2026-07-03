@@ -838,6 +838,8 @@ static float mtArrive[3];      /* first-elevator landing */
 static int mtElevDoorA = -1;   /* the tunnel's return elevator */
 static float mtEntr[3];        /* facility room2_mt landing */
 static int mtEntrOK;
+static float mtGen[3];         /* generator room cell (props + items) */
+static int mtGenOK;
 
 static int inMtBounds(float x, float z) {
     if (!mtInstCount) return 0;
@@ -1013,6 +1015,20 @@ static void buildMtMaze(void) {
     if (mtArrive[0] == 0.0f && mtArrive[2] == 0.0f && mtInstCount) {
         mtArrive[0] = mtInst[0].wx;
         mtArrive[2] = mtInst[0].wz;
+    }
+    /* Turn a dead-end into the generator room (source MT_GENERATOR): the
+     * mt1_generator tile shares the dead-end's single opening, so the
+     * swap keeps its rotation. Its props/items spawn there. */
+    mtGenOK = 0;
+    for (int m = mtInstCount - 1; m >= 0; m--) {
+        if (mtInst[m].mesh == MT_M_DEADEND && mtMesh[MT_M_GEN].scene) {
+            mtInst[m].mesh = MT_M_GEN;
+            mtGen[0] = mtInst[m].wx;
+            mtGen[1] = 0.0f;
+            mtGen[2] = mtInst[m].wz;
+            mtGenOK = 1;
+            break;
+        }
     }
 }
 
@@ -6051,6 +6067,17 @@ static void spawnItems(void) {
                          p->gridY * ROOM_SPACING);
             break;
         }
+    }
+
+    /* Maintenance-tunnel generator room stash (source MT_GENERATOR:
+     * SCP-500-01 + Night Vision Goggles on the generator dead-end cell).
+     * Added last because spawnItems() resets worldItemCount and runs
+     * after setupMaintenanceTunnel(). */
+    if (mtGenOK) {
+        worldItemAdd(itemTplFind("SCP-500-01"),
+                     mtGen[0], mtGen[1] + 30.0f, mtGen[2]);
+        worldItemAdd(itemTplFind("Night Vision Goggles"),
+                     mtGen[0], mtGen[1] + 30.0f, mtGen[2] + 120.0f);
     }
 }
 
