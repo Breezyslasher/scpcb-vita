@@ -487,6 +487,10 @@ static WorldCamera worldCameras[MAX_CAMERAS];
 static int worldCameraCount;
 static float camCheckTimer;   /* MTF camera sweep: >0 while one runs */
 static int camCheckSpotted;   /* a camera caught the player this sweep */
+/* SCP-895 CoffinEffect / SCP-079 broadcast: once the player leaves the
+ * first zone, SCP-079 broadcasts SCP-895's coffin feed onto the monitors
+ * (source CoffinEffect 2/3), scrambling them red. */
+static int leftFirstZone;
 
 static void spawnRoomCameras(void) {
     worldCameraCount = 0;
@@ -2077,10 +2081,6 @@ static GLuint monFeedTex;
 static int monFeedCam = -1;   /* worldCameras index the feed shows */
 static float monFeedTick;
 static int monFeedActive;     /* a feed was captured this frame */
-/* SCP-895 CoffinEffect / SCP-079 broadcast: once the player leaves the
- * first zone, SCP-079 broadcasts SCP-895's coffin feed onto the monitors
- * (source CoffinEffect 2/3), scrambling them red. */
-static int leftFirstZone;
 /* SCP-106 rots the doors it passes (UpdateNPCType106 swaps the panel /
  * frame texture): Door01_Corrosive for sliding doors, containment for
  * heavy. Loaded with the door assets. */
