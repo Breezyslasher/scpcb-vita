@@ -1278,8 +1278,47 @@ typedef struct {
     const char *texOverride;
     float animStart, animEnd, animSpeed; /* frames, frames/game-tick */
     float frame;
-    SceneVertex *buf;    /* private posed copy (re-skinned at ~15 Hz) */
+    GLuint vbo;          /* posed vertices live on the GPU; uploaded
+                            only when the figure re-skins */
+    int posed;           /* vbo holds a valid pose */
 } IntroHuman;
+
+/* Element buffers are per skeleton (indices never change), shared by
+ * every figure using that model. */
+typedef struct {
+    const SkinnedMesh *skin;
+    GLuint ibos[8];
+    int built;
+} SkinIBOCache;
+static SkinIBOCache skinIBO[2];
+
+static GLuint *skinIBOsFor(SkinnedMesh *skin) {
+    for (int i = 0; i < 2; i++) {
+        if (skinIBO[i].skin == skin && skinIBO[i].built) {
+            return skinIBO[i].ibos;
+        }
+    }
+    for (int i = 0; i < 2; i++) {
+        if (!skinIBO[i].built) {
+            skinIBO[i].skin = skin;
+            uint32_t nb = skinnedBatchCount(skin);
+            if (nb > 8) nb = 8;
+            for (uint32_t b = 0; b < nb; b++) {
+                const SkinBatch *batch = skinnedBatch(skin, b);
+                glGenBuffers(1, &skinIBO[i].ibos[b]);
+                glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, skinIBO[i].ibos[b]);
+                glBufferData(GL_ELEMENT_ARRAY_BUFFER,
+                             (GLsizeiptr)(batch->indexCount
+                                          * sizeof(uint16_t)),
+                             batch->indices, GL_STATIC_DRAW);
+            }
+            glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
+            skinIBO[i].built = 1;
+            return skinIBO[i].ibos;
+        }
+    }
+    return NULL;
+}
 
 static IntroHuman INTRO_HUMANS[8];
 static int introHumanCount;
@@ -1287,7 +1326,7 @@ static int introHumanCount;
 /* The escort route from the cell block to the chamber gate, BFS'd
  * over the intro mesh floors (room-local raw units). */
 static const float ESCORT_WP[][2] = {
-    { -4264.0f, 856.0f },  { -7976.0f, 856.0f },  { -7976.0f, 280.0f },
+    { -4300.0f, 856.0f },  { -7976.0f, 856.0f },  { -7976.0f, 280.0f },
     { -7912.0f, 280.0f },  { -7912.0f, -872.0f }, { -7720.0f, -872.0f },
     { -7720.0f, -1064.0f },{ -6568.0f, -1064.0f },{ -6568.0f, -1192.0f },
     { -1064.0f, -1192.0f },{ -1064.0f, -936.0f }, { -808.0f, -936.0f },
@@ -1537,15 +1576,32 @@ static void introUpdate(void) {
                 break;
             }
             if (introCineT <= 900) {
-                /* Eyes opening on the cell ceiling: pitch eases from
-                 * -70 to level with a sinus wobble while the view
-                 * swings toward the door (UpdateIntro's camera). */
+                /* Eyes opening on the bunk: pitch eases from -70 to
+                 * level with a sinus wobble while the player sits up
+                 * and stands (UpdateIntro's camera: smoothstepped
+                 * Dist/Dist2, camera rising from the bunk to the
+                 * standing eye at local -4130, 72). */
                 float t = introCineT / 60.0f; /* seconds */
                 float rise = t / 5.0f;
                 if (rise > 1.0f) rise = 1.0f;
+                rise = rise * rise * (3.0f - 2.0f * rise);
                 float turn = (t - 10.0f) / 4.0f;
                 if (turn < 0.0f) turn = 0.0f;
                 if (turn > 1.0f) turn = 1.0f;
+                turn = turn * turn * (3.0f - 2.0f * turn);
+                float ox = INTRO_GX * ROOM_SPACING;
+                float oz = INTRO_GY * ROOM_SPACING;
+                /* Bunk at the cell's east wall; sit up (+0.2 world),
+                 * then rise to the 0.9-world standing eye. */
+                float bedX = -4230.0f, bedZ = 250.0f, bedY = 105.0f;
+                float sitY = bedY + 0.2f * 256.0f;
+                float x = bedX + (-4130.0f - bedX) * turn;
+                float z = bedZ + (72.0f - bedZ) * rise;
+                float y = bedY + (sitY - bedY) * rise;
+                y = y + ((0.302f + 0.6f) * 256.0f - y) * turn;
+                camPos[0] = ox + x;
+                camPos[1] = y;
+                camPos[2] = oz + z;
                 camPitch = ((-70.0f + 70.0f * rise)
                             + sinf(t * 12.857f) * 5.0f * (1.0f - rise))
                          * 3.14159265f / 180.0f;
@@ -1560,6 +1616,10 @@ static void introUpdate(void) {
                 if (introCineT > 900) {
                     introTimer = 0;
                     camPitch = 0.0f;
+                    camPos[0] = INTRO_GX * ROOM_SPACING - 4130.0f;
+                    camPos[1] = EYE_HEIGHT;
+                    camPos[2] = INTRO_GY * ROOM_SPACING + 72.0f;
+                    velY = 0.0f;
                     snprintf(toastMsg, sizeof(toastMsg),
                              "CHECK YOUR INVENTORY FOR YOUR ORIENTATION"
                              " LEAFLET");
@@ -1656,21 +1716,24 @@ static void introPlaceHumans(void) {
      * frame like SetNPCFrame(182). */
     IntroHuman defs[8] = {
         /* Positions from UpdateIntro (block corridor floor y=0). The
-         * guard idle (77-201) is authored very subtle; it plays at
-         * 2x so the breathing/shift reads on a small screen. */
-        { &introGuardRT, -4205.0f, 0.0f, 870.0f, 180.0f,
+         * standing yaws face the cells like the original (the draw
+         * convention showed their backs before). Ulgrin waits right
+         * across from the player's cell door. The guard idle (77-201)
+         * is authored very subtle; it plays at 2x so the
+         * breathing/shift reads on a small screen. */
+        { &introGuardRT, -4130.0f, 0.0f, 830.0f, 0.0f,
           NULL, 1, NULL, 77, 201, 0.4f, 77 },                /* Ulgrin */
-        { &introGuardRT, -3985.0f, 0.0f, 786.0f, 135.0f,
+        { &introGuardRT, -3985.0f, 0.0f, 786.0f, 315.0f,
           NULL, 1, NULL, 77, 201, 0.4f, 120 },
-        { &introGuardRT, -8064.0f, 0.0f, 1096.0f, 180.0f,
+        { &introGuardRT, -8064.0f, 0.0f, 1096.0f, 0.0f,
           NULL, 1, NULL, 77, 201, 0.4f, 160 },               /* radio guy */
-        { &introClassDRT, -3550.0f, 0.0f, 800.0f, 0.0f,
+        { &introClassDRT, -3550.0f, 0.0f, 800.0f, 180.0f,
           NULL, 1, NULL, 357, 381, 0.12f, 357 },             /* inmate */
-        { &introGuardRT, 328.0f, 480.0f, 1072.0f, 180.0f,
+        { &introGuardRT, 328.0f, 480.0f, 1072.0f, 0.0f,
           NULL, 1, NULL, 77, 201, 0.4f, 40 },                /* balcony */
-        { &introFranklinRT, -3424.0f, -100.0f, -2208.0f, 0.0f,
+        { &introFranklinRT, -3424.0f, -100.0f, -2208.0f, 180.0f,
           NULL, 1, "Franklin.png", 357, 381, 0.12f, 366 },
-        { &introScientistRT, -3073.0f, -315.0f, -2165.0f, 45.0f,
+        { &introScientistRT, -3073.0f, -315.0f, -2165.0f, 225.0f,
           NULL, 1, "scientist.png", 182, 182, 0.0f, 182 },
         { &introGuardRT, -4000.0f, 0.0f, 950.0f, 160.0f,
           NULL, 1, NULL, 77, 201, 0.4f, 90 },
@@ -1684,33 +1747,46 @@ static void introPlaceHumans(void) {
             defs[i].skinScale = skinClassDScale;
         }
     }
-    /* Private pose buffers, allocated once per slot and reused (the
-     * roster is fixed, so slot i always maps to the same model). */
-    static SceneVertex *slotBuf[8];
+    /* Per-slot VBOs, created once and reused (the roster is fixed, so
+     * slot i always maps to the same model). */
+    static GLuint slotVbo[8];
     introHumanCount = 0;
     for (int i = 0; i < 8; i++) {
         if (!defs[i].skin && !defs[i].rt->ok) continue;
         if (defs[i].skin) {
-            if (!slotBuf[i]) slotBuf[i] = skinnedNewBuffer(defs[i].skin);
-            defs[i].buf = slotBuf[i];
-            if (!defs[i].buf) defs[i].skin = NULL; /* static fallback */
-            else skinnedEvalInto(defs[i].skin, defs[i].frame, defs[i].buf);
+            if (!slotVbo[i]) glGenBuffers(1, &slotVbo[i]);
+            defs[i].vbo = slotVbo[i];
+            defs[i].posed = 0;
         }
         INTRO_HUMANS[introHumanCount++] = defs[i];
     }
 }
 
-/* Draw a posed skeleton with client arrays (the buffer changes, so
- * VBOs would just be re-uploads). The pose itself is re-skinned on
- * the caller's schedule, not per draw. */
-static void drawSkinnedHuman(IntroHuman *h) {
-    const SceneVertex *verts = h->buf;
+/* Re-skin a figure and push the pose to its VBO. */
+static void poseHumanVbo(IntroHuman *h) {
+    skinnedEval(h->skin, h->frame);
+    uint32_t vcount;
+    const SceneVertex *verts = skinnedVertices(h->skin, &vcount);
+    glBindBuffer(GL_ARRAY_BUFFER, h->vbo);
+    glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)(vcount * sizeof(SceneVertex)),
+                 verts, GL_DYNAMIC_DRAW);
     glBindBuffer(GL_ARRAY_BUFFER, 0);
-    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
-    glVertexPointer(3, GL_FLOAT, sizeof(SceneVertex), &verts[0].x);
-    glColorPointer(4, GL_UNSIGNED_BYTE, sizeof(SceneVertex), &verts[0].r);
-    glTexCoordPointer(2, GL_FLOAT, sizeof(SceneVertex), &verts[0].du);
-    for (uint32_t b = 0; b < skinnedBatchCount(h->skin); b++) {
+    h->posed = 1;
+}
+
+/* Draw a posed skeleton from its VBO (the pose is only re-uploaded
+ * when the figure re-skins; client arrays went through vitaGL's slow
+ * per-draw copy path and tanked the framerate). */
+static void drawSkinnedHuman(IntroHuman *h) {
+    GLuint *ibos = skinIBOsFor(h->skin);
+    if (!ibos || !h->posed) return;
+    glBindBuffer(GL_ARRAY_BUFFER, h->vbo);
+    glVertexPointer(3, GL_FLOAT, sizeof(SceneVertex), VTX_OFF(x));
+    glColorPointer(4, GL_UNSIGNED_BYTE, sizeof(SceneVertex), VTX_OFF(r));
+    glTexCoordPointer(2, GL_FLOAT, sizeof(SceneVertex), VTX_OFF(du));
+    uint32_t nb = skinnedBatchCount(h->skin);
+    if (nb > 8) nb = 8;
+    for (uint32_t b = 0; b < nb; b++) {
         const SkinBatch *batch = skinnedBatch(h->skin, b);
         GLuint tex = textureGet(h->texOverride ? h->texOverride
                                                : batch->textureName);
@@ -1720,29 +1796,41 @@ static void drawSkinnedHuman(IntroHuman *h) {
         } else {
             glDisable(GL_TEXTURE_2D);
         }
+        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, ibos[b]);
         glDrawElements(GL_TRIANGLES, (GLsizei)batch->indexCount,
-                       GL_UNSIGNED_SHORT, batch->indices);
+                       GL_UNSIGNED_SHORT, NULL);
     }
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
 }
 
 static void drawIntroHumans(const float viewPos[3]) {
     /* Only during the escort; the breach clears the block. */
     if (introPhase < 0 || introPhase >= 4) return;
+    float fwdX = sinf(camYaw), fwdZ = -cosf(camYaw);
     for (int i = 0; i < introHumanCount; i++) {
         IntroHuman *h = &INTRO_HUMANS[i];
         float wx = INTRO_GX * ROOM_SPACING + h->x;
         float wz = INTRO_GY * ROOM_SPACING + h->z;
         float dx = wx - viewPos[0], dz = wz - viewPos[2];
-        if (dx * dx + dz * dz > VIEW_RANGE * VIEW_RANGE) continue;
+        float d2 = dx * dx + dz * dz;
+        if (d2 > 3800.0f * 3800.0f) continue;
+        /* Behind the camera: no skinning, no draw. */
+        if (d2 > 600.0f * 600.0f
+            && (dx * fwdX + dz * fwdZ) / sqrtf(d2) < -0.25f) {
+            continue;
+        }
 
-        /* Advance the idle loop; re-skin staggered at ~15 Hz (the
-         * CPU skin of every figure every frame is what tanked the
-         * framerate). */
-        if (h->animSpeed > 0.0f && h->skin && h->buf) {
-            h->frame += h->animSpeed;
-            if (h->frame > h->animEnd) h->frame = h->animStart;
-            if (((introTimer + i) & 1) == 0) {
-                skinnedEvalInto(h->skin, h->frame, h->buf);
+        /* Advance the idle loop; re-skin staggered at ~30 Hz and
+         * upload the pose only then. */
+        if (h->skin) {
+            int animating = h->animSpeed > 0.0f;
+            if (animating) {
+                h->frame += h->animSpeed;
+                if (h->frame > h->animEnd) h->frame = h->animStart;
+            }
+            if (!h->posed || (animating && ((introTimer + i) & 1) == 0)) {
+                poseHumanVbo(h);
             }
         }
 
@@ -4062,7 +4150,10 @@ int main(void) {
         }
 
         float fwdX = sinf(camYaw), fwdZ = -cosf(camYaw);
-        if (walkMode && haveData) {
+        if (haveData && introCameraLocked()) {
+            /* The wake-up cinematic drives the camera; gravity and
+             * the floor snap would stand the player straight up. */
+        } else if (walkMode && haveData) {
             int crouched = inputDown(ACTION_CROUCH) && !invOpen && !pauseOpen;
             float eye = crouched ? CROUCH_EYE_HEIGHT : EYE_HEIGHT;
             /* Stamina: drains while sprinting, blocks at empty until
