@@ -1429,11 +1429,11 @@ static void introPlaceHumans(void) {
         { &introGuardRT, -8064.0f, 0.0f, 1096.0f, 180.0f,
           NULL, 1, NULL, 77, 201, 0.2f, 160 },               /* radio guy */
         { &introClassDRT, -3550.0f, 0.0f, 800.0f, 0.0f,
-          NULL, 1, NULL, 210, 235, 0.1f, 210 },              /* inmate */
+          NULL, 1, NULL, 357, 381, 0.05f, 357 },             /* inmate */
         { &introGuardRT, 328.0f, 480.0f, 1072.0f, 180.0f,
           NULL, 1, NULL, 77, 201, 0.2f, 40 },                /* balcony */
         { &introFranklinRT, -3424.0f, -100.0f, -2208.0f, 0.0f,
-          NULL, 1, "Franklin.png", 210, 235, 0.1f, 222 },
+          NULL, 1, "Franklin.png", 357, 381, 0.05f, 366 },
         { &introScientistRT, -3073.0f, -315.0f, -2165.0f, 45.0f,
           NULL, 1, "scientist.png", 182, 182, 0.0f, 182 },
         { &introGuardRT, -4000.0f, 0.0f, 950.0f, 160.0f,

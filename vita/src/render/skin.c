@@ -344,42 +344,69 @@ void skinnedBounds(const SkinnedMesh *s, float mn[3], float mx[3]) {
     memcpy(mx, s->bindMax, sizeof(s->bindMax));
 }
 
-/* Interpolated node transform at `frame`. Keys are frame-ordered per
- * chunk; nodes without keys keep their base transform. */
+/* Bracketing keys for one channel (a node's keys can come from
+ * several KEYS chunks carrying different channels, so each channel
+ * interpolates only between keys that actually carry it). Returns 0
+ * if the node has no keys for the channel. */
+static int chBracket(const B3DNode *n, float frame, int flag,
+                     const B3DKey **prevOut, const B3DKey **nextOut) {
+    const B3DKey *prev = NULL, *next = NULL;
+    for (uint32_t i = 0; i < n->keyCount; i++) {
+        const B3DKey *k = &n->keys[i];
+        if (!(k->flags & flag)) continue;
+        if ((float)k->frame <= frame) {
+            if (!prev || k->frame >= prev->frame) prev = k;
+        }
+        if ((float)k->frame >= frame) {
+            if (!next || k->frame < next->frame) next = k;
+        }
+    }
+    if (!prev && !next) return 0;
+    if (!prev) prev = next;
+    if (!next) next = prev;
+    *prevOut = prev;
+    *nextOut = next;
+    return 1;
+}
+
+static float chT(const B3DKey *prev, const B3DKey *next, float frame) {
+    if (next->frame <= prev->frame) return 0.0f;
+    float t = (frame - (float)prev->frame)
+            / (float)(next->frame - prev->frame);
+    if (t < 0.0f) t = 0.0f;
+    if (t > 1.0f) t = 1.0f;
+    return t;
+}
+
+/* Interpolated node transform at `frame`; nodes without keys keep
+ * their base transform. */
 static void animLocal(const B3DNode *n, float frame, float out[16]) {
     if (n->keyCount == 0) {
         nodeLocal(n, out);
         return;
     }
-    const B3DKey *prev = &n->keys[0], *next = &n->keys[n->keyCount - 1];
-    for (uint32_t i = 0; i < n->keyCount; i++) {
-        const B3DKey *k = &n->keys[i];
-        if ((float)k->frame <= frame
-            && (float)k->frame >= (float)prev->frame) {
-            prev = k;
-        }
-        if ((float)k->frame >= frame && (float)k->frame < (float)next->frame) {
-            next = k;
-        }
-    }
-    float t = 0.0f;
-    if (next->frame > prev->frame) {
-        t = (frame - (float)prev->frame)
-          / (float)(next->frame - prev->frame);
-        if (t < 0.0f) t = 0.0f;
-        if (t > 1.0f) t = 1.0f;
-    }
 
     float pos[3], scl[3], quat[4];
-    for (int i = 0; i < 3; i++) {
-        pos[i] = (n->keyFlags & 1)
-               ? prev->position[i] + (next->position[i] - prev->position[i]) * t
-               : n->position[i];
-        scl[i] = (n->keyFlags & 2)
-               ? prev->scale[i] + (next->scale[i] - prev->scale[i]) * t
-               : n->scale[i];
+    memcpy(pos, n->position, sizeof(pos));
+    memcpy(scl, n->scale, sizeof(scl));
+    memcpy(quat, n->rotation, sizeof(quat));
+
+    const B3DKey *prev, *next;
+    if (chBracket(n, frame, 1, &prev, &next)) {
+        float t = chT(prev, next, frame);
+        for (int i = 0; i < 3; i++) {
+            pos[i] = prev->position[i]
+                   + (next->position[i] - prev->position[i]) * t;
+        }
     }
-    if (n->keyFlags & 4) {
+    if (chBracket(n, frame, 2, &prev, &next)) {
+        float t = chT(prev, next, frame);
+        for (int i = 0; i < 3; i++) {
+            scl[i] = prev->scale[i] + (next->scale[i] - prev->scale[i]) * t;
+        }
+    }
+    if (chBracket(n, frame, 4, &prev, &next)) {
+        float t = chT(prev, next, frame);
         /* nlerp with hemisphere correction */
         float dot = prev->rotation[0] * next->rotation[0]
                   + prev->rotation[1] * next->rotation[1]
@@ -398,8 +425,6 @@ static void animLocal(const B3DNode *n, float frame, float out[16]) {
         } else {
             memcpy(quat, n->rotation, sizeof(quat));
         }
-    } else {
-        memcpy(quat, n->rotation, sizeof(quat));
     }
 
     float rot[16];

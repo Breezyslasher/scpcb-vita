@@ -56,9 +56,12 @@ typedef struct {
     uint32_t triSetCount;
 } B3DMesh;
 
-/* One KEYS entry; flags say which channels the chunk carries. */
+/* One KEYS entry; flags say which channels this key carries (keys
+ * from different KEYS chunks of one node can carry different
+ * channels). */
 typedef struct {
     int32_t frame;
+    int32_t flags;
     float position[3];   /* flags & 1 */
     float scale[3];      /* flags & 2 */
     float rotation[4];   /* flags & 4, quaternion w,x,y,z */

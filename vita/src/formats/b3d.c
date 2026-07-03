@@ -246,6 +246,7 @@ static bool parseKeys(Reader *r, const Chunk *c, B3DNode *n) {
         memset(k, 0, sizeof(*k));
         k->scale[0] = k->scale[1] = k->scale[2] = 1.0f;
         k->rotation[0] = 1.0f;
+        k->flags = flags;
         k->frame = rdI32(r);
         if (flags & 1) {
             k->position[0] = rdF32(r);
