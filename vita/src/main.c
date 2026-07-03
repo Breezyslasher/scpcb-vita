@@ -199,7 +199,9 @@ typedef struct {
 } BatchGL;
 
 typedef struct {
-    int state; /* 0 = not loaded, 1 = ok, -1 = failed */
+    int state;        /* 0 = not loaded, 1 = ok, -1 = failed,
+                         2 = geometry built, textures loading */
+    uint32_t texDone; /* batches with textures resolved (state 2) */
     Scene *scene;
     BatchGL *gl;
     CollisionWorld *col;
@@ -224,45 +226,66 @@ static void templateUnload(TemplateRT *rt) {
     memset(rt, 0, sizeof(*rt));
 }
 
-static void templateEnsure(int idx) {
+/* One increment of room loading (the same spread-the-work idea as
+ * the skinned figures: never do a whole room in one frame unless the
+ * player is standing in it). Step 1 parses the mesh and builds the
+ * scene and collision; each following step resolves the textures of
+ * a couple of batches; the last one uploads the VBOs. */
+static void templateEnsureStep(int idx) {
     TemplateRT *rt = &tplRT[idx];
-    if (rt->state != 0) return;
-    rt->state = -1;
+    if (rt->state == 1 || rt->state == -1) return;
 
-    const RoomTemplateInfo *info = &tplList.items[idx];
-    if (!info->meshPath) return;
-
-    char path[1024];
-    snprintf(path, sizeof(path), MAP_DIR "/%s", info->meshPath);
-    char err[128];
-    RMesh *mesh = rmeshLoadFile(path, err, sizeof(err));
-    if (!mesh) return;
-
-    rt->scene = sceneBuild(mesh);
-    if (!rt->scene) {
+    if (rt->state == 0) {
+        rt->state = -1;
+        const RoomTemplateInfo *info = &tplList.items[idx];
+        if (!info->meshPath) return;
+        char path[1024];
+        snprintf(path, sizeof(path), MAP_DIR "/%s", info->meshPath);
+        char err[128];
+        RMesh *mesh = rmeshLoadFile(path, err, sizeof(err));
+        if (!mesh) return;
+        rt->scene = sceneBuild(mesh);
+        if (!rt->scene) {
+            rmeshFree(mesh);
+            return;
+        }
+        for (uint32_t i = 0; i < mesh->entityCount; i++) {
+            const RMeshEntity *e = &mesh->entities[i];
+            if (e->type != RMESH_ENTITY_PROP || !e->u.prop.file) continue;
+            B3DModel *model = propModelGet(e->u.prop.file);
+            if (!model) continue;
+            float pos[3] = { e->x, e->y, e->z };
+            float euler[3] = { e->u.prop.pitch, e->u.prop.yaw,
+                               e->u.prop.roll };
+            float scl[3] = { e->u.prop.scaleX, e->u.prop.scaleY,
+                             e->u.prop.scaleZ };
+            sceneAppendB3D(rt->scene, model, pos, euler, scl,
+                           e->u.prop.texture);
+        }
+        rt->col = collisionBuild(rt->scene, mesh);
         rmeshFree(mesh);
+        rt->gl = (BatchGL *)calloc(
+            rt->scene->batchCount ? rt->scene->batchCount : 1,
+            sizeof(BatchGL));
+        if (!rt->gl) return;
+        rt->texDone = 0;
+        rt->state = 2;
         return;
     }
-    for (uint32_t i = 0; i < mesh->entityCount; i++) {
-        const RMeshEntity *e = &mesh->entities[i];
-        if (e->type != RMESH_ENTITY_PROP || !e->u.prop.file) continue;
-        B3DModel *model = propModelGet(e->u.prop.file);
-        if (!model) continue;
-        float pos[3] = { e->x, e->y, e->z };
-        float euler[3] = { e->u.prop.pitch, e->u.prop.yaw, e->u.prop.roll };
-        float scl[3] = { e->u.prop.scaleX, e->u.prop.scaleY, e->u.prop.scaleZ };
-        sceneAppendB3D(rt->scene, model, pos, euler, scl, e->u.prop.texture);
-    }
-    rt->col = collisionBuild(rt->scene, mesh);
-    rmeshFree(mesh);
 
-    rt->gl = (BatchGL *)calloc(rt->scene->batchCount ? rt->scene->batchCount : 1,
-                               sizeof(BatchGL));
-    if (!rt->gl) return;
+    /* state 2: a couple of texture batches per step. */
+    uint32_t end = rt->texDone + 2;
+    if (end > rt->scene->batchCount) end = rt->scene->batchCount;
+    for (; rt->texDone < end; rt->texDone++) {
+        const SceneBatch *b = &rt->scene->batches[rt->texDone];
+        rt->gl[rt->texDone].diffuse = textureGet(b->diffuseName);
+        rt->gl[rt->texDone].lightmap = textureGet(b->lightmapName);
+    }
+    if (rt->texDone < rt->scene->batchCount) return;
+
+    /* Final step: VBO uploads (cheap). */
     for (uint32_t i = 0; i < rt->scene->batchCount; i++) {
         const SceneBatch *b = &rt->scene->batches[i];
-        rt->gl[i].diffuse = textureGet(b->diffuseName);
-        rt->gl[i].lightmap = textureGet(b->lightmapName);
         glGenBuffers(1, &rt->gl[i].vbo);
         glBindBuffer(GL_ARRAY_BUFFER, rt->gl[i].vbo);
         glBufferData(GL_ARRAY_BUFFER,
@@ -277,6 +300,13 @@ static void templateEnsure(int idx) {
     glBindBuffer(GL_ARRAY_BUFFER, 0);
     glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
     rt->state = 1;
+}
+
+/* Load a room to completion (the cell the player stands in). */
+static void templateEnsure(int idx) {
+    while (tplRT[idx].state != 1 && tplRT[idx].state != -1) {
+        templateEnsureStep(idx);
+    }
 }
 
 /* ---------------- placement transforms ---------------- */
@@ -434,19 +464,41 @@ static void updateActiveRooms(const float pos[3]) {
     int px = (int)floorf(pos[0] / ROOM_SPACING + 0.5f);
     int py = (int)floorf(pos[2] / ROOM_SPACING + 0.5f);
     activeCount = 0;
+    /* One loading increment per frame: the room under the player
+     * loads to completion (it is the floor), everything else -
+     * neighbors first, then a 5x5 prefetch ring - advances one small
+     * step per frame so crossings stop hitching. */
+    int stepIdx = -1;
+    int stepScore = 1000;
     for (uint32_t i = 0; i < map.roomCount; i++) {
         const RoomPlacement *p = &map.rooms[i];
         int dx = p->gridX - px, dy = p->gridY - py;
-        int near = dx >= -1 && dx <= 1 && dy >= -1 && dy <= 1;
+        int adx = dx < 0 ? -dx : dx, ady = dy < 0 ? -dy : dy;
+        int ring = adx > ady ? adx : ady;
+        int near = ring <= 1;
+        int self = dx == 0 && dy == 0;
         /* The intro mesh spans several cells around its placement. */
-        if ((int)i == introRoomIdx) near = inIntroBounds(pos[0], pos[2]);
-        if (near && activeCount < 16) {
+        if ((int)i == introRoomIdx) {
+            near = inIntroBounds(pos[0], pos[2]);
+            self = near;
+        }
+        TemplateRT *rt = &tplRT[p->templateIndex];
+        if (self && rt->state != 1 && rt->state != -1) {
             templateEnsure(p->templateIndex);
-            if (tplRT[p->templateIndex].state == 1) {
-                activeRooms[activeCount++] = p;
+        } else if (ring <= 2 && rt->state != 1 && rt->state != -1) {
+            /* Prefer nearer rings; among equals prefer rooms already
+             * mid-load so they finish sooner. */
+            int score = ring * 2 + (rt->state == 0 ? 1 : 0);
+            if (score < stepScore) {
+                stepScore = score;
+                stepIdx = p->templateIndex;
             }
         }
+        if (near && rt->state == 1 && activeCount < 16) {
+            activeRooms[activeCount++] = p;
+        }
     }
+    if (stepIdx >= 0) templateEnsureStep(stepIdx);
 }
 
 static int inIntroBounds(float x, float z);
@@ -1456,8 +1508,15 @@ static void introUpdate(void) {
         float pdz = camPos[2] - (INTRO_GY * ROOM_SPACING + ulgrin->z);
         float pdist = sqrtf(pdx * pdx + pdz * pdz);
 
+        /* Ulgrin holds his post until the player actually steps out
+         * of the cell (the door needs its moment to slide open). */
+        int holdPost = !escortWalking && escortWp == 0
+                    && camPos[2] - INTRO_GY * ROOM_SPACING < 560.0f;
+        if (holdPost) {
+            ulgrin->yawDeg = -atan2f(pdx, pdz) * 180.0f / 3.14159265f;
+        }
         int walking = 0;
-        if (escortWp < ESCORT_WP_COUNT && pdist < 1400.0f) {
+        if (!holdPost && escortWp < ESCORT_WP_COUNT && pdist < 1400.0f) {
             float tx = ESCORT_WP[escortWp][0], tz = ESCORT_WP[escortWp][1];
             float dx = tx - ulgrin->x, dz = tz - ulgrin->z;
             float d = sqrtf(dx * dx + dz * dz);
@@ -1593,7 +1652,7 @@ static void introUpdate(void) {
                 float oz = INTRO_GY * ROOM_SPACING;
                 /* Bunk at the cell's east wall; sit up (+0.2 world),
                  * then rise to the 0.9-world standing eye. */
-                float bedX = -4230.0f, bedZ = 250.0f, bedY = 105.0f;
+                float bedX = -4240.0f, bedZ = 110.0f, bedY = 152.0f;
                 float sitY = bedY + 0.2f * 256.0f;
                 float x = bedX + (-4130.0f - bedX) * turn;
                 float z = bedZ + (72.0f - bedZ) * rise;
