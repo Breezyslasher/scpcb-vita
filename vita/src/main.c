@@ -760,6 +760,8 @@ static int snd079Speech = -1, snd079Refuse = -1;
 static int snd895Idle[3] = { -1, -1, -1 }, snd895Scream[3] = { -1, -1, -1 };
 /* SCP-205 (cont1_205): the shadow demon's horror cue. */
 static int snd205Horror = -1;
+/* SCP-914 (cont1_914): the refinement whir. */
+static int snd914 = -1;
 static GLuint teslaArcTex;
 static float teslaFlash;       /* white screen flash when it zaps nearby */
 
@@ -1670,6 +1672,7 @@ static void spawn895(void);
 static void spawn012(void);
 static void spawn372(void);
 static void spawn205(void);
+static void spawn914(void);
 
 static void regenerateMap(uint32_t seed) {
     memset(roomVisited, 0, sizeof(roomVisited));
@@ -1729,6 +1732,7 @@ static void regenerateMap(uint32_t seed) {
         spawn012();
         spawn372();
         spawn205();
+        spawn914();
         eventRng = mapSeed ^ 0xA5A5F00Du;
         spawnItems();
         spawnRoomDecals();
@@ -2062,6 +2066,7 @@ static void loadSounds(void) {
         snd895Scream[i] = audioLoad(p);
     }
     snd205Horror = audioLoad(SFX_DIR "/SCP/205/Horror.ogg");
+    snd914 = audioLoad(SFX_DIR "/SCP/513/914Refine.ogg");
     sndAmbience = audioLoad(SFX_DIR "/Ambient/Room ambience/rumble.ogg");
     audioLoopAmbience(sndAmbience, 0.30f);
 }
@@ -2131,6 +2136,19 @@ static int scp012Ok;
 static float scp012Pos[3];    /* the score's world position */
 static GLuint scp012OvTex;    /* scp_012_overlay.png */
 static float scp012Comp;      /* 0..1 compulsion strength (drives overlay) */
+/* SCP-914 (cont1_914): the refinement machine. A knob (5 settings) + two
+ * booths; feeding it the selected item and running it transforms the item
+ * per the setting (Use914). */
+static ModelRT knob914RT, key914RT;
+static int scp914Ok;
+static float scp914In[3];     /* input booth (Objects[2]) */
+static float scp914Out[3];    /* output booth (Objects[3]) */
+static float scp914Knob[3];   /* the setting knob (Objects[1]) */
+static float scp914Yaw;       /* room yaw */
+static int scp914Setting;     /* -2 ROUGH .. 2 VERYFINE */
+static int scp914State;       /* 0 idle, 1 running */
+static float scp914Timer;
+static int scp914RefineTpl = -1; /* item being refined */
 static char toastMsg[128];
 static int toastTimer;
 
@@ -2251,6 +2269,11 @@ static void buildDoorAssets(void) {
     /* Monitor prop for the camera feed (source Scale = RoomScale*1.8). */
     buildModelRT(&monitorRT, "monitor2.b3d", 0, 0, 0, NULL);
     monitorRT.scale[0] = monitorRT.scale[1] = monitorRT.scale[2] = 1.8f;
+    /* SCP-914's knob and control key (source ScaleEntity RoomScale -> 1). */
+    buildModelRT(&knob914RT, "scp_914_knob.b3d", 0, 0, 0, NULL);
+    knob914RT.scale[0] = knob914RT.scale[1] = knob914RT.scale[2] = 1.0f;
+    buildModelRT(&key914RT, "scp_914_key.b3d", 0, 0, 0, NULL);
+    key914RT.scale[0] = key914RT.scale[1] = key914RT.scale[2] = 1.0f;
     /* SCP-079's computer (ScaleEntity 1.3 world -> *256 raw) and its
      * seven screen-overlay frames. */
     buildModelRT(&scp079RT, "scp_079.b3d", 0, 0, 0, NULL);
@@ -6537,6 +6560,153 @@ static void worldItemAdd(int tpl, float x, float y, float z) {
     w->taken = 0;
 }
 
+/* ---- SCP-914: the refinement machine (cont1_914) ---- */
+
+static const char *setting914Name(int s) {
+    switch (s) {
+        case -2: return "ROUGH";
+        case -1: return "COARSE";
+        case 0:  return "1:1";
+        case 1:  return "FINE";
+        default: return "VERY FINE";
+    }
+}
+
+/* A slice of Use914: keycards step up/down by setting (1:1 famously spits
+ * out a Playing Card), and everything else is destroyed on Rough/Coarse
+ * and passed through otherwise. Returns the output template, or -1 if the
+ * item is consumed to nothing. */
+static int refine914(int tpl, int setting) {
+    if (tpl < 0) return -1;
+    int lvl = itemKeycardLevel(tpl);
+    if (lvl > 0) {
+        int target = lvl;
+        switch (setting) {
+            case -2: return -1;               /* ROUGH: shredded */
+            case -1: target = lvl - 1; break; /* COARSE: a level down */
+            case 0: {                         /* 1:1: a playing card */
+                int pc = itemTplFind("Playing Card");
+                return pc >= 0 ? pc : tpl;
+            }
+            case 1: target = lvl + 1; break;  /* FINE: a level up */
+            default: target = lvl + 2; break; /* VERY FINE: two up */
+        }
+        if (target < 1) return -1;
+        if (target > 5) {                     /* past L5: the Mastercard */
+            int mc = itemTplFind("Mastercard");
+            if (mc >= 0) return mc;
+            target = 5;
+        }
+        char nm[32];
+        snprintf(nm, sizeof(nm), "Level %d key Card", target);
+        int t = itemTplFind(nm);
+        return t >= 0 ? t : tpl;
+    }
+    /* Non-keycards: Rough/Coarse ruin them, the rest pass through (the
+     * full item table is not yet ported). */
+    if (setting <= -1) return -1;
+    return tpl;
+}
+
+static void spawn914(void) {
+    scp914Ok = 0;
+    scp914State = 0;
+    scp914Setting = 0;
+    scp914Timer = 0.0f;
+    scp914RefineTpl = -1;
+    for (uint32_t r = 0; r < map.roomCount; r++) {
+        const RoomPlacement *p = &map.rooms[r];
+        if (strcmp(tplList.items[p->templateIndex].name, "cont1_914") != 0) {
+            continue;
+        }
+        float in[3] = { -1128.0f, 0.5f, 640.0f }, w[3];
+        localToWorld(p, in, w);
+        scp914In[0] = w[0]; scp914In[1] = w[1]; scp914In[2] = w[2];
+        float out[3] = { 308.0f, 0.5f, 640.0f };
+        localToWorld(p, out, w);
+        scp914Out[0] = w[0]; scp914Out[1] = w[1]; scp914Out[2] = w[2];
+        float kn[3] = { -416.0f, 230.0f, 374.0f };
+        localToWorld(p, kn, w);
+        scp914Knob[0] = w[0]; scp914Knob[1] = w[1]; scp914Knob[2] = w[2];
+        scp914Yaw = (float)(p->angle * 90);
+        scp914Ok = 1;
+        break;
+    }
+}
+
+/* Interaction near the machine: the knob cycles the setting, the input
+ * booth runs the currently-selected inventory item through. Returns 1 if
+ * it handled the press. */
+static int try914Interact(void) {
+    if (!scp914Ok || scp914State != 0) return 0;
+    float kdx = camPos[0] - scp914Knob[0], kdz = camPos[2] - scp914Knob[2];
+    if (kdx * kdx + kdz * kdz < 280.0f * 280.0f) {
+        scp914Setting++;
+        if (scp914Setting > 2) scp914Setting = -2;
+        snprintf(toastMsg, sizeof(toastMsg), "SCP-914: %s",
+                 setting914Name(scp914Setting));
+        toastTimer = 160;
+        audioPlay(sndButton[rand() % 2], 0.8f, 0.0f);
+        return 1;
+    }
+    float idx = camPos[0] - scp914In[0], idz = camPos[2] - scp914In[2];
+    if (idx * idx + idz * idz < 420.0f * 420.0f) {
+        if (invSel < 0 || invSel >= (int)inventoryCount) {
+            snprintf(toastMsg, sizeof(toastMsg),
+                     "SELECT AN ITEM TO REFINE");
+            toastTimer = 160;
+            return 1;
+        }
+        scp914RefineTpl = inventory[invSel];
+        consumeSlot(invSel);
+        scp914State = 1;
+        scp914Timer = 0.0f;
+        if (snd914 >= 0) audioPlay(snd914, 0.9f, 0.0f);
+        snprintf(toastMsg, sizeof(toastMsg), "SCP-914 WHIRS TO LIFE...");
+        toastTimer = 180;
+        return 1;
+    }
+    return 0;
+}
+
+static void update914(void) {
+    if (!scp914Ok || scp914State != 1) return;
+    scp914Timer += 1.0f;
+    if (scp914Timer > 180.0f) {  /* the doors reopen after ~3 s */
+        scp914State = 0;
+        int out = refine914(scp914RefineTpl, scp914Setting);
+        scp914RefineTpl = -1;
+        if (out >= 0) {
+            worldItemAdd(out, scp914Out[0], scp914Out[1] + 20.0f,
+                         scp914Out[2]);
+            snprintf(toastMsg, sizeof(toastMsg), "SCP-914 OUTPUT: %s",
+                     ITEM_TEMPLATES[out].name);
+        } else {
+            snprintf(toastMsg, sizeof(toastMsg), "SCP-914 DESTROYED IT");
+        }
+        toastTimer = 220;
+    }
+}
+
+static void draw914(const float viewPos[3]) {
+    if (!scp914Ok) return;
+    float dx = scp914Knob[0] - viewPos[0], dz = scp914Knob[2] - viewPos[2];
+    if (dx * dx + dz * dz > VIEW_RANGE * VIEW_RANGE) return;
+    /* The knob, rotated to its setting (-2..2 -> +-90 deg). */
+    glPushMatrix();
+    glTranslatef(scp914Knob[0], scp914Knob[1], scp914Knob[2]);
+    glRotatef(-scp914Yaw, 0.0f, 1.0f, 0.0f);
+    glRotatef((float)scp914Setting * 45.0f, 0.0f, 0.0f, 1.0f);
+    drawModelRT(&knob914RT);
+    glPopMatrix();
+    /* The control key just below it. */
+    glPushMatrix();
+    glTranslatef(scp914Knob[0], scp914Knob[1] - 40.0f, scp914Knob[2]);
+    glRotatef(-scp914Yaw, 0.0f, 1.0f, 0.0f);
+    drawModelRT(&key914RT);
+    glPopMatrix();
+}
+
 /* Place FillRoom's literal item spawns in every placed room (rotated
  * with the room), plus one keycard per zone as progression safety
  * until the scripted keycard sources are ported. */
@@ -9568,6 +9738,10 @@ int main(void) {
          * frame must not also interact with the world. */
         if (haveData && !invOpen && !pauseOpen && !pausedAtFrameStart
             && !keypadOpen && !introCameraLocked()
+            && inputHit(ACTION_INTERACT) && try914Interact()) {
+            /* SCP-914 handled the press (knob cycle or refine run). */
+        } else if (haveData && !invOpen && !pauseOpen && !pausedAtFrameStart
+            && !keypadOpen && !introCameraLocked()
             && inputHit(ACTION_INTERACT)) {
             int fxType = 0;
             int fx = fixtureNearest(camPos, &fxType);
@@ -9723,6 +9897,7 @@ int main(void) {
             update012();
             update372();
             update205();
+            update914();
             update173();
             update106();
             update096();
@@ -10022,6 +10197,7 @@ int main(void) {
             draw895(camPos);
             draw372(camPos);
             draw205(camPos);
+            draw914(camPos);
             drawItems(camPos);
             draw173(camPos);
             draw106(camPos);
