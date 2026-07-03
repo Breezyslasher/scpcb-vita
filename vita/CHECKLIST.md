@@ -10,7 +10,7 @@ Updated as features land. States: **done** / **partial** / **missing**.
 | Map generation (CreateMap) | done | Hallway walk, shape/angle tables, forced iconic rooms, force-more-ROOM1 pass, 50-seed CI check |
 | Zones | partial | Everything generates as one LCZ-style zone; the source's LCZ/HCZ/EZ zone bands with checkpoint transitions and per-zone room pools are not split |
 | Room loading | done | Incremental (mesh/collision, then textures, then VBOs), 5x5 prefetch ring |
-| Room ambience per zone | missing | The source loops zone ambience + random room sounds |
+| Room ambience emitters | done | RMESH soundemitter entities loop the nearest in-range ambience per room |
 | Grid doors between rooms | done | Placement rules, dedup, keycard checkpoints |
 | Room-internal doors (FillRoom) | done | 257 extracted; types, locks, buttonless, keypad codes |
 | Runtime-expression doors | missing | ~30 CreateDoor calls with computed coordinates skipped by the extractor |
@@ -73,7 +73,7 @@ Updated as features land. States: **done** / **partial** / **missing**.
 | SCP-106 | missing | Pocket dimension too |
 | SCP-096, 049, 049-2, 939, 966, 860-1, 1499-1 | missing | |
 | Guards/MTF in gameplay | missing | Only intro figures |
-| NPC waypoint pathfinding | missing | 173 walks straight lines + room hops |
+| NPC waypoint pathfinding | done | 173 BFS-routes through room cells/doorways toward the player and last-seen spot |
 
 ## Events / story
 
@@ -91,8 +91,8 @@ Updated as features land. States: **done** / **partial** / **missing**.
 | --- | --- | --- |
 | Mixer (3D pan/attenuate, loops) | done | 48 kHz out, 64-bit positions |
 | Streamed music | done | Menu + LCZ track, radio stations |
-| Per-zone music switching | missing | Single gameplay track |
-| Footstep surface variants | partial | One surface set |
+| Per-zone music switching | done | Track follows the room zone (LCZ/HCZ/EZ) |
+| Footstep surface variants | done | Metal step/run set on grating/panel floors via down-ray texture test |
 | Door/interact/horror/intro voice sets | done | |
 | Ambient room emitters | missing | |
 

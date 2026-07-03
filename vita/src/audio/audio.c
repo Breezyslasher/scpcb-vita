@@ -35,7 +35,7 @@ static void alog(const char *fmt, ...) {
  * conversion handles the 44.1 kHz sources. */
 #define OUT_RATE 48000
 #define GRAIN 256
-#define MAX_SOUNDS 96
+#define MAX_SOUNDS 160
 #define MAX_CHANNELS 12
 #define AMBIENCE_CHANNEL MAX_CHANNELS       /* extra looping slot */
 #define MUSIC_CHANNEL (MAX_CHANNELS + 1)    /* extra looping slot */

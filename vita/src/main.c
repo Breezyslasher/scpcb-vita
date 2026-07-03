@@ -199,6 +199,13 @@ typedef struct {
     GLuint ibo;
 } BatchGL;
 
+#define MAX_ROOM_EMITTERS 6
+typedef struct {
+    float x, y, z;    /* room-local raw units */
+    int id;           /* RoomAmbience index (1-based in the file) */
+    float range;      /* raw units */
+} RoomEmitter;
+
 typedef struct {
     int state;        /* 0 = not loaded, 1 = ok, -1 = failed,
                          2 = geometry built, textures loading */
@@ -206,6 +213,8 @@ typedef struct {
     Scene *scene;
     BatchGL *gl;
     CollisionWorld *col;
+    RoomEmitter emitters[MAX_ROOM_EMITTERS];
+    int emitterCount;
 } TemplateRT;
 
 static RoomTemplateList tplList;
@@ -264,6 +273,21 @@ static void templateEnsureStep(int idx) {
                            e->u.prop.texture);
         }
         rt->col = collisionBuild(rt->scene, mesh);
+        rt->emitterCount = 0;
+        for (uint32_t i = 0; i < mesh->entityCount; i++) {
+            const RMeshEntity *e = &mesh->entities[i];
+            if (e->type != RMESH_ENTITY_SOUND_EMITTER) continue;
+            if (rt->emitterCount >= MAX_ROOM_EMITTERS) break;
+            RoomEmitter *em = &rt->emitters[rt->emitterCount++];
+            em->x = e->x;
+            em->y = e->y;
+            em->z = e->z;
+            em->id = e->u.soundEmitter.id;
+            /* File range is raw; the game loops within `range` and
+             * uses the same units the emitter position is in. */
+            em->range = e->u.soundEmitter.range;
+            if (em->range < 256.0f) em->range = 1024.0f;
+        }
         rmeshFree(mesh);
         rt->gl = (BatchGL *)calloc(
             rt->scene->batchCount ? rt->scene->batchCount : 1,
@@ -605,6 +629,42 @@ static const char *roomNameAt(const float pos[3]) {
     return "(void)";
 }
 
+/* Zone of the player's current room (rooms.ini Zone1: 1 LCZ, 2 HCZ,
+ * 3 EZ), for per-zone music. Defaults to LCZ. */
+static int zoneAt(const float pos[3]) {
+    if (inIntroBounds(pos[0], pos[2])) return 1;
+    int px = (int)floorf(pos[0] / ROOM_SPACING + 0.5f);
+    int py = (int)floorf(pos[2] / ROOM_SPACING + 0.5f);
+    for (uint32_t i = 0; i < map.roomCount; i++) {
+        if (map.rooms[i].gridX == px && map.rooms[i].gridY == py) {
+            int z = tplList.items[map.rooms[i].templateIndex].zones[0];
+            return z >= 1 && z <= 3 ? z : 1;
+        }
+    }
+    return 1;
+}
+
+/* Materials with stepsound=1 in Data/materials.ini (metal floors). */
+static int textureIsMetal(const char *name) {
+    if (!name) return 0;
+    static const char *METAL[] = {
+        "metal3.jpg", "dirtymetal.jpg", "metalpanels.png",
+        "metalpanels2.png", "metalpanels2blood1.png",
+        "metalpanels2blood2.png", "metal.jpg", "metal_darker.jpg",
+        "controlpanel.jpg",
+    };
+    for (unsigned i = 0; i < sizeof(METAL) / sizeof(METAL[0]); i++) {
+        if (strcasecmp(name, METAL[i]) == 0) return 1;
+    }
+    return 0;
+}
+
+/* The floor material under the player: ray straight down against the
+ * scene batches of the room the player stands in and return whether
+ * the topmost floor surface below the feet is metal. Called only at
+ * footstep cadence, so the per-triangle test is cheap enough. */
+static int floorIsMetal(const float pos[3]);
+
 /* ---------------- collision across active rooms ---------------- */
 
 static void pushWorld(float pos[3], float radius, int *pushedUp) {
@@ -698,6 +758,8 @@ static int wearNVG;                 /* 0 none, 1 normal, 2 fine */
 static int wear268;                 /* SCP-268: unseen by NPCs */
 static int wearVest;
 static int radioChannel = -1;       /* -1 off, 0..3 = SCPRadio0-3 */
+static int currentMusicZone = -1;   /* per-zone music tracking */
+static int currentAmbienceId;       /* active room ambience emitter id */
 static int blinkFrames;             /* >0 while eyes closed */
 static float stamina = 100.0f;      /* sprint resource */
 static int staminaBlocked;
@@ -733,6 +795,8 @@ static void spawnPlayer(void) {
 
 static void regenerateMap(uint32_t seed) {
     memset(roomVisited, 0, sizeof(roomVisited));
+    currentMusicZone = -1;
+    currentAmbienceId = 0;
     equippedNav = -1;
     navVisible = 1;
     health = 100.0f;
@@ -865,6 +929,51 @@ static void drawRoomBatches(const RoomPlacement *p, int alphaPass) {
     glPopMatrix();
 }
 
+static int floorIsMetal(const float pos[3]) {
+    int px = (int)floorf(pos[0] / ROOM_SPACING + 0.5f);
+    int py = (int)floorf(pos[2] / ROOM_SPACING + 0.5f);
+    const RoomPlacement *rp = NULL;
+    for (int i = 0; i < activeCount; i++) {
+        if (activeRooms[i]->gridX == px && activeRooms[i]->gridY == py) {
+            rp = activeRooms[i];
+            break;
+        }
+    }
+    if (!rp) return 0;
+    const TemplateRT *rt = &tplRT[rp->templateIndex];
+    if (rt->state != 1 || !rt->scene) return 0;
+
+    float local[3];
+    worldToLocal(rp, pos, local);
+    float feet = local[1] - EYE_HEIGHT; /* local floor is y ~ 0 */
+    float bestY = -1e30f;
+    const char *bestTex = NULL;
+    for (uint32_t b = 0; b < rt->scene->batchCount; b++) {
+        const SceneBatch *bt = &rt->scene->batches[b];
+        for (uint32_t t = 0; t + 2 < bt->indexCount; t += 3) {
+            const SceneVertex *v0 = &bt->vertices[bt->indices[t]];
+            const SceneVertex *v1 = &bt->vertices[bt->indices[t + 1]];
+            const SceneVertex *v2 = &bt->vertices[bt->indices[t + 2]];
+            /* Barycentric point-in-triangle on XZ. */
+            float d = (v1->z - v2->z) * (v0->x - v2->x)
+                    + (v2->x - v1->x) * (v0->z - v2->z);
+            if (fabsf(d) < 1e-4f) continue;
+            float a = ((v1->z - v2->z) * (local[0] - v2->x)
+                     + (v2->x - v1->x) * (local[2] - v2->z)) / d;
+            float bb = ((v2->z - v0->z) * (local[0] - v2->x)
+                      + (v0->x - v2->x) * (local[2] - v2->z)) / d;
+            float c = 1.0f - a - bb;
+            if (a < -0.02f || bb < -0.02f || c < -0.02f) continue;
+            float y = a * v0->y + bb * v1->y + c * v2->y;
+            if (y <= feet + 40.0f && y > bestY) {
+                bestY = y;
+                bestTex = bt->diffuseName;
+            }
+        }
+    }
+    return textureIsMetal(bestTex);
+}
+
 /* ---------------- door assets and drawing ---------------- */
 
 typedef struct {
@@ -886,6 +995,7 @@ static int npcAggressive = 0;
 static int sndDoorOpen[3], sndDoorClose[3];
 static int sndBigOpen[3], sndBigClose[3];
 static int sndStep[8], sndRun[7];
+static int sndStepMetal[8], sndRunMetal[8];
 static int sndButton[2], sndKeycardUse[2], sndDoorLock, sndLever;
 static GLuint texButtonRed;
 static int sndPick[4];
@@ -910,6 +1020,10 @@ static void loadSounds(void) {
     for (int i = 0; i < 8; i++) {
         snprintf(p, sizeof(p), SFX_DIR "/Step/Step%d.ogg", i);
         sndStep[i] = audioLoad(p);
+        snprintf(p, sizeof(p), SFX_DIR "/Step/StepMetal%d.ogg", i);
+        sndStepMetal[i] = audioLoad(p);
+        snprintf(p, sizeof(p), SFX_DIR "/Step/RunMetal%d.ogg", i);
+        sndRunMetal[i] = audioLoad(p);
     }
     for (int i = 0; i < 7; i++) {
         snprintf(p, sizeof(p), SFX_DIR "/Step/Run%d.ogg", i);
@@ -1276,6 +1390,78 @@ static float normDeg(float a) {
  * (1 world unit = 256): freezes while watched, hunts a player it can
  * reach within 10u, remembers the last seen position, wanders and
  * teleports closer when far, opens doors, snaps necks at 0.65u. */
+/* Waypoint navigation: BFS over occupied room cells (4-connected,
+ * which is how CreateMap links rooms) from 173's cell toward a goal
+ * cell, then aim at the center of the next cell on the path so 173
+ * rounds corners through doorways instead of grinding straight into
+ * walls. Falls back to the direct vector when goal and 173 share a
+ * cell or no path exists. */
+static int cellIndexAt(float x, float z) {
+    int gx = (int)floorf(x / ROOM_SPACING + 0.5f);
+    int gy = (int)floorf(z / ROOM_SPACING + 0.5f);
+    for (uint32_t i = 0; i < map.roomCount; i++) {
+        if (map.rooms[i].gridX == gx && map.rooms[i].gridY == gy) {
+            return (int)i;
+        }
+    }
+    return -1;
+}
+
+static int navNextCell(float fromX, float fromZ, float goalX, float goalZ,
+                       float out[2]) {
+    int start = cellIndexAt(fromX, fromZ);
+    int goal = cellIndexAt(goalX, goalZ);
+    if (start < 0 || goal < 0 || start == goal) return 0;
+
+    static int prev[1024];
+    static int queue[1024];
+    int qh = 0, qt = 0;
+    uint32_t rc = map.roomCount < 1024 ? map.roomCount : 1024;
+    for (uint32_t i = 0; i < rc; i++) prev[i] = -2;
+    prev[start] = -1;
+    queue[qt++] = start;
+    const int dx4[4] = { 1, -1, 0, 0 }, dy4[4] = { 0, 0, 1, -1 };
+    int found = 0;
+    while (qh < qt) {
+        int cur = queue[qh++];
+        if (cur == goal) { found = 1; break; }
+        int cx = map.rooms[cur].gridX, cy = map.rooms[cur].gridY;
+        for (int d = 0; d < 4; d++) {
+            for (uint32_t j = 0; j < rc; j++) {
+                if (prev[j] != -2) continue;
+                if (map.rooms[j].gridX == cx + dx4[d]
+                    && map.rooms[j].gridY == cy + dy4[d]) {
+                    prev[j] = cur;
+                    if (qt < 1024) queue[qt++] = j;
+                }
+            }
+        }
+    }
+    if (!found) return 0;
+    /* Walk back to the cell right after start. */
+    int step = goal;
+    while (prev[step] != start && prev[step] >= 0) step = prev[step];
+    out[0] = map.rooms[step].gridX * ROOM_SPACING;
+    out[1] = map.rooms[step].gridY * ROOM_SPACING;
+    return 1;
+}
+
+/* Direction toward `goal`, routed through the next doorway cell when
+ * they are in different rooms. */
+static void navDir(float goalX, float goalZ, float *dirX, float *dirZ) {
+    float wp[2];
+    float tx = goalX, tz = goalZ;
+    if (navNextCell(npc173Pos[0], npc173Pos[2], goalX, goalZ, wp)) {
+        tx = wp[0];
+        tz = wp[1];
+    }
+    float ddx = tx - npc173Pos[0], ddz = tz - npc173Pos[2];
+    float d = sqrtf(ddx * ddx + ddz * ddz);
+    if (d < 1.0f) { *dirX = 0.0f; *dirZ = 0.0f; return; }
+    *dirX = ddx / d;
+    *dirZ = ddz / d;
+}
+
 static void update173(void) {
     if (!npc173Active || deathTimer > 0 || !walkMode) return;
     float dx = camPos[0] - npc173Pos[0];
@@ -1349,8 +1535,14 @@ static void update173(void) {
             float speed = 97.0f; /* NPCs.ini Speed 38 */
             if (speed > dist - 80.0f) speed = dist - 80.0f;
             if (speed > 0.0f) {
-                move173(dx / dist, dz / dist, speed);
-                npc173YawDeg = yawToPlayer;
+                float ndx, ndz;
+                navDir(camPos[0], camPos[2], &ndx, &ndz);
+                if (ndx == 0.0f && ndz == 0.0f) { /* same room */
+                    ndx = dx / dist;
+                    ndz = dz / dist;
+                }
+                move173(ndx, ndz, speed);
+                npc173YawDeg = atan2f(ndx, ndz) * 180.0f / 3.14159265f;
                 moving = 1;
             }
         } else if (npc173EnemyX != 0.0f || npc173EnemyZ != 0.0f) {
@@ -1359,8 +1551,14 @@ static void update173(void) {
             float ez = npc173EnemyZ - npc173Pos[2];
             float ed = sqrtf(ex * ex + ez * ez);
             if (ed > 128.0f && rand() % 500 != 0) {
-                move173(ex / ed, ez / ed, 97.0f);
-                npc173YawDeg = atan2f(ex, ez) * 180.0f / 3.14159265f;
+                float ndx, ndz;
+                navDir(npc173EnemyX, npc173EnemyZ, &ndx, &ndz);
+                if (ndx == 0.0f && ndz == 0.0f) {
+                    ndx = ex / ed;
+                    ndz = ez / ed;
+                }
+                move173(ndx, ndz, 97.0f);
+                npc173YawDeg = atan2f(ndx, ndz) * 180.0f / 3.14159265f;
                 npc173HeadYawDeg = normDeg(yawToPlayer - npc173YawDeg);
                 moving = 1;
             } else {
@@ -2580,12 +2778,80 @@ static void menuMusicStart(void) {
     audioStreamMusic(DATA_ROOT "/SFX/Music/Menu.ogg", 0.8f, 1);
 }
 
-/* Zone music while playing; the generated facility is the Light
- * Containment Zone (Music[0] in Loading_Core.bb). */
+/* Per-zone music (Loading_Core Music[0..2]): the streamed track
+ * follows the player's current zone. */
+static const char *ZONE_MUSIC[4] = {
+    NULL,
+    DATA_ROOT "/SFX/Music/LightContainmentZone.ogg",
+    DATA_ROOT "/SFX/Music/HeavyContainmentZone.ogg",
+    DATA_ROOT "/SFX/Music/EntranceZone.ogg",
+};
+
 static void gameMusicStart(void) {
     if (radioChannel >= 0) return; /* the radio owns the music path */
-    audioStreamMusic(DATA_ROOT "/SFX/Music/LightContainmentZone.ogg",
-                     0.55f, 1);
+    int z = worldReady ? zoneAt(camPos) : 1;
+    currentMusicZone = z;
+    audioStreamMusic(ZONE_MUSIC[z], 0.55f, 1);
+}
+
+/* Called each gameplay frame: swap the track when the zone changes. */
+static void updateZoneMusic(void) {
+    if (radioChannel >= 0 || !worldReady) return;
+    int z = zoneAt(camPos);
+    if (z != currentMusicZone) {
+        currentMusicZone = z;
+        audioStreamMusic(ZONE_MUSIC[z], 0.55f, 1);
+    }
+}
+
+/* Room ambience emitters (RMESH soundemitter entities): loop the
+ * ambience of the nearest in-range emitter in the active rooms on the
+ * dedicated ambience channel. Sounds load lazily by path. */
+static int ambienceSound(int id) {
+    static const char *AMB[12] = {
+        "/Ambient/Room ambience/rumble.ogg",
+        "/Ambient/Room ambience/lowdrone.ogg",
+        "/Ambient/Room ambience/pulsing.ogg",
+        "/Ambient/Room ambience/ventilation.ogg",
+        "/Ambient/Room ambience/drip.ogg",
+        "/Alarm/Alarm0.ogg",
+        "/Ambient/Room ambience/895.ogg",
+        "/Ambient/Room ambience/fuelpump.ogg",
+        "/Ambient/Room ambience/Fan.ogg",
+        "/Ambient/Room ambience/servers1.ogg",
+        "/Ambient/Room ambience/173chamber.ogg",
+        "/Ambient/Room ambience/372Cell.ogg",
+    };
+    if (id < 1 || id > 12) return -1;
+    char path[256];
+    snprintf(path, sizeof(path), SFX_DIR "%s", AMB[id - 1]);
+    return audioLoad(path);
+}
+
+static void updateRoomAmbience(void) {
+    int bestId = 0;
+    float bestVol = 0.0f;
+    for (int i = 0; i < activeCount; i++) {
+        const RoomPlacement *rp = activeRooms[i];
+        const TemplateRT *rt = &tplRT[rp->templateIndex];
+        for (int e = 0; e < rt->emitterCount; e++) {
+            const RoomEmitter *em = &rt->emitters[e];
+            float local[3] = { em->x, em->y, em->z }, w[3];
+            localToWorld(rp, local, w);
+            float dx = w[0] - camPos[0], dz = w[2] - camPos[2];
+            float d = sqrtf(dx * dx + dz * dz);
+            if (d >= em->range) continue;
+            float vol = (1.0f - d / em->range) * 0.7f;
+            if (vol > bestVol) {
+                bestVol = vol;
+                bestId = em->id;
+            }
+        }
+    }
+    if (bestId != currentAmbienceId) {
+        currentAmbienceId = bestId;
+        audioLoopAmbience(bestId ? ambienceSound(bestId) : -1, bestVol);
+    }
 }
 
 /* Radio Transceiver: SCPRadio stations stream where the zone music
@@ -4480,6 +4746,10 @@ int main(void) {
             doorsUpdate(&doors);
             update173();
             introUpdate();
+            if (introPhase < 0) {
+                updateZoneMusic();
+                updateRoomAmbience();
+            }
             itemSpin += 1.0f;
             if (itemSpin >= 360.0f) itemSpin -= 360.0f;
         }
@@ -4586,16 +4856,21 @@ int main(void) {
             camPos[0] += mvx;
             camPos[2] += mvz;
 
-            /* Footstep cadence by distance walked (PlayStepSound). */
+            /* Footstep cadence by distance walked (PlayStepSound),
+             * with a metal step set on grating/panel floors
+             * (GetStepSound). */
             if (velY > -1.0f) {
                 stepAccum += sqrtf(mvx * mvx + mvz * mvz);
                 float strideLen = 170.0f;
                 if (stepAccum >= strideLen) {
                     stepAccum = 0.0f;
+                    int metal = floorIsMetal(camPos);
                     if (sprinting) {
-                        audioPlay(sndRun[rand() % 7], 0.7f, 0.0f);
+                        audioPlay(metal ? sndRunMetal[rand() % 8]
+                                        : sndRun[rand() % 7], 0.7f, 0.0f);
                     } else {
-                        audioPlay(sndStep[rand() % 8],
+                        audioPlay(metal ? sndStepMetal[rand() % 8]
+                                        : sndStep[rand() % 8],
                                   crouched ? 0.25f : 0.5f, 0.0f);
                     }
                 }
