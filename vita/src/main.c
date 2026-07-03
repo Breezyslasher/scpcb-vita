@@ -482,9 +482,13 @@ typedef struct {
 #define MAX_CAMERAS 48
 static WorldCamera worldCameras[MAX_CAMERAS];
 static int worldCameraCount;
+static float camCheckTimer;   /* MTF camera sweep: >0 while one runs */
+static int camCheckSpotted;   /* a camera caught the player this sweep */
 
 static void spawnRoomCameras(void) {
     worldCameraCount = 0;
+    camCheckTimer = 0.0f;
+    camCheckSpotted = 0;
     const int NC = (int)(sizeof(ROOM_CAMERAS) / sizeof(ROOM_CAMERAS[0]));
     for (uint32_t r = 0;
          r < map.roomCount && worldCameraCount < MAX_CAMERAS; r++) {
@@ -725,6 +729,8 @@ static TeslaGate teslaGates[MAX_TESLA];
 static int teslaCount;
 static int sndTeslaIdle = -1, sndTeslaWind = -1, sndTeslaShock = -1,
            sndTeslaPower = -1;
+/* MTF camera-check announcements (UpdateCameraCheck). */
+static int sndCamCheck = -1, sndCamFound[2] = { -1, -1 }, sndCamNoFound = -1;
 static GLuint teslaArcTex;
 static float teslaFlash;       /* white screen flash when it zaps nearby */
 
@@ -2004,6 +2010,10 @@ static void loadSounds(void) {
     sndHorrorClose[3] = audioLoad(SFX_DIR "/Horror/Horror10.ogg");
     sndHorrorClose[4] = audioLoad(SFX_DIR "/Horror/Horror12.ogg");
     sndDoor173 = audioLoad(SFX_DIR "/Door/DoorOpen173.ogg");
+    sndCamCheck = audioLoad(SFX_DIR "/Character/MTF/AnnouncCameraCheck.ogg");
+    sndCamFound[0] = audioLoad(SFX_DIR "/Character/MTF/AnnouncCameraFound1.ogg");
+    sndCamFound[1] = audioLoad(SFX_DIR "/Character/MTF/AnnouncCameraFound2.ogg");
+    sndCamNoFound = audioLoad(SFX_DIR "/Character/MTF/AnnouncCameraNoFound.ogg");
     sndAmbience = audioLoad(SFX_DIR "/Ambient/Room ambience/rumble.ogg");
     audioLoopAmbience(sndAmbience, 0.30f);
 }
@@ -7264,6 +7274,57 @@ static void camerasDraw(const float viewPos[3]) {
     }
 }
 
+/* MTF camera-detection subplot (UpdateCameraCheck): now and then the
+ * MTF run a camera sweep - an announcement, then a window in which any
+ * security camera that sees the player flags it, and a second
+ * announcement (found / not found) when the window closes. The source
+ * kicks this off when an MTF unit loses its target; the port has no MTF,
+ * so it fires on a rare timer for the same tension, and "detected" is a
+ * scare cue (toast + horror sting) rather than a dispatch, since there
+ * is no squad to send. */
+#define CAM_CHECK_DURATION 5400.0f   /* ~90 s at 60 fps (source 70*90) */
+
+static void cameraCheckUpdate(void) {
+    if (!worldReady) return;
+    if (camCheckTimer <= 0.0f) {
+        if ((rand() % 10800) == 0) {  /* ~1 sweep per 3 min */
+            camCheckTimer = 1.0f;
+            camCheckSpotted = 0;
+            if (sndCamCheck >= 0) audioPlay(sndCamCheck, 0.9f, 0.0f);
+        }
+        return;
+    }
+    if (!camCheckSpotted) {
+        for (int i = 0; i < worldCameraCount; i++) {
+            const WorldCamera *c = &worldCameras[i];
+            float dx = camPos[0] - c->x, dz = camPos[2] - c->z;
+            if (dx * dx + dz * dz > 2200.0f * 2200.0f) continue;
+            /* Inside the head's ~60 deg cone (source DeltaYaw < 60) and
+             * not occluded. */
+            float toPlayer = atan2f(dx, dz) * (180.0f / 3.14159265f);
+            if (fabsf(yawDelta(toPlayer, c->headYaw)) > 60.0f) continue;
+            float eye[3] = { c->x, c->y - 21.0f, c->z };
+            if (!lineOfSight(eye, camPos)) continue;
+            camCheckSpotted = 1;
+            break;
+        }
+    }
+    camCheckTimer += 1.0f;
+    if (camCheckTimer >= CAM_CHECK_DURATION) {
+        camCheckTimer = 0.0f;
+        if (camCheckSpotted) {
+            if (sndCamFound[0] >= 0) audioPlay(sndCamFound[rand() % 2],
+                                               0.95f, 0.0f);
+            if (sndHorror11 >= 0) audioPlay(sndHorror11, 0.6f, 0.0f);
+            snprintf(toastMsg, sizeof(toastMsg),
+                     "A SECURITY CAMERA CAUGHT YOU");
+            toastTimer = 220;
+        } else if (sndCamNoFound >= 0) {
+            audioPlay(sndCamNoFound, 0.9f, 0.0f);
+        }
+    }
+}
+
 static const ModelRT *buttonModelFor(int btnId) {
     switch (btnId) {
         case 1: return &buttonKeycardRT;
@@ -8949,6 +9010,7 @@ int main(void) {
             if (blurAmount < 0.02f) blurAmount = 0.0f;
             doorsUpdate(&doors);
             camerasUpdate();
+            cameraCheckUpdate();
             update173();
             update106();
             update096();
