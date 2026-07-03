@@ -588,6 +588,8 @@ static void appendIntroRoom(void) {
 static int pdRoomIdx = -1;
 static int inPocket;          /* player is in the pocket dimension */
 static float pocketTimer;     /* frames until it collapses (death) */
+static float pdCircle;        /* 106's orbit angle in the start room */
+static int pdLunging;         /* 106 has broken off to attack */
 static int npc106Contained;   /* femur breaker: 106 permanently stopped */
 static float femurTimer;      /* femur breaker sequence progress */
 static float femurSpot[3];    /* world pos of the breaker pit */
@@ -868,6 +870,7 @@ static void regenerateMap(uint32_t seed) {
     currentMusicZone = -1;
     currentAmbienceId = 0;
     inPocket = 0;
+    pdLunging = 0;
     femurTimer = 0.0f;
     npc106Contained = 0;
     injuries = 0.0f;
@@ -2569,6 +2572,10 @@ static void enterPocketDimension(void) {
     velY = 0.0f;
     inPocket = 1;
     pocketTimer = 5400.0f; /* ~90 s */
+    pdCircle = 0.0f;
+    pdLunging = 0;
+    npc106Active = skin106 != NULL;
+    npc106State = N106_CHASING; /* so draw106 shows it */
     blinkFrames = 20;
     blinkTimer = 100.0f;
     audioPlay(sndPdEnter, 1.0f, 0.0f);
@@ -2577,6 +2584,9 @@ static void enterPocketDimension(void) {
 
 static void leavePocketDimension(int escaped) {
     inPocket = 0;
+    pdLunging = 0;
+    npc106State = N106_DORMANT;
+    npc106Pos[1] = -5000.0f;
     audioLoopAmbience(-1, 0.0f);
     if (escaped) {
         audioPlay(sndPdExit, 1.0f, 0.0f);
@@ -2602,6 +2612,56 @@ static void updatePocketDimension(void) {
     if (pocketTimer <= 0.0f) {
         leavePocketDimension(0);
         return;
+    }
+
+    /* SCP-106 circles the start room (PD_StartRoom: it orbits until it
+     * lunges - after a while, or at random). */
+    float cx = PD_GX * ROOM_SPACING, cz = PD_GY * ROOM_SPACING;
+    if (npc106Active && skin106) {
+        if (!pdLunging) {
+            pdCircle += 0.6f;
+            float a = pdCircle * 3.14159265f / 180.0f;
+            npc106Pos[0] = cx + sinf(a) * 950.0f;
+            npc106Pos[2] = cz + cosf(a) * 950.0f;
+            float o[3] = { npc106Pos[0], camPos[1] + 200.0f, npc106Pos[2] };
+            float hy;
+            npc106Pos[1] = rayDownWorld(o, 3000.0f, &hy) ? hy
+                                                         : camPos[1]
+                                                           - EYE_HEIGHT;
+            npc106Frame += 0.7f;
+            if (npc106Frame > 333.0f || npc106Frame < 284.0f) {
+                npc106Frame = 284.0f;
+            }
+            /* Face along the orbit toward the player. */
+            npc106YawDeg = -atan2f(camPos[0] - npc106Pos[0],
+                                   camPos[2] - npc106Pos[2])
+                         * 180.0f / 3.14159265f + 180.0f;
+            if (pocketTimer < 1500.0f || rand() % 1400 == 0) {
+                pdLunging = 1;
+                audioPlay(snd106Laugh, 1.0f, 0.0f);
+            }
+        } else {
+            /* Lunge straight at the player; contact is fatal. */
+            float dx = camPos[0] - npc106Pos[0];
+            float dz = camPos[2] - npc106Pos[2];
+            float d = sqrtf(dx * dx + dz * dz);
+            if (d < 150.0f) {
+                snprintf(deathCause, sizeof(deathCause), "SCP-106");
+                audioPlay(sndPdExplode, 1.0f, 0.0f);
+                deathTimer = 180;
+                inPocket = 0;
+                audioLoopAmbience(-1, 0.0f);
+                return;
+            }
+            if (d > 1.0f) {
+                npc106Pos[0] += dx / d * 40.0f;
+                npc106Pos[2] += dz / d * 40.0f;
+                npc106YawDeg = -atan2f(dx, dz) * 180.0f / 3.14159265f
+                             + 180.0f;
+            }
+            npc106Frame += 0.7f;
+            if (npc106Frame > 333.0f) npc106Frame = 284.0f;
+        }
     }
     /* Exit at the far corner; reaching it escapes. */
     float ex = PD_GX * ROOM_SPACING + 400.0f;
