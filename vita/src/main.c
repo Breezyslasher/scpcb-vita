@@ -607,6 +607,17 @@ static int elevState;
 static float elevTimer;
 static float elevDest[3];     /* arrival position */
 static int elevDoorA = -1, elevDoorB = -1; /* doors to open on arrival */
+/* The gate surfaces are real elevator destinations: gate_a_entrance /
+ * gate_b_entrance (in the facility) ride to the appended gate_a / gate_b
+ * surface rooms and back. */
+#define GATEA_GX -20
+#define GATEA_GY -20
+#define GATEB_GX -24
+#define GATEB_GY -20
+static int gateARoomIdx = -1, gateBRoomIdx = -1;
+static int gateADoor = -1, gateBDoor = -1;   /* surface return elevators */
+static float gateAEntr[3], gateBEntr[3];     /* facility landings */
+static int gateAEntrOK, gateBEntrOK;
 static int inMask;            /* wearing SCP-1499, in its dimension */
 static float maskReturn[4];   /* pre-mask pos + yaw */
 #define MAX_1499 8
@@ -840,6 +851,61 @@ static void appendMaskRoom(void) {
     p->angle = 0;
     maskRoomIdx = (int)map.roomCount;
     map.roomCount++;
+}
+
+/* Append the gate_a / gate_b surface rooms off-grid and give each a
+ * return elevator, and record the facility gate-entrance landings, so
+ * the entrance elevators actually travel to the surfaces. Call after the
+ * grid doors are generated (it appends internal elevator doors). */
+static void appendGateRooms(void) {
+    gateARoomIdx = gateBRoomIdx = -1;
+    gateADoor = gateBDoor = -1;
+    struct { const char *name; int gx, gy; int *idx, *door; } G[2] = {
+        { "gate_a", GATEA_GX, GATEA_GY, &gateARoomIdx, &gateADoor },
+        { "gate_b", GATEB_GX, GATEB_GY, &gateBRoomIdx, &gateBDoor },
+    };
+    for (int g = 0; g < 2; g++) {
+        int tplIdx = -1;
+        for (uint32_t i = 0; i < tplList.count; i++) {
+            if (strcmp(tplList.items[i].name, G[g].name) == 0) {
+                tplIdx = (int)i;
+                break;
+            }
+        }
+        if (tplIdx < 0) continue;
+        RoomPlacement *grown = (RoomPlacement *)realloc(
+            map.rooms, (map.roomCount + 1) * sizeof(RoomPlacement));
+        if (!grown) return;
+        map.rooms = grown;
+        RoomPlacement *p = &map.rooms[map.roomCount];
+        p->templateIndex = tplIdx;
+        p->gridX = G[g].gx;
+        p->gridY = G[g].gy;
+        p->angle = 0;
+        *G[g].idx = (int)map.roomCount;
+        map.roomCount++;
+        /* A call elevator on the surface, to ride back. */
+        doorsAddInternal(&doors, G[g].gx * ROOM_SPACING, 0.0f,
+                         G[g].gy * ROOM_SPACING, 0, 1, 0, 0, 0, 0, 0);
+        *G[g].door = (int)doors.count - 1;
+    }
+    /* Facility landings (the entrance rooms are force-placed). */
+    gateAEntrOK = gateBEntrOK = 0;
+    for (uint32_t i = 0; i < map.roomCount; i++) {
+        const char *nm = tplList.items[map.rooms[i].templateIndex].name;
+        if (!gateAEntrOK && strcmp(nm, "gate_a_entrance") == 0) {
+            gateAEntr[0] = map.rooms[i].gridX * ROOM_SPACING;
+            gateAEntr[1] = 0.0f;
+            gateAEntr[2] = map.rooms[i].gridY * ROOM_SPACING;
+            gateAEntrOK = 1;
+        }
+        if (!gateBEntrOK && strcmp(nm, "gate_b_entrance") == 0) {
+            gateBEntr[0] = map.rooms[i].gridX * ROOM_SPACING;
+            gateBEntr[1] = 0.0f;
+            gateBEntr[2] = map.rooms[i].gridY * ROOM_SPACING;
+            gateBEntrOK = 1;
+        }
+    }
 }
 
 /* Active set: placements within one cell of the player. */
@@ -1219,6 +1285,7 @@ static void regenerateMap(uint32_t seed) {
         appendMaskRoom();
         doorsGenerate(&map, &tplList, mapSeed ^ 0x9E3779B9u, &doors);
         spawnRoomDoors();
+        appendGateRooms();
         spawnRoomFixtures();
         spawnRoomEvents();
         teslaSpawn();
@@ -4910,21 +4977,40 @@ static void update860(void) {
 static void elevatorStart(const Door *d) {
     if (elevState != ELEV_IDLE || d->type != 1) return;
     int di = (int)(d - doors.items);
-    int dest = -1;
-    for (uint32_t off = 1; off <= doors.count; off++) {
-        int j = (int)(((uint32_t)di + off) % doors.count);
-        if (j != di && doors.items[j].type == 1) { dest = j; break; }
+    const char *here = roomNameAt(camPos);
+    /* The gate elevators travel to the real surfaces (and back); every
+     * other car fast-travels to the next elevator in the map. */
+    if (strcmp(here, "gate_a_entrance") == 0 && gateARoomIdx >= 0) {
+        elevDest[0] = GATEA_GX * ROOM_SPACING;
+        elevDest[2] = GATEA_GY * ROOM_SPACING;
+        elevDoorB = gateADoor;
+    } else if (strcmp(here, "gate_b_entrance") == 0 && gateBRoomIdx >= 0) {
+        elevDest[0] = GATEB_GX * ROOM_SPACING;
+        elevDest[2] = GATEB_GY * ROOM_SPACING;
+        elevDoorB = gateBDoor;
+    } else if (strcmp(here, "gate_a") == 0 && gateAEntrOK) {
+        elevDest[0] = gateAEntr[0];
+        elevDest[2] = gateAEntr[2];
+        elevDoorB = di;
+    } else if (strcmp(here, "gate_b") == 0 && gateBEntrOK) {
+        elevDest[0] = gateBEntr[0];
+        elevDest[2] = gateBEntr[2];
+        elevDoorB = di;
+    } else {
+        int dest = -1;
+        for (uint32_t off = 1; off <= doors.count; off++) {
+            int j = (int)(((uint32_t)di + off) % doors.count);
+            if (j != di && doors.items[j].type == 1) { dest = j; break; }
+        }
+        const Door *dd = (dest >= 0) ? &doors.items[dest] : d;
+        int gx = (int)floorf(dd->x / ROOM_SPACING + 0.5f);
+        int gy = (int)floorf(dd->z / ROOM_SPACING + 0.5f);
+        elevDest[0] = gx * ROOM_SPACING;
+        elevDest[2] = gy * ROOM_SPACING;
+        elevDoorB = (dest >= 0) ? dest : di;
     }
-    /* Arrival room: the cell the destination door sits in. With only one
-     * elevator the car just returns to this landing. */
-    const Door *dd = (dest >= 0) ? &doors.items[dest] : d;
-    int gx = (int)floorf(dd->x / ROOM_SPACING + 0.5f);
-    int gy = (int)floorf(dd->z / ROOM_SPACING + 0.5f);
-    elevDest[0] = gx * ROOM_SPACING;
     elevDest[1] = camPos[1];
-    elevDest[2] = gy * ROOM_SPACING;
     elevDoorA = di;
-    elevDoorB = (dest >= 0) ? dest : di;
     doors.items[di].open = 0; /* shut for the ride */
     elevState = ELEV_CLOSE;
     elevTimer = 0.0f;
