@@ -126,6 +126,10 @@ int templatesLoad(const char *iniPath, RoomTemplateList *out) {
             cur->zones[3] = atoi(val);
         } else if (keyEq(key, "Zone5")) {
             cur->zones[4] = atoi(val);
+        } else if (keyEq(key, "DisableDecals")) {
+            cur->disableDecals = atoi(val);
+            if (cur->disableDecals < 0) cur->disableDecals = 0;
+            if (cur->disableDecals > 3) cur->disableDecals = 3;
         }
     }
     fclose(f);

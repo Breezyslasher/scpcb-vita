@@ -431,6 +431,7 @@ static int roomEventId[MAX_EVENT_ROOMS];
 static float roomEventState[MAX_EVENT_ROOMS];
 static float camShake;          /* decays; jitters the view rotation */
 static float cameraZoom;         /* FOV narrowing (deg) - 106's dread pulse */
+static float blurAmount;         /* 0..1 screen blur (me\BlurVolume) */
 static unsigned gTick;           /* gameplay frame counter (effect phases) */
 static uint32_t eventRng;        /* per-run event RNG */
 static int sndHorror11 = -1, snd682Roar = -1;
@@ -837,6 +838,21 @@ static int zoneAt(const float pos[3]) {
         }
     }
     return 1;
+}
+
+/* DisableDecals of the player's current room (0..3), which also gates
+ * SCP-106's spawn timer (source UpdateNPCType106 State 1). The pocket
+ * dimension and intro count as fully open (0). */
+static int roomDisableDecalsAt(const float pos[3]) {
+    if (inIntroBounds(pos[0], pos[2]) || inPdBounds(pos[0], pos[2])) return 0;
+    int px = (int)floorf(pos[0] / ROOM_SPACING + 0.5f);
+    int py = (int)floorf(pos[2] / ROOM_SPACING + 0.5f);
+    for (uint32_t i = 0; i < map.roomCount; i++) {
+        if (map.rooms[i].gridX == px && map.rooms[i].gridY == py) {
+            return tplList.items[map.rooms[i].templateIndex].disableDecals;
+        }
+    }
+    return 0;
 }
 
 /* Materials with stepsound=1 in Data/materials.ini (metal floors). */
@@ -3218,6 +3234,7 @@ static void updatePocketDimension(void) {
             if (sanity < -1000.0f) sanity = -1000.0f;
             float pz = (sinf(gTick * 0.05f) + 1.0f) * 12.0f;
             if (cameraZoom < pz) cameraZoom = pz;
+            if (blurAmount < 0.4f) blurAmount = 0.4f;
             float ddx = camPos[0] - tx, ddz = camPos[2] - tz;
             if (ddx * ddx + ddz * ddz >= 2000.0f * 2000.0f) {
                 pdState = PD_FOURWAY;
@@ -3265,6 +3282,8 @@ static void updatePocketDimension(void) {
             float d2 = dx * dx + dz * dz;
             if (d2 < 640.0f * 640.0f) {
                 blinkTimer = 100.0f * (d2 / (640.0f * 640.0f));
+                float b = 1.0f - d2 / (640.0f * 640.0f);
+                if (blurAmount < b * 0.9f) blurAmount = b * 0.9f;
                 if (d2 < 130.0f * 130.0f) {
                     leavePocketDimension(1);
                     return;
@@ -3350,14 +3369,24 @@ static void update106(void) {
     int sameLevel = feetDy < 260.0f;
 
     switch (npc106State) {
-        case N106_DORMANT:
+        case N106_DORMANT: {
             /* SCP-268 hides you; time still passes but no spawn. On the
              * aggressive difficulties (Keter/Apollyon) the spawn timer
              * counts down twice as fast (source: fps\Factor *
-             * (1 + AggressiveNPCs)). */
-            npc106Timer -= (wear268 ? 0.3f : 1.0f) * (1.0f + npcAggressive);
-            if (npc106Timer <= 0.0f) spawn106Near();
+             * (1 + AggressiveNPCs)). The room's DisableDecals slows or
+             * halts it: 0 full, 1 half, 2 quarter (floored so it never
+             * spawns while you stay put), 3 no countdown at all. */
+            float countDown = (wear268 ? 0.3f : 1.0f) * (1.0f + npcAggressive);
+            int dd = roomDisableDecalsAt(camPos);
+            if (dd < 3) {
+                if (dd == 1) countDown *= 0.5f;
+                else if (dd == 2) countDown *= 0.25f;
+                npc106Timer -= countDown;
+                if (dd == 2 && npc106Timer < 600.0f) npc106Timer = 600.0f;
+                if (npc106Timer <= 0.0f) spawn106Near();
+            }
             break;
+        }
         case N106_SPAWNING:
             npc106Frame += 2.2f; /* rise anim 111..259 */
             npc106YawDeg = atan2f(dx, dz) * 180.0f / 3.14159265f;
@@ -3415,6 +3444,10 @@ static void update106(void) {
                     float pulse = (sinf(gTick * 0.06f) + 1.0f) * 9.0f
                                 * prox;
                     if (cameraZoom < pulse) cameraZoom = pulse;
+                    /* ...and the view blurs as it fills the frame
+                     * (source BlurVolume, clamped 0.1..0.9). */
+                    float b = 0.1f + prox * 0.8f;
+                    if (blurAmount < b) blurAmount = b;
                 }
             }
 
@@ -5063,6 +5096,53 @@ static void endHud2D(void) {
     glEnable(GL_DEPTH_TEST);
 }
 
+/* Screen-space blur (source me\BlurVolume): SCP-106 in view - and the
+ * pocket dimension - smear the view. The rendered frame is copied to a
+ * texture, then drawn back four times at growing offsets so the
+ * overlapping copies soften it. Real post-process, no FBO needed. */
+static GLuint blurTex;
+static void drawScreenBlur(void) {
+    if (blurAmount <= 0.02f) return;
+    float amt = blurAmount > 0.9f ? 0.9f : blurAmount;
+    if (!blurTex) {
+        glGenTextures(1, &blurTex);
+        glBindTexture(GL_TEXTURE_2D, blurTex);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    }
+    glBindTexture(GL_TEXTURE_2D, blurTex);
+    glCopyTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, 0, 0, SCREEN_W, SCREEN_H, 0);
+
+    beginHud2D();
+    glEnable(GL_TEXTURE_2D);
+    glBindTexture(GL_TEXTURE_2D, blurTex);
+    glEnableClientState(GL_TEXTURE_COORD_ARRAY);
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    float off = 1.5f + amt * 6.0f;   /* offset in pixels grows with blur */
+    static const float dir[4][2] = { {1,0}, {-1,0}, {0,1}, {0,-1} };
+    /* The capture is bottom-up; flip V so screen top maps to V=1. */
+    GLfloat uv[8] = { 0,1, 1,1, 1,0, 0,0 };
+    for (int t = 0; t < 4; t++) {
+        float ox = dir[t][0] * off, oy = dir[t][1] * off;
+        glColor4f(1.0f, 1.0f, 1.0f, amt * 0.4f);
+        GLfloat v[8] = {
+            ox,             oy,
+            SCREEN_W + ox,  oy,
+            SCREEN_W + ox,  SCREEN_H + oy,
+            ox,             SCREEN_H + oy,
+        };
+        glVertexPointer(2, GL_FLOAT, 0, v);
+        glTexCoordPointer(2, GL_FLOAT, 0, uv);
+        glDrawArrays(GL_TRIANGLE_FAN, 0, 4);
+    }
+    glDisable(GL_BLEND);
+    glColor4f(1, 1, 1, 1);
+    endHud2D();
+}
+
 /* Design-space mapping: Menu_Core.bb lays the menu out in 1280x960. */
 #define MENU_SX (SCREEN_W / 1280.0f)
 #define MENU_SY (SCREEN_H / 960.0f)
@@ -6292,11 +6372,13 @@ int main(void) {
             }
         }
         if (haveData && !pauseOpen) {
-            /* The dread-zoom eases back each frame; 106 (and the throne)
-             * re-ramp it while they hold the player's gaze. */
+            /* The dread-zoom and screen blur ease back each frame; 106
+             * (and the throne) re-ramp them while they hold the gaze. */
             gTick++;
             cameraZoom *= 0.9f;
             if (cameraZoom < 0.05f) cameraZoom = 0.0f;
+            blurAmount *= 0.88f;
+            if (blurAmount < 0.02f) blurAmount = 0.0f;
             doorsUpdate(&doors);
             update173();
             update106();
@@ -6581,6 +6663,7 @@ int main(void) {
                 glPopMatrix();
             }
             drawPocketComposite(1);
+            drawScreenBlur();
         }
 
         char line1[320];
