@@ -31,4 +31,10 @@ int collisionSpherePush(const CollisionWorld *world, float pos[3],
 int collisionRayDown(const CollisionWorld *world, const float origin[3],
                      float maxDist, float *hitY);
 
+/* Cast a ray from origin along dir (need not be normalized) and return 1
+ * if any triangle blocks it within maxDist - i.e. the segment is
+ * occluded. Used for line-of-sight tests. */
+int collisionRayHit(const CollisionWorld *world, const float origin[3],
+                    const float dir[3], float maxDist);
+
 #endif

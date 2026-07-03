@@ -1023,6 +1023,48 @@ static int rayDownWorld(const float origin[3], float maxDist, float *hitY) {
     return hit;
 }
 
+/* True line-of-sight: 1 if the segment a->b is clear of room geometry,
+ * 0 if a wall/prop occludes it. Tested per active room in that room's
+ * local space (plus the intro cell and pocket-dimension composite). A
+ * margin stops the ray short of the target's own body. */
+static int lineOfSight(const float a[3], const float b[3]) {
+    float wdx = b[0] - a[0], wdy = b[1] - a[1], wdz = b[2] - a[2];
+    float dist = sqrtf(wdx * wdx + wdy * wdy + wdz * wdz);
+    if (dist < 60.0f) return 1;
+    float maxD = dist - 40.0f;
+    if (maxD < 1.0f) return 1;
+
+    if (introCellCol
+        && (inIntroBounds(a[0], a[2]) || inIntroBounds(b[0], b[2]))) {
+        float la[3] = { a[0] - INTRO_GX * ROOM_SPACING, a[1],
+                        a[2] - INTRO_GY * ROOM_SPACING };
+        float dir[3] = { wdx, wdy, wdz };
+        if (collisionRayHit(introCellCol, la, dir, maxD)) return 0;
+    }
+    if (pdMeshCount && inPocket) {
+        for (int m = 0; m < pdInstCount; m++) {
+            const PdMesh *pm = &pdMesh[pdInst[m].mesh];
+            if (!pm->col) continue;
+            float la[3], lb[3];
+            pdInstToLocal(&pdInst[m], a, la);
+            pdInstToLocal(&pdInst[m], b, lb);
+            float dir[3] = { lb[0] - la[0], lb[1] - la[1], lb[2] - la[2] };
+            if (collisionRayHit(pm->col, la, dir, maxD)) return 0;
+        }
+    }
+    for (int i = 0; i < activeCount; i++) {
+        const RoomPlacement *p = activeRooms[i];
+        const CollisionWorld *col = tplRT[p->templateIndex].col;
+        if (!col) continue;
+        float la[3], lb[3];
+        worldToLocal(p, a, la);
+        worldToLocal(p, b, lb);
+        float dir[3] = { lb[0] - la[0], lb[1] - la[1], lb[2] - la[2] };
+        if (collisionRayHit(col, la, dir, maxD)) return 0;
+    }
+    return 1;
+}
+
 /* ---------------- player ---------------- */
 
 static float camPos[3];
@@ -1876,7 +1918,10 @@ static int playerSees173(void) {
     if (dist < 60.0f) return 1;
     float fwdX = sinf(camYaw), fwdZ = -cosf(camYaw);
     float dot = (dx * fwdX + dz * fwdZ) / dist;
-    return dot > 0.55f; /* ~57-degree half-angle (bbox partially on screen) */
+    if (dot <= 0.55f) return 0; /* ~57-degree half-angle */
+    /* And a wall must not block the view (source EntityVisible). */
+    float head[3] = { npc173Pos[0], npc173Pos[1] + 200.0f, npc173Pos[2] };
+    return lineOfSight(camPos, head);
 }
 
 static int roomExistsAt(float x, float z);
@@ -2015,6 +2060,35 @@ static int cellIndexAt(float x, float z) {
     return -1;
 }
 
+/* A room's open edges as a 4-bit mask (bit0 +Z/N, bit1 +X/E, bit2 -Z/S,
+ * bit3 -X/W), from its shape and rotation - the same per-shape opening
+ * rules the door generator uses. Two grid-adjacent rooms are only
+ * traversable when both have an opening on their shared edge, so the
+ * pathfinder routes through real doorways instead of any adjacency. */
+static int navRot90(int m) {
+    int r = 0;
+    if (m & 1) r |= 8;   /* N -> W */
+    if (m & 2) r |= 1;   /* E -> N */
+    if (m & 4) r |= 2;   /* S -> E */
+    if (m & 8) r |= 4;   /* W -> S */
+    return r;
+}
+
+static int roomOpenMask(const RoomPlacement *p) {
+    int base;
+    switch (tplList.items[p->templateIndex].shape) {
+        case SHAPE_ROOM1:  base = 4; break;         /* S (dead end) */
+        case SHAPE_ROOM2:  base = 1 | 4; break;     /* N+S corridor */
+        case SHAPE_ROOM2C: base = 2 | 4; break;     /* E+S corner */
+        case SHAPE_ROOM3:  base = 2 | 4 | 8; break; /* E+S+W tee */
+        case SHAPE_ROOM4:  base = 15; break;        /* cross */
+        default:           return 15;               /* special: open */
+    }
+    int a = p->angle & 3;
+    for (int i = 0; i < a; i++) base = navRot90(base);
+    return base;
+}
+
 static int navNextCell(float fromX, float fromZ, float goalX, float goalZ,
                        float out[2]) {
     int start = cellIndexAt(fromX, fromZ);
@@ -2029,16 +2103,23 @@ static int navNextCell(float fromX, float fromZ, float goalX, float goalZ,
     prev[start] = -1;
     queue[qt++] = start;
     const int dx4[4] = { 1, -1, 0, 0 }, dy4[4] = { 0, 0, 1, -1 };
+    /* Bit the current room must have open toward the neighbour, and the
+     * bit the neighbour must have open back, for each direction. */
+    const int curBit[4] = { 2, 8, 1, 4 };   /* E, W, N, S */
+    const int nbrBit[4] = { 8, 2, 4, 1 };   /* W, E, S, N */
     int found = 0;
     while (qh < qt) {
         int cur = queue[qh++];
         if (cur == goal) { found = 1; break; }
         int cx = map.rooms[cur].gridX, cy = map.rooms[cur].gridY;
+        int curMask = roomOpenMask(&map.rooms[cur]);
         for (int d = 0; d < 4; d++) {
+            if (!(curMask & curBit[d])) continue;
             for (uint32_t j = 0; j < rc; j++) {
                 if (prev[j] != -2) continue;
                 if (map.rooms[j].gridX == cx + dx4[d]
-                    && map.rooms[j].gridY == cy + dy4[d]) {
+                    && map.rooms[j].gridY == cy + dy4[d]
+                    && (roomOpenMask(&map.rooms[j]) & nbrBit[d])) {
                     prev[j] = cur;
                     if (qt < 1024) queue[qt++] = j;
                 }
@@ -3919,13 +4000,15 @@ static void update096(void) {
     float dz = camPos[2] - npc096Pos[2];
     float dist = sqrtf(dx * dx + dz * dz);
 
-    /* IsLooking: 096 on screen (in the view cone), within sight range,
-     * and the player is not mid-blink. */
+    /* IsLooking: 096's face on screen (in the view cone), within sight
+     * range, with a clear line to it, and the player not mid-blink
+     * (source EntityVisible(Camera, n\OBJ2) + EntityInView). */
     int looking = 0;
     if (dist < 4200.0f && blinkFrames == 0) {
         float vx = sinf(camYaw), vz = -cosf(camYaw);
         float facing = dist > 1.0f ? (-dx * vx - dz * vz) / dist : 1.0f;
-        if (facing > 0.55f) looking = 1;
+        float head[3] = { npc096Pos[0], npc096Pos[1] + 300.0f, npc096Pos[2] };
+        if (facing > 0.55f && lineOfSight(camPos, head)) looking = 1;
     }
 
     switch (npc096State) {
@@ -4331,9 +4414,15 @@ static void update939(void) {
             npc939Frame += 0.7f;
             if (npc939Frame > 464.0f) npc939Frame = 449.0f;
             npc939YawDeg = atan2f(dx, dz) * 180.0f / 3.14159265f;
-            if (dist > 220.0f) {
-                npc939Pos[0] += dx / dist * 60.0f;
-                npc939Pos[2] += dz / dist * 60.0f;
+            float bhead[3] = { npc939Pos[0], npc939Pos[1] + 150.0f,
+                               npc939Pos[2] };
+            if (dist > 220.0f || !lineOfSight(camPos, bhead)) {
+                /* Close on the sound (blind, so it presses on even
+                 * through walls) but only bite once actually in reach. */
+                if (dist > 1.0f) {
+                    npc939Pos[0] += dx / dist * 60.0f;
+                    npc939Pos[2] += dz / dist * 60.0f;
+                }
             } else if (npc939Cool <= 0.0f) {
                 /* A bite: injures; enough of them kill (Injuries > 4). */
                 injuries += 2.0f;
@@ -4560,12 +4649,15 @@ static void update1499(void) {
         float d = sqrtf(dx * dx + dz * dz);
         int type = npc1499Type[k];
 
-        /* Rouse when the player is within this member's tolerance. The
-         * king only stirs to a direct approach and never leaves the
-         * altar; guards hold a tight line; citizens spook widest. */
+        /* Rouse when the player strays within this member's tolerance
+         * AND it can actually see them (source EntityVisible). The king
+         * only stirs to a direct approach and never leaves the altar;
+         * guards hold a tight line; citizens spook widest. */
         if (!npc1499Aggro[k]) {
             float thr = type == 0 ? 650.0f : type == 2 ? 380.0f : 480.0f;
-            if (d < thr) mask1499Rouse(k);
+            float head[3] = { npc1499Pos[k][0], npc1499Pos[k][1] + 200.0f,
+                              npc1499Pos[k][2] };
+            if (d < thr && lineOfSight(camPos, head)) mask1499Rouse(k);
         }
 
         if (npc1499Aggro[k]) {
