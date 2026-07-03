@@ -1020,6 +1020,8 @@ static int sndPick[4];
 static int sndDamage[4];
 static int sndAmbience;
 static int sndRattle[3], sndNeckSnap[3], sndStoneDrag;
+static int snd106Corr[3], snd106Wall[3], snd106Decay[4];
+static int snd106Laugh, snd106Breath;
 static int sndHorrorSpot[2], sndHorrorClose[5], sndDoor173;
 static float stepAccum;
 
@@ -1233,8 +1235,6 @@ static float npc106YawDeg;
 static float npc106Frame;
 static float npc106Timer;      /* dormant spawn countdown */
 static int npc106Cool;         /* teleport-behind cooldown */
-static int snd106Corr[3], snd106Wall[3], snd106Decay[4];
-static int snd106Laugh, snd106Breath;
 
 static void buildHumanRT(ModelRT *rt, const char *model, const char *tex) {
     buildModelRT(rt, model, 0, 0, 0, tex);
@@ -2550,6 +2550,8 @@ static void update106(void) {
                     npc106Pos[0] = wp[0];
                     npc106Pos[2] = wp[1];
                     npc106Cool = 120;
+                    audioPlay3D(snd106Wall[rand() % 3], npc106Pos, camPos,
+                                camYaw, 2500.0f);
                 }
             }
             /* Give up if the player breaks away for good. */
