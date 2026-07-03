@@ -1399,10 +1399,12 @@ static void introUpdate(void) {
         }
         if (walking != escortWalking) {
             escortWalking = walking;
-            /* Guard walk cycle 236-260, idle 77-201 (NPCs_AI). */
-            ulgrin->animStart = walking ? 236.0f : 77.0f;
-            ulgrin->animEnd = walking ? 260.0f : 201.0f;
-            ulgrin->animSpeed = walking ? 0.45f : 0.2f;
+            /* Guard walk cycle is frames 1-38 at CurrSpeed*40
+             * (NPCs_AI state 3/5/10); 4.2 raw/tick = 0.66 f/tick.
+             * Idle 77-201, sped up a touch so it reads on screen. */
+            ulgrin->animStart = walking ? 1.0f : 77.0f;
+            ulgrin->animEnd = walking ? 38.0f : 201.0f;
+            ulgrin->animSpeed = walking ? 0.66f : 0.4f;
             ulgrin->frame = ulgrin->animStart;
         }
         if (!walking && escortWp < ESCORT_WP_COUNT && pdist >= 1400.0f) {
@@ -1552,23 +1554,25 @@ static void introPlaceHumans(void) {
      * Class-D idle = 210..235 @0.1; the scientist sits at a fixed
      * frame like SetNPCFrame(182). */
     IntroHuman defs[8] = {
-        /* Positions from UpdateIntro (block corridor floor y=0). */
+        /* Positions from UpdateIntro (block corridor floor y=0). The
+         * guard idle (77-201) is authored very subtle; it plays at
+         * 2x so the breathing/shift reads on a small screen. */
         { &introGuardRT, -4205.0f, 0.0f, 870.0f, 180.0f,
-          NULL, 1, NULL, 77, 201, 0.2f, 77 },                /* Ulgrin */
+          NULL, 1, NULL, 77, 201, 0.4f, 77 },                /* Ulgrin */
         { &introGuardRT, -3985.0f, 0.0f, 786.0f, 135.0f,
-          NULL, 1, NULL, 77, 201, 0.2f, 120 },
+          NULL, 1, NULL, 77, 201, 0.4f, 120 },
         { &introGuardRT, -8064.0f, 0.0f, 1096.0f, 180.0f,
-          NULL, 1, NULL, 77, 201, 0.2f, 160 },               /* radio guy */
+          NULL, 1, NULL, 77, 201, 0.4f, 160 },               /* radio guy */
         { &introClassDRT, -3550.0f, 0.0f, 800.0f, 0.0f,
-          NULL, 1, NULL, 357, 381, 0.05f, 357 },             /* inmate */
+          NULL, 1, NULL, 357, 381, 0.12f, 357 },             /* inmate */
         { &introGuardRT, 328.0f, 480.0f, 1072.0f, 180.0f,
-          NULL, 1, NULL, 77, 201, 0.2f, 40 },                /* balcony */
+          NULL, 1, NULL, 77, 201, 0.4f, 40 },                /* balcony */
         { &introFranklinRT, -3424.0f, -100.0f, -2208.0f, 0.0f,
-          NULL, 1, "Franklin.png", 357, 381, 0.05f, 366 },
+          NULL, 1, "Franklin.png", 357, 381, 0.12f, 366 },
         { &introScientistRT, -3073.0f, -315.0f, -2165.0f, 45.0f,
           NULL, 1, "scientist.png", 182, 182, 0.0f, 182 },
         { &introGuardRT, -4000.0f, 0.0f, 950.0f, 160.0f,
-          NULL, 1, NULL, 77, 201, 0.2f, 90 },
+          NULL, 1, NULL, 77, 201, 0.4f, 90 },
     };
     for (int i = 0; i < 8; i++) {
         if (defs[i].rt == &introGuardRT) {
@@ -1636,7 +1640,7 @@ static void drawIntroHumans(const float viewPos[3]) {
         if (h->animSpeed > 0.0f && h->skin && h->buf) {
             h->frame += h->animSpeed;
             if (h->frame > h->animEnd) h->frame = h->animStart;
-            if (((introTimer + i) & 3) == 0) {
+            if (((introTimer + i) & 1) == 0) {
                 skinnedEvalInto(h->skin, h->frame, h->buf);
             }
         }
