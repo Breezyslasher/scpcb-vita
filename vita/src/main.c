@@ -806,56 +806,240 @@ static void pdInstToWorld(const PdInstance *in, const float l[3],
     w[2] = s * l[0] + c * l[2] + oz + in->off[2];
 }
 
-/* The maintenance tunnels: the source builds a 19x19 procedural grid of
- * tunnel tiles below the facility, reached by room2_mt's elevators. That
- * whole sub-map is not ported; instead a single self-contained tunnel
- * cross (mt4.rmesh) is overlaid off-grid as a real destination the cars
- * ride down to, with a return elevator. Built once, kept for the run. */
+/* The maintenance tunnels: a port of the source's procedural tunnel grid
+ * (Events_Core ~4300-4600). A random walk lays a connected corridor
+ * network; each cell then becomes a tile by its neighbour count - 1
+ * dead-end (mt1), 2 straight/bent (mt2/mt2c), 3 tee (mt3), 4 cross (mt4)
+ * - rotated so its openings face the occupied neighbours, at 512-raw
+ * (2-blitz) spacing. Two straight cells become the elevators. Overlaid
+ * off-grid like the intro cell; built once, kept for the run. */
 #define MT_GX -20
 #define MT_GY -24
-static Scene *mtScene;
-static BatchGL *mtGL;
-static CollisionWorld *mtCol;
-static int mtReturnDoor = -1;
+#define MT_GRID 15
+#define MT_CELL 512.0f
+#define MT_MESH_MAX 7
+#define MT_INST_MAX 200
+typedef struct {
+    Scene *scene;
+    BatchGL *gl;
+    CollisionWorld *col;
+} MtMesh;
+typedef struct {
+    int mesh;         /* index into mtMesh[] */
+    float wx, wz;     /* world position */
+    int yaw;          /* 0..3, times 90 deg */
+} MtInstance;
+static MtMesh mtMesh[MT_MESH_MAX];
+static int mtMeshCount;
+static MtInstance mtInst[MT_INST_MAX];
+static int mtInstCount;
+static float mtMinX, mtMaxX, mtMinZ, mtMaxZ; /* bounds for culling */
+static float mtArrive[3];      /* first-elevator landing */
+static int mtElevDoorA = -1;   /* the tunnel's return elevator */
 static float mtEntr[3];        /* facility room2_mt landing */
 static int mtEntrOK;
 
 static int inMtBounds(float x, float z) {
-    if (!mtScene) return 0;
-    float ox = MT_GX * ROOM_SPACING, oz = MT_GY * ROOM_SPACING;
-    return x > ox - 1200.0f && x < ox + 1200.0f
-        && z > oz - 1200.0f && z < oz + 1200.0f;
+    if (!mtInstCount) return 0;
+    return x > mtMinX - 700.0f && x < mtMaxX + 700.0f
+        && z > mtMinZ - 700.0f && z < mtMaxZ + 700.0f;
 }
 
-static void buildMtComposite(void) {
-    if (mtScene) return;
+static int buildMtMesh(const char *path) {
+    if (mtMeshCount >= MT_MESH_MAX) return -1;
     char err[128];
-    RMesh *mesh = rmeshLoadFile(MAP_DIR "/mt4.rmesh", err, sizeof(err));
-    if (!mesh) return;
-    mtScene = sceneBuild(mesh);
-    if (!mtScene) { rmeshFree(mesh); return; }
-    mtCol = collisionBuild(mtScene, mesh);
+    RMesh *mesh = rmeshLoadFile(path, err, sizeof(err));
+    if (!mesh) return -1;
+    Scene *sc = sceneBuild(mesh);
+    if (!sc) { rmeshFree(mesh); return -1; }
+    CollisionWorld *col = collisionBuild(sc, mesh);
     rmeshFree(mesh);
-    mtGL = (BatchGL *)calloc(mtScene->batchCount ? mtScene->batchCount : 1,
-                             sizeof(BatchGL));
-    if (!mtGL) return;
-    for (uint32_t i = 0; i < mtScene->batchCount; i++) {
-        const SceneBatch *b = &mtScene->batches[i];
-        mtGL[i].diffuse = textureGet(b->diffuseName);
-        mtGL[i].lightmap = textureGet(b->lightmapName);
-        glGenBuffers(1, &mtGL[i].vbo);
-        glBindBuffer(GL_ARRAY_BUFFER, mtGL[i].vbo);
+    BatchGL *gl = (BatchGL *)calloc(sc->batchCount ? sc->batchCount : 1,
+                                    sizeof(BatchGL));
+    if (!gl) return -1;
+    for (uint32_t i = 0; i < sc->batchCount; i++) {
+        const SceneBatch *b = &sc->batches[i];
+        gl[i].diffuse = textureGet(b->diffuseName);
+        gl[i].lightmap = textureGet(b->lightmapName);
+        glGenBuffers(1, &gl[i].vbo);
+        glBindBuffer(GL_ARRAY_BUFFER, gl[i].vbo);
         glBufferData(GL_ARRAY_BUFFER,
                      (GLsizeiptr)(b->vertexCount * sizeof(SceneVertex)),
                      b->vertices, GL_STATIC_DRAW);
-        glGenBuffers(1, &mtGL[i].ibo);
-        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, mtGL[i].ibo);
+        glGenBuffers(1, &gl[i].ibo);
+        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, gl[i].ibo);
         glBufferData(GL_ELEMENT_ARRAY_BUFFER,
                      (GLsizeiptr)(b->indexCount * sizeof(uint16_t)),
                      b->indices, GL_STATIC_DRAW);
     }
     glBindBuffer(GL_ARRAY_BUFFER, 0);
     glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
+    int idx = mtMeshCount++;
+    mtMesh[idx].scene = sc;
+    mtMesh[idx].gl = gl;
+    mtMesh[idx].col = col;
+    return idx;
+}
+
+/* MT tile mesh indices (Loading_Core MTModelID order). */
+enum { MT_M_DEADEND = 0, MT_M_CORR, MT_M_CORNER, MT_M_TEE, MT_M_CROSS,
+       MT_M_ELEV, MT_M_GEN };
+
+static void buildMtMaze(void) {
+    if (mtMeshCount) return; /* built once */
+    buildMtMesh(MAP_DIR "/mt1.rmesh");
+    buildMtMesh(MAP_DIR "/mt2.rmesh");
+    buildMtMesh(MAP_DIR "/mt2c.rmesh");
+    buildMtMesh(MAP_DIR "/mt3.rmesh");
+    buildMtMesh(MAP_DIR "/mt4.rmesh");
+    buildMtMesh(MAP_DIR "/mt2_elevator.rmesh");
+    buildMtMesh(MAP_DIR "/mt1_generator.rmesh");
+    if (mtMeshCount < 6) return;
+
+    static signed char grid[MT_GRID * MT_GRID];
+    memset(grid, 0, sizeof(grid));
+    /* Random walk from the centre (deterministic from the seed). */
+    uint32_t rng = mapSeed ^ 0x4D41494Eu;
+    int x = MT_GRID / 2, y = MT_GRID / 2, dir = (int)(rng & 3);
+    grid[x + y * MT_GRID] = 1;
+    int count = 1, target = 26 + (int)((rng >> 8) % 16u);
+    int guard = 0;
+    while (count < target && guard++ < 400) {
+        rng = rng * 1664525u + 1013904223u;
+        int run = 1 + (int)((rng >> 16) % 4u);
+        for (int s = 0; s < run; s++) {
+            int nx = x, ny = y;
+            if (dir == 0) ny--;
+            else if (dir == 1) nx++;
+            else if (dir == 2) ny++;
+            else nx--;
+            if (nx < 1 || nx >= MT_GRID - 1 || ny < 1 || ny >= MT_GRID - 1) {
+                break;
+            }
+            x = nx; y = ny;
+            if (!grid[x + y * MT_GRID]) { grid[x + y * MT_GRID] = 1; count++; }
+        }
+        rng = rng * 1664525u + 1013904223u;
+        dir += ((rng >> 16) & 1u) ? 1 : -1;
+        dir = (dir + 4) & 3;
+    }
+    /* Replace each occupied cell with its orthogonal neighbour count. */
+    static signed char cnt[MT_GRID * MT_GRID];
+    for (int j = 0; j < MT_GRID; j++) {
+        for (int i = 0; i < MT_GRID; i++) {
+            if (!grid[i + j * MT_GRID]) { cnt[i + j * MT_GRID] = 0; continue; }
+            int n = 0;
+            if (j + 1 < MT_GRID && grid[i + (j + 1) * MT_GRID]) n++;
+            if (j - 1 >= 0 && grid[i + (j - 1) * MT_GRID]) n++;
+            if (i + 1 < MT_GRID && grid[(i + 1) + j * MT_GRID]) n++;
+            if (i - 1 >= 0 && grid[(i - 1) + j * MT_GRID]) n++;
+            cnt[i + j * MT_GRID] = (signed char)n;
+        }
+    }
+    /* Two straight-corridor cells become the elevators. */
+    int firstX = -1, firstY = -1, lastX = -1, lastY = -1;
+    for (int j = 1; j < MT_GRID - 1; j++) {
+        for (int i = 1; i < MT_GRID - 1; i++) {
+            if (cnt[i + j * MT_GRID] != 2) continue;
+            int horiz = grid[(i + 1) + j * MT_GRID]
+                     && grid[(i - 1) + j * MT_GRID];
+            int vert = grid[i + (j + 1) * MT_GRID]
+                    && grid[i + (j - 1) * MT_GRID];
+            if (!horiz && !vert) continue;
+            if (firstX < 0) { firstX = i; firstY = j; }
+            else { lastX = i; lastY = j; }
+        }
+    }
+    /* Lay the tiles. */
+    float ox = MT_GX * ROOM_SPACING, oz = MT_GY * ROOM_SPACING;
+    mtInstCount = 0;
+    mtMinX = mtMinZ = 1e30f; mtMaxX = mtMaxZ = -1e30f;
+    for (int j = 0; j < MT_GRID && mtInstCount < MT_INST_MAX; j++) {
+        for (int i = 0; i < MT_GRID && mtInstCount < MT_INST_MAX; i++) {
+            int n = cnt[i + j * MT_GRID];
+            if (n <= 0) continue;
+            int up = j - 1 >= 0 && grid[i + (j - 1) * MT_GRID];
+            int down = j + 1 < MT_GRID && grid[i + (j + 1) * MT_GRID];
+            int right = i + 1 < MT_GRID && grid[(i + 1) + j * MT_GRID];
+            int left = i - 1 >= 0 && grid[(i - 1) + j * MT_GRID];
+            int mesh = MT_M_CROSS, yaw = 0;
+            int isElev = (i == firstX && j == firstY)
+                      || (i == lastX && j == lastY);
+            if (n == 1) {
+                mesh = MT_M_DEADEND;
+                yaw = right ? 1 : left ? 3 : down ? 2 : 0;
+            } else if (n == 2) {
+                int horiz = right && left, vert = up && down;
+                if (horiz || vert) {
+                    mesh = isElev ? MT_M_ELEV : MT_M_CORR;
+                    rng = rng * 1664525u + 1013904223u;
+                    int flip = (int)((rng >> 16) & 1u);
+                    yaw = horiz ? (flip * 2 + 1) : (flip * 2);
+                } else {
+                    mesh = MT_M_CORNER;
+                    yaw = (down && right) ? 0 : (down && left) ? 1
+                        : (up && right) ? 3 : 2;
+                }
+            } else if (n == 3) {
+                mesh = MT_M_TEE;
+                yaw = (down && right && left) ? 1
+                    : (up && right && left) ? 3
+                    : (right && up && down) ? 0 : 2;
+            } else {
+                mesh = MT_M_CROSS;
+                rng = rng * 1664525u + 1013904223u;
+                yaw = (int)((rng >> 16) % 4u);
+            }
+            MtInstance *in = &mtInst[mtInstCount++];
+            in->mesh = mesh;
+            in->wx = ox + (float)i * MT_CELL;
+            in->wz = oz + (float)j * MT_CELL;
+            in->yaw = yaw;
+            if (in->wx < mtMinX) mtMinX = in->wx;
+            if (in->wx > mtMaxX) mtMaxX = in->wx;
+            if (in->wz < mtMinZ) mtMinZ = in->wz;
+            if (in->wz > mtMaxZ) mtMaxZ = in->wz;
+            if (isElev) {
+                /* Land in the first elevator cell. */
+                if (i == firstX && j == firstY) {
+                    mtArrive[0] = in->wx;
+                    mtArrive[2] = in->wz;
+                    mtArrive[1] = 0.0f;
+                }
+            }
+        }
+    }
+    /* Fallback if no straight cell was found for a landing. */
+    if (mtArrive[0] == 0.0f && mtArrive[2] == 0.0f && mtInstCount) {
+        mtArrive[0] = mtInst[0].wx;
+        mtArrive[2] = mtInst[0].wz;
+    }
+}
+
+/* World<->tile-local for a 90-degree-rotated MT tile (render does
+ * glTranslate(w) then glRotatef(-yaw*90), matching the room transform). */
+static void mtToLocal(const MtInstance *in, const float w[3], float l[3]) {
+    float dx = w[0] - in->wx, dz = w[2] - in->wz;
+    switch (in->yaw & 3) {
+        case 0: l[0] = dx;  l[2] = dz;  break;
+        case 1: l[0] = dz;  l[2] = -dx; break;
+        case 2: l[0] = -dx; l[2] = -dz; break;
+        case 3: l[0] = -dz; l[2] = dx;  break;
+    }
+    l[1] = w[1];
+}
+
+static void mtToWorld(const MtInstance *in, const float l[3], float w[3]) {
+    float x = 0.0f, z = 0.0f;
+    switch (in->yaw & 3) {
+        case 0: x = l[0];  z = l[2];  break;
+        case 1: x = -l[2]; z = l[0];  break;
+        case 2: x = -l[0]; z = -l[2]; break;
+        case 3: x = l[2];  z = -l[0]; break;
+    }
+    w[0] = x + in->wx;
+    w[1] = l[1];
+    w[2] = z + in->wz;
 }
 
 static void appendPocketRoom(void) {
@@ -964,13 +1148,13 @@ static void appendGateRooms(void) {
  * record the facility room2_mt landing so those cars ride to it and
  * back. Call after the grid doors are generated. */
 static void setupMaintenanceTunnel(void) {
-    buildMtComposite();
-    mtReturnDoor = -1;
+    buildMtMaze();
+    mtElevDoorA = -1;
     mtEntrOK = 0;
-    if (mtScene) {
-        doorsAddInternal(&doors, MT_GX * ROOM_SPACING, 0.0f,
-                         MT_GY * ROOM_SPACING, 0, 1, 0, 0, 0, 0, 0);
-        mtReturnDoor = (int)doors.count - 1;
+    if (mtInstCount) {
+        doorsAddInternal(&doors, mtArrive[0], 0.0f, mtArrive[2], 0, 1, 0, 0,
+                         0, 0, 0);
+        mtElevDoorA = (int)doors.count - 1;
     }
     for (uint32_t i = 0; i < map.roomCount; i++) {
         if (strcmp(tplList.items[map.rooms[i].templateIndex].name,
@@ -1108,16 +1292,21 @@ static void pushWorld(float pos[3], float radius, int *pushedUp) {
         }
         if (up && pushedUp) *pushedUp = 1;
     }
-    if (mtCol && inMtBounds(pos[0], pos[2])) {
-        float local[3] = { pos[0] - MT_GX * ROOM_SPACING, pos[1],
-                           pos[2] - MT_GY * ROOM_SPACING };
-        int up = 0;
-        if (collisionSpherePush(mtCol, local, radius, &up)) {
-            pos[0] = local[0] + MT_GX * ROOM_SPACING;
-            pos[1] = local[1];
-            pos[2] = local[2] + MT_GY * ROOM_SPACING;
+    if (mtInstCount && inMtBounds(pos[0], pos[2])) {
+        for (int m = 0; m < mtInstCount; m++) {
+            const MtInstance *in = &mtInst[m];
+            float cdx = pos[0] - in->wx, cdz = pos[2] - in->wz;
+            if (cdx * cdx + cdz * cdz > 600.0f * 600.0f) continue;
+            const CollisionWorld *col = mtMesh[in->mesh].col;
+            if (!col) continue;
+            float local[3];
+            mtToLocal(in, pos, local);
+            int up = 0;
+            if (collisionSpherePush(col, local, radius, &up)) {
+                mtToWorld(in, local, pos);
+            }
+            if (up && pushedUp) *pushedUp = 1;
         }
-        if (up && pushedUp) *pushedUp = 1;
     }
     if (pdMeshCount && inPocket) {
         for (int m = 0; m < pdInstCount; m++) {
@@ -1158,13 +1347,20 @@ static int rayDownWorld(const float origin[3], float maxDist, float *hitY) {
             hit = 1;
         }
     }
-    if (mtCol && inMtBounds(origin[0], origin[2])) {
-        float local[3] = { origin[0] - MT_GX * ROOM_SPACING, origin[1],
-                           origin[2] - MT_GY * ROOM_SPACING };
-        float y;
-        if (collisionRayDown(mtCol, local, maxDist, &y) && y > best) {
-            best = y;
-            hit = 1;
+    if (mtInstCount && inMtBounds(origin[0], origin[2])) {
+        for (int m = 0; m < mtInstCount; m++) {
+            const MtInstance *in = &mtInst[m];
+            float cdx = origin[0] - in->wx, cdz = origin[2] - in->wz;
+            if (cdx * cdx + cdz * cdz > 600.0f * 600.0f) continue;
+            const CollisionWorld *col = mtMesh[in->mesh].col;
+            if (!col) continue;
+            float local[3], y;
+            mtToLocal(in, origin, local);
+            if (collisionRayDown(col, local, maxDist, &y)) {
+                float wl[3] = { local[0], y, local[2] }, wout[3];
+                mtToWorld(in, wl, wout);
+                if (wout[1] > best) { best = wout[1]; hit = 1; }
+            }
         }
     }
     if (pdMeshCount && inPocket) {
@@ -5093,10 +5289,10 @@ static void elevatorStart(const Door *d) {
         elevDest[0] = gateBEntr[0];
         elevDest[2] = gateBEntr[2];
         elevDoorB = di;
-    } else if (strcmp(here, "room2_mt") == 0 && mtScene) {
-        elevDest[0] = MT_GX * ROOM_SPACING;
-        elevDest[2] = MT_GY * ROOM_SPACING;
-        elevDoorB = mtReturnDoor;
+    } else if (strcmp(here, "room2_mt") == 0 && mtInstCount) {
+        elevDest[0] = mtArrive[0];
+        elevDest[2] = mtArrive[2];
+        elevDoorB = mtElevDoorA;
     } else if (inMtBounds(camPos[0], camPos[2]) && mtEntrOK) {
         elevDest[0] = mtEntr[0];
         elevDest[2] = mtEntr[2];
@@ -5370,6 +5566,22 @@ static void drawPocketComposite(int alphaPass) {
         glTranslatef(ox + in->off[0], in->off[1], oz + in->off[2]);
         glRotatef(-in->yawDeg, 0.0f, 1.0f, 0.0f);
         drawBatchSet(pm->scene, pm->gl, alphaPass);
+        glPopMatrix();
+    }
+}
+
+static void drawMtMaze(int alphaPass) {
+    if (!mtInstCount || !inMtBounds(camPos[0], camPos[2])) return;
+    for (int m = 0; m < mtInstCount; m++) {
+        const MtInstance *in = &mtInst[m];
+        float dx = in->wx - camPos[0], dz = in->wz - camPos[2];
+        if (dx * dx + dz * dz > VIEW_RANGE * VIEW_RANGE) continue;
+        const MtMesh *mm = &mtMesh[in->mesh];
+        if (!mm->scene) continue;
+        glPushMatrix();
+        glTranslatef(in->wx, 0.0f, in->wz);
+        glRotatef(-(float)(in->yaw * 90), 0.0f, 1.0f, 0.0f);
+        drawBatchSet(mm->scene, mm->gl, alphaPass);
         glPopMatrix();
     }
 }
@@ -8683,13 +8895,7 @@ int main(void) {
                 drawBatchSet(introCellScene, introCellGL, 0);
                 glPopMatrix();
             }
-            if (mtGL && inMtBounds(camPos[0], camPos[2])) {
-                glPushMatrix();
-                glTranslatef(MT_GX * ROOM_SPACING, 0.0f,
-                             MT_GY * ROOM_SPACING);
-                drawBatchSet(mtScene, mtGL, 0);
-                glPopMatrix();
-            }
+            drawMtMaze(0);
             drawPocketComposite(0);
             decalsDraw();
             drawDoors(camPos);
@@ -8719,13 +8925,7 @@ int main(void) {
                 drawBatchSet(introCellScene, introCellGL, 1);
                 glPopMatrix();
             }
-            if (mtGL && inMtBounds(camPos[0], camPos[2])) {
-                glPushMatrix();
-                glTranslatef(MT_GX * ROOM_SPACING, 0.0f,
-                             MT_GY * ROOM_SPACING);
-                drawBatchSet(mtScene, mtGL, 1);
-                glPopMatrix();
-            }
+            drawMtMaze(1);
             drawPocketComposite(1);
             drawScreenBlur();
         }
