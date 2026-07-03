@@ -1372,7 +1372,7 @@ static GLuint *skinIBOsFor(SkinnedMesh *skin) {
     return NULL;
 }
 
-static IntroHuman INTRO_HUMANS[12];
+static IntroHuman INTRO_HUMANS[14];
 static int introHumanCount;
 static int introDIdx[2] = { -1, -1 }; /* the chamber-front Class-Ds */
 
@@ -1807,15 +1807,13 @@ static void introPlaceHumans(void) {
      * observation room, the two Class-Ds posted in front of SCP-173's
      * chamber (they get sent in ahead of the player), and the south
      * balcony group. Standing yaws face as the original does. */
-    IntroHuman defs[11] = {
+    IntroHuman defs[13] = {
         { &introGuardRT, -4130.0f, 0.0f, 830.0f, 0.0f,
           NULL, 1, NULL, 77, 201, 0.4f, 77 },                /* Ulgrin */
         { &introGuardRT, -3985.0f, 0.0f, 786.0f, 315.0f,
           NULL, 1, NULL, 77, 201, 0.4f, 120 },
         { &introGuardRT, -8064.0f, 0.0f, 1096.0f, 0.0f,
           NULL, 1, NULL, 77, 201, 0.4f, 160 },               /* radio guy */
-        { &introClassDRT, -3550.0f, 0.0f, 800.0f, 180.0f,
-          NULL, 1, NULL, 357, 381, 0.12f, 357 },             /* inmate */
         { &introGuardRT, 328.0f, 480.0f, 1072.0f, 0.0f,
           NULL, 1, NULL, 77, 201, 0.4f, 40 },                /* balcony */
         { &introFranklinRT, -3424.0f, -100.0f, -2208.0f, 180.0f,
@@ -1830,8 +1828,14 @@ static void introPlaceHumans(void) {
           NULL, 1, NULL, 77, 201, 0.4f, 90 },      /* south balcony */
         { &introGuardRT, -4200.0f, 250.0f, -4088.0f, 0.0f,
           NULL, 1, NULL, 77, 201, 0.4f, 150 },
+        { &introClassDRT, -4000.0f, 250.0f, -4088.0f, 0.0f,
+          NULL, 1, "D_9341.png", 357, 381, 0.12f, 364 },
+        { &introGuardRT, -7208.0f, -600.0f, -3104.0f, 0.0f,
+          NULL, 1, NULL, 77, 201, 0.4f, 60 },      /* lower level */
+        { &introClassDRT, -5675.0f, -1020.0f, -3717.0f, 0.0f,
+          NULL, 1, NULL, 357, 381, 0.12f, 368 },
     };
-    for (int i = 0; i < 11; i++) {
+    for (int i = 0; i < 13; i++) {
         if (defs[i].rt == &introGuardRT) {
             defs[i].skin = skinGuard;
             defs[i].skinScale = skinGuardScale;
@@ -1842,18 +1846,18 @@ static void introPlaceHumans(void) {
     }
     /* Per-slot VBOs, created once and reused (the roster is fixed, so
      * slot i always maps to the same model). */
-    static GLuint slotVbo[12];
+    static GLuint slotVbo[14];
     introHumanCount = 0;
     introDIdx[0] = introDIdx[1] = -1;
-    for (int i = 0; i < 11; i++) {
+    for (int i = 0; i < 13; i++) {
         if (!defs[i].skin && !defs[i].rt->ok) continue;
         if (defs[i].skin) {
             if (!slotVbo[i]) glGenBuffers(1, &slotVbo[i]);
             defs[i].vbo = slotVbo[i];
             defs[i].posed = 0;
         }
-        if (i == 7) introDIdx[0] = introHumanCount;
-        if (i == 8) introDIdx[1] = introHumanCount;
+        if (i == 6) introDIdx[0] = introHumanCount;
+        if (i == 7) introDIdx[1] = introHumanCount;
         INTRO_HUMANS[introHumanCount++] = defs[i];
     }
 }
