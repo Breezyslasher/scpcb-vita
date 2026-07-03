@@ -477,6 +477,9 @@ typedef struct {
     float currAngle;    /* animated sweep offset */
     int dir;            /* sweep direction */
     float headYaw, headPitch; /* animated head orientation (world) */
+    int screen;         /* feeds a monitor */
+    float mx, my, mz;   /* monitor world position */
+    float myaw, mpitch; /* monitor facing (world) */
 } WorldCamera;
 
 #define MAX_CAMERAS 48
@@ -511,6 +514,17 @@ static void spawnRoomCameras(void) {
             c->dir = 0;
             c->headYaw = c->yawBase;
             c->headPitch = cd->pitch;
+            c->screen = cd->screen;
+            if (cd->screen) {
+                float ml[3] = { cd->mx, cd->my, cd->mz }, mw[3];
+                localToWorld(p, ml, mw);
+                c->mx = mw[0]; c->my = mw[1]; c->mz = mw[2];
+                c->myaw = roomYaw + cd->myaw;
+                c->mpitch = cd->mpitch;
+            } else {
+                c->mx = c->my = c->mz = 0.0f;
+                c->myaw = c->mpitch = 0.0f;
+            }
         }
     }
 }
@@ -2053,6 +2067,15 @@ static ModelRT leverBaseRT, leverHandleRT;
  * sweeps or tracks the player, its red light blinking. */
 static ModelRT camBaseRT, camHeadRT;
 static GLuint camHeadRedTex;
+/* Live monitor feed: the nearest Screen camera renders the scene to a
+ * texture (glCopyTexImage2D from a viewport corner, no FBO - matching the
+ * blur post-process) that its monitor displays. */
+static ModelRT monitorRT;
+#define MON_FEED_SIZE 256
+static GLuint monFeedTex;
+static int monFeedCam = -1;   /* worldCameras index the feed shows */
+static float monFeedTick;
+static int monFeedActive;     /* a feed was captured this frame */
 /* SCP-106 rots the doors it passes (UpdateNPCType106 swaps the panel /
  * frame texture): Door01_Corrosive for sliding doors, containment for
  * heavy. Loaded with the door assets. */
@@ -2215,6 +2238,9 @@ static void buildDoorAssets(void) {
     buildModelRT(&camHeadRT, "CamHead.b3d", 0, 0, 0, "camera(1).png");
     camHeadRT.scale[0] = camHeadRT.scale[1] = camHeadRT.scale[2] = 2.56f;
     camHeadRedTex = textureGet("camera(2).png");
+    /* Monitor prop for the camera feed (source Scale = RoomScale*1.8). */
+    buildModelRT(&monitorRT, "monitor2.b3d", 0, 0, 0, NULL);
+    monitorRT.scale[0] = monitorRT.scale[1] = monitorRT.scale[2] = 1.8f;
     /* SCP-079's computer (ScaleEntity 1.3 world -> *256 raw) and its
      * seven screen-overlay frames. */
     buildModelRT(&scp079RT, "scp_079.b3d", 0, 0, 0, NULL);
@@ -7521,6 +7547,127 @@ static void cameraCheckUpdate(void) {
     }
 }
 
+/* Render the nearest Screen camera's view into monFeedTex. Draws the
+ * scene into a MON_FEED_SIZE corner of the backbuffer (pointed from the
+ * camera toward the player, a security-cam-watching-the-occupant view),
+ * then copies it out with glCopyTexImage2D - the same no-FBO trick as the
+ * blur. Refreshed every few frames (source RenderInterval). Call before
+ * the main scene clear. */
+static void renderCameraFeed(void) {
+    monFeedActive = 0;
+    if (!worldReady || activeCount == 0 || !monitorRT.ok) {
+        monFeedCam = -1;
+        return;
+    }
+    int best = -1;
+    float bestD2 = 2600.0f * 2600.0f;
+    for (int i = 0; i < worldCameraCount; i++) {
+        if (!worldCameras[i].screen) continue;
+        float dx = worldCameras[i].mx - camPos[0];
+        float dz = worldCameras[i].mz - camPos[2];
+        float d2 = dx * dx + dz * dz;
+        if (d2 < bestD2) { bestD2 = d2; best = i; }
+    }
+    monFeedCam = best;
+    if (best < 0) return;
+    monFeedTick += 1.0f;
+    if (monFeedTex && monFeedTick < 6.0f) { monFeedActive = 1; return; }
+    monFeedTick = 0.0f;
+
+    const WorldCamera *c = &worldCameras[best];
+    float eyeY = c->y - 21.0f;
+    float dx = camPos[0] - c->x, dz = camPos[2] - c->z, dy = camPos[1] - eyeY;
+    float horiz = sqrtf(dx * dx + dz * dz);
+    if (horiz < 1.0f) horiz = 1.0f;
+    float yaw = atan2f(dx, -dz) * (180.0f / 3.14159265f);
+    float pitch = atan2f(-dy, horiz) * (180.0f / 3.14159265f);
+
+    glViewport(0, 0, MON_FEED_SIZE, MON_FEED_SIZE);
+    glEnable(GL_SCISSOR_TEST);
+    glScissor(0, 0, MON_FEED_SIZE, MON_FEED_SIZE);
+    glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+    float zn = 4.0f, zf = VIEW_RANGE * 3.0f;
+    float t = zn * tanf(35.0f * 3.14159265f / 180.0f);
+    glMatrixMode(GL_PROJECTION);
+    glLoadIdentity();
+    glFrustum(-t, t, -t, t, zn, zf);
+    glMatrixMode(GL_MODELVIEW);
+    glLoadIdentity();
+    glRotatef(pitch, 1, 0, 0);
+    glRotatef(yaw, 0, 1, 0);
+    glTranslatef(-c->x, -eyeY, -c->z);
+    glEnable(GL_DEPTH_TEST);
+    glEnable(GL_CULL_FACE);
+    glCullFace(GL_BACK);
+    glFrontFace(GL_CW);
+    glColor4f(1, 1, 1, 1);
+    for (int i = 0; i < activeCount; i++) drawRoomBatches(activeRooms[i], 0);
+
+    if (!monFeedTex) {
+        glGenTextures(1, &monFeedTex);
+        glBindTexture(GL_TEXTURE_2D, monFeedTex);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    }
+    glBindTexture(GL_TEXTURE_2D, monFeedTex);
+    glCopyTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, 0, 0, MON_FEED_SIZE,
+                     MON_FEED_SIZE, 0);
+    glDisable(GL_SCISSOR_TEST);
+    glViewport(0, 0, SCREEN_W, SCREEN_H);
+    monFeedActive = 1;
+}
+
+/* Draw the monitor props; the active one shows the live feed, the rest a
+ * dark screen. */
+static void drawMonitors(const float viewPos[3]) {
+    for (int i = 0; i < worldCameraCount; i++) {
+        const WorldCamera *c = &worldCameras[i];
+        if (!c->screen) continue;
+        float dx = c->mx - viewPos[0], dz = c->mz - viewPos[2];
+        if (dx * dx + dz * dz > VIEW_RANGE * VIEW_RANGE) continue;
+
+        glPushMatrix();
+        glTranslatef(c->mx, c->my, c->mz);
+        glRotatef(-c->myaw, 0.0f, 1.0f, 0.0f);
+        glRotatef(c->mpitch, 1.0f, 0.0f, 0.0f);
+        drawModelRT(&monitorRT);
+        glPopMatrix();
+
+        int lit = (i == monFeedCam && monFeedActive && monFeedTex);
+        glPushMatrix();
+        glTranslatef(c->mx, c->my, c->mz);
+        glRotatef(-c->myaw, 0.0f, 1.0f, 0.0f);
+        glTranslatef(0.0f, 0.0f, 34.0f); /* onto the screen face */
+        glBindBuffer(GL_ARRAY_BUFFER, 0);
+        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
+        glDisableClientState(GL_COLOR_ARRAY);
+        GLfloat sv[18] = {
+            -62.0f,  46.0f, 0.0f,  62.0f,  46.0f, 0.0f,  62.0f, -46.0f, 0.0f,
+            -62.0f,  46.0f, 0.0f,  62.0f, -46.0f, 0.0f, -62.0f, -46.0f, 0.0f,
+        };
+        if (lit) {
+            /* The capture is bottom-up; flip V. */
+            static const GLfloat uv[12] = { 0,1, 1,1, 1,0, 0,1, 1,0, 0,0 };
+            glEnable(GL_TEXTURE_2D);
+            glBindTexture(GL_TEXTURE_2D, monFeedTex);
+            glEnableClientState(GL_TEXTURE_COORD_ARRAY);
+            glTexCoordPointer(2, GL_FLOAT, 0, uv);
+            glColor4f(1.0f, 1.0f, 1.0f, 1.0f);
+        } else {
+            glDisable(GL_TEXTURE_2D);
+            glColor4f(0.02f, 0.03f, 0.05f, 1.0f);
+        }
+        glVertexPointer(3, GL_FLOAT, 0, sv);
+        glDrawArrays(GL_TRIANGLES, 0, 6);
+        glColor4f(1, 1, 1, 1);
+        glEnableClientState(GL_COLOR_ARRAY);
+        glPopMatrix();
+    }
+}
+
 /* ---- SCP-079 (cont1_079): the sentient computer ---- */
 
 static void spawn079(void) {
@@ -9705,6 +9852,10 @@ int main(void) {
             if (blinkFrames == 0) blinkTimer = 100.0f;
         }
 
+        /* Capture the nearest monitor's live feed before clearing the
+         * frame (it renders into a scissored corner, then copies out). */
+        renderCameraFeed();
+
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
 
         if (haveData && activeCount > 0) {
@@ -9738,6 +9889,7 @@ int main(void) {
             drawDoors(camPos);
             drawFixtures(camPos);
             camerasDraw(camPos);
+            drawMonitors(camPos);
             draw079(camPos);
             draw895(camPos);
             draw372(camPos);

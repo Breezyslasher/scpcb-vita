@@ -64,6 +64,20 @@ for li, line in enumerate(lines):
     pitch = ev(a[3]) if len(a) > 3 else 0.0
     if None in (x, y, z, pitch):
         continue
+    # Screen=True cameras carry a monitor: CreateSecurityCam(room, x1, y1,
+    # z1, Pitch1, Screen, x2, y2, z2, Pitch2, Yaw2, Roll2). Capture the
+    # monitor's transform so the port can render the feed screen.
+    screen = 1 if (len(a) > 4 and a[4] == "True") else 0
+    mx = my = mz = mpitch = myaw = mroll = 0.0
+    if screen and len(a) >= 8:
+        mx = ev(a[5]) or 0.0
+        my = ev(a[6]) or 0.0
+        mz = ev(a[7]) or 0.0
+        mpitch = ev(a[8]) if len(a) > 8 else 0.0
+        myaw = ev(a[9]) if len(a) > 9 else 0.0
+        mroll = ev(a[10]) if len(a) > 10 else 0.0
+        if None in (mpitch, myaw, mroll):
+            mpitch = myaw = mroll = 0.0
     # Follow-up attributes on this and the next few lines.
     angle, turn, follow = 0.0, 0.0, 0
     for follow_line in lines[li:li + 5]:
@@ -80,7 +94,8 @@ for li, line in enumerate(lines):
         if follow_re.search(follow_line):
             follow = 1
     for room in rooms:
-        cams.append((room, x, y, z, pitch, angle % 360.0, turn, follow))
+        cams.append((room, x, y, z, pitch, angle % 360.0, turn, follow,
+                     screen, mx, my, mz, mpitch, myaw % 360.0, mroll))
 
 
 def cf(v):
@@ -95,8 +110,8 @@ with open(OUT, "w") as f:
             " * FillRoom's security cameras (room-local raw units; Blitz\n"
             " * degrees). pitch = head tilt, angle = head yaw base (added\n"
             " * to the room angle), turn = sweep amplitude (0 = static),\n"
-            " * follow = track the player. The live monitor feed is not\n"
-            " * ported. */\n"
+            " * follow = track the player. screen = 1 if it feeds a monitor\n"
+            " * at (mx,my,mz) with orientation (mpitch,myaw,mroll). */\n"
             "#ifndef VITA_GAME_ROOM_CAMERAS_H\n"
             "#define VITA_GAME_ROOM_CAMERAS_H\n\n"
             "typedef struct {\n"
@@ -104,12 +119,19 @@ with open(OUT, "w") as f:
             "    float x, y, z;\n"
             "    float pitch, angle, turn;\n"
             "    unsigned char follow;\n"
+            "    unsigned char screen;\n"
+            "    float mx, my, mz;\n"
+            "    float mpitch, myaw, mroll;\n"
             "} RoomCameraDef;\n\n"
             "static const RoomCameraDef ROOM_CAMERAS[] = {\n")
-    for room, x, y, z, p, ang, turn, follow in cams:
-        f.write('    { "%s", %s, %s, %s, %s, %s, %s, %d },\n'
+    for (room, x, y, z, p, ang, turn, follow, screen, mx, my, mz,
+         mp, myw, mrl) in cams:
+        f.write('    { "%s", %s, %s, %s, %s, %s, %s, %d, %d, '
+                '%s, %s, %s, %s, %s, %s },\n'
                 % (room, cf(x), cf(y), cf(z), cf(p), cf(ang), cf(turn),
-                   follow))
+                   follow, screen, cf(mx), cf(my), cf(mz), cf(mp), cf(myw),
+                   cf(mrl)))
     f.write("};\n\n#endif\n")
 
-print("cameras:", len(cams))
+nscreen = sum(1 for c in cams if c[8])
+print("cameras:", len(cams), "with screen:", nscreen)
