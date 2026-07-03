@@ -55,6 +55,7 @@ unsigned int _newlib_heap_size_user = 220 * 1024 * 1024;
 #define INV_ICONS_DIR DATA_ROOT "/GFX/Items/Inventory Icons"
 #define NPCS_DIR DATA_ROOT "/GFX/NPCs"
 #define DECALS_DIR DATA_ROOT "/GFX/Decals"
+#define OVERLAYS_DIR DATA_ROOT "/GFX/Overlays"
 #define MENU_DIR DATA_ROOT "/GFX/Menu"
 #define ROOMS_INI DATA_ROOT "/Data/rooms.ini"
 
@@ -93,11 +94,11 @@ static GLuint textureGet(const char *name) {
     }
 
     GLuint handle = 0;
-    const char *dirs[9] = { MAP_DIR, MAP_TEXTURES_DIR, PROPS_DIR, ITEMS_DIR,
-                            ITEMS_HUD_DIR, HUD_DIR, INV_ICONS_DIR, NPCS_DIR,
-                            DECALS_DIR };
+    const char *dirs[10] = { MAP_DIR, MAP_TEXTURES_DIR, PROPS_DIR, ITEMS_DIR,
+                             ITEMS_HUD_DIR, HUD_DIR, INV_ICONS_DIR, NPCS_DIR,
+                             DECALS_DIR, OVERLAYS_DIR };
     char path[1024];
-    if (textureResolve(name, dirs, 9, path, sizeof(path))) {
+    if (textureResolve(name, dirs, 10, path, sizeof(path))) {
         char err[128];
         TextureImage *img = textureLoadFile(path, TEXTURE_CAP, err, sizeof(err));
         if (img) {
@@ -614,6 +615,23 @@ static float pdReturn[4];     /* pre-catch pos + yaw to restore */
 static int sndPdEnter = -1, sndPdExit = -1, sndPdRumble = -1,
            sndPdExplode = -1;
 
+/* Tesla gates (Events_Core e_tesla): the room2_tesla_* corridors have
+ * an electrified gate at their centre that idles, charges, zaps and
+ * recharges. Caught in the zap it kills the player ("tesla" death) and
+ * repels SCP-106 (its long-missing State 4 retreat). */
+#define MAX_TESLA 8
+typedef struct {
+    float x, z;        /* gate centre (room centre), raw world */
+    int state;         /* 0 idle 1 charge 2 zap 3 recharge */
+    float timer;       /* EventState2 analogue (frames) */
+} TeslaGate;
+static TeslaGate teslaGates[MAX_TESLA];
+static int teslaCount;
+static int sndTeslaIdle = -1, sndTeslaWind = -1, sndTeslaShock = -1,
+           sndTeslaPower = -1;
+static GLuint teslaArcTex;
+static float teslaFlash;       /* white screen flash when it zaps nearby */
+
 static int inPdBounds(float x, float z) {
     if (pdRoomIdx < 0) return 0;
     float ox = PD_GX * ROOM_SPACING, oz = PD_GY * ROOM_SPACING;
@@ -1043,6 +1061,7 @@ static void updateRoomEvents(void);
 static void reset106(void);
 static void enterPocketDimension(void);
 static void updatePocketDimension(void);
+static void teslaSpawn(void);
 
 static void regenerateMap(uint32_t seed) {
     memset(roomVisited, 0, sizeof(roomVisited));
@@ -1078,6 +1097,7 @@ static void regenerateMap(uint32_t seed) {
         spawnRoomDoors();
         spawnRoomFixtures();
         spawnRoomEvents();
+        teslaSpawn();
         eventRng = mapSeed ^ 0xA5A5F00Du;
         spawnItems();
         reset173();
@@ -1342,6 +1362,10 @@ static void loadSounds(void) {
     sndPdExit = audioLoad(SFX_DIR "/Room/PocketDimension/Exit.ogg");
     sndPdRumble = audioLoad(SFX_DIR "/Room/PocketDimension/Rumble.ogg");
     sndPdExplode = audioLoad(SFX_DIR "/Room/PocketDimension/Explosion.ogg");
+    sndTeslaIdle = audioLoad(SFX_DIR "/Room/Tesla/Idle.ogg");
+    sndTeslaWind = audioLoad(SFX_DIR "/Room/Tesla/WindUp.ogg");
+    sndTeslaShock = audioLoad(SFX_DIR "/Room/Tesla/Shock.ogg");
+    sndTeslaPower = audioLoad(SFX_DIR "/Room/Tesla/PowerUp.ogg");
     /* UpdateNPCType173: HorrorSFX[3..4] on spotting it, HorrorSFX
      * [1,2,9,10,12] on a very close encounter. */
     sndHorrorSpot[0] = audioLoad(SFX_DIR "/Horror/Horror3.ogg");
@@ -1476,6 +1500,7 @@ static void buildDoorAssets(void) {
     pdPillarRT.scale[0] = pdPillarRT.scale[1] = pdPillarRT.scale[2] = 256.0f;
     doorCorrTex = textureGet("Door01_Corrosive.png");
     doorCorrHeavyTex = textureGet("containment_doors_Corrosive.png");
+    teslaArcTex = textureGet("tesla_overlay.png");
 }
 
 static void drawModelRT(const ModelRT *rt);
@@ -3555,6 +3580,94 @@ static void update106(void) {
     }
 }
 
+/* ---- Tesla gates ---- */
+
+static void teslaSpawn(void) {
+    teslaCount = 0;
+    teslaFlash = 0.0f;
+    for (uint32_t r = 0; r < map.roomCount && teslaCount < MAX_TESLA; r++) {
+        const char *nm = tplList.items[map.rooms[r].templateIndex].name;
+        if (strncmp(nm, "room2_tesla", 11) == 0) {
+            TeslaGate *g = &teslaGates[teslaCount++];
+            g->x = map.rooms[r].gridX * ROOM_SPACING;
+            g->z = map.rooms[r].gridY * ROOM_SPACING;
+            g->state = 0;
+            g->timer = 0.0f;
+        }
+    }
+}
+
+/* The gate cycle (Events_Core e_tesla EventState 0..3): idle until the
+ * player steps into the plane, wind up (~35 frames), zap (fatal in the
+ * inner box, repels 106), then recharge (~70 frames). Kill/activation
+ * boxes are the source's |dx|,|dz| < 1.0 / 0.75 blitz units (x256). */
+static void teslaUpdate(void) {
+    if (deathTimer > 0) return;
+    if (teslaFlash > 0.0f) teslaFlash -= 0.04f;
+    for (int i = 0; i < teslaCount; i++) {
+        TeslaGate *g = &teslaGates[i];
+        float gp[3] = { g->x, EYE_HEIGHT, g->z };
+        float pdx = fabsf(camPos[0] - g->x);
+        float pdz = fabsf(camPos[2] - g->z);
+        float pdy = fabsf(camPos[1] - EYE_HEIGHT);
+        int nearGate = pdx < 2400.0f && pdz < 2400.0f;
+        switch (g->state) {
+            case 0: /* idle: arm when the player enters the plane */
+                if (pdx < 256.0f && pdz < 256.0f && pdy < 333.0f) {
+                    g->state = 1;
+                    g->timer = 0.0f;
+                    if (nearGate) {
+                        audioPlay3D(sndTeslaWind, gp, camPos, camYaw, 4000.0f);
+                    }
+                }
+                break;
+            case 1: /* charge */
+                g->timer += 1.0f;
+                if (g->timer >= 35.0f) {
+                    g->state = 2;
+                    if (nearGate) {
+                        audioPlay3D(sndTeslaShock, gp, camPos, camYaw,
+                                    4000.0f);
+                    }
+                }
+                break;
+            case 2: /* zap */
+                if (pdx < 192.0f && pdz < 192.0f && pdy < 333.0f) {
+                    teslaFlash = 0.85f;
+                    camShake = 1.5f;
+                    snprintf(deathCause, sizeof(deathCause), "A TESLA GATE");
+                    deathTimer = 180;
+                    return;
+                }
+                if (nearGate && teslaFlash < 0.35f) teslaFlash = 0.35f;
+                /* Repel SCP-106 (its State 4 retreat): sent dormant. */
+                if (npc106Active && npc106State != N106_DORMANT
+                    && fabsf(npc106Pos[0] - g->x) < 220.0f
+                    && fabsf(npc106Pos[2] - g->z) < 220.0f) {
+                    audioPlay(sndTeslaShock, 0.8f, 0.0f);
+                    reset106();
+                    snprintf(toastMsg, sizeof(toastMsg),
+                             "SCP-106 WAS REPELLED BY THE TESLA GATE");
+                    toastTimer = 220;
+                }
+                g->timer -= 1.5f;
+                if (g->timer <= 0.0f) {
+                    g->state = 3;
+                    g->timer = -70.0f;
+                    if (nearGate) {
+                        audioPlay3D(sndTeslaPower, gp, camPos, camYaw,
+                                    4000.0f);
+                    }
+                }
+                break;
+            case 3: /* recharge */
+                g->timer += 1.0f;
+                if (g->timer >= 0.0f) g->state = 0;
+                break;
+        }
+    }
+}
+
 static void draw173(const float viewPos[3]) {
     if (!npc173Active || !npc173RT.ok) return;
     float dx = npc173Pos[0] - viewPos[0], dz = npc173Pos[2] - viewPos[2];
@@ -3607,6 +3720,53 @@ static void drawBillboard(const float pos[3], float w, float h, GLuint tex,
     glDisable(GL_BLEND);
     glColor4f(1, 1, 1, 1);
     glEnableClientState(GL_COLOR_ARRAY);
+}
+
+/* The arc of a Tesla gate, drawn additively across the gate while it
+ * zaps (charge flickers faintly too). Approximates the game's overlay
+ * sprite + red light. */
+static void drawTeslaArcs(const float viewPos[3]) {
+    if (!teslaArcTex) return;
+    for (int i = 0; i < teslaCount; i++) {
+        const TeslaGate *g = &teslaGates[i];
+        if (g->state != 1 && g->state != 2) continue;
+        float dx = g->x - viewPos[0], dz = g->z - viewPos[2];
+        if (dx * dx + dz * dz > VIEW_RANGE * VIEW_RANGE) continue;
+        float a = g->state == 2
+                ? 0.6f + 0.4f * sinf(gTick * 1.7f)
+                : 0.15f * (0.5f + 0.5f * sinf(gTick * 3.0f));
+        if (a < 0.02f) continue;
+        /* Additive so the arc glows; a tall quad across the corridor. */
+        float rx = cosf(camYaw), rz = sinf(camYaw);
+        float hw = 360.0f;
+        float base = 40.0f, h = 620.0f;
+        GLfloat verts[18] = {
+            g->x - rx * hw, base,     g->z - rz * hw,
+            g->x + rx * hw, base,     g->z + rz * hw,
+            g->x + rx * hw, base + h, g->z + rz * hw,
+            g->x - rx * hw, base,     g->z - rz * hw,
+            g->x + rx * hw, base + h, g->z + rz * hw,
+            g->x - rx * hw, base + h, g->z - rz * hw,
+        };
+        GLfloat uvs[12] = { 0, 1, 1, 1, 1, 0, 0, 1, 1, 0, 0, 0 };
+        glBindBuffer(GL_ARRAY_BUFFER, 0);
+        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
+        glDisableClientState(GL_COLOR_ARRAY);
+        glColor4f(0.7f, 0.85f, 1.0f, a);
+        glEnable(GL_TEXTURE_2D);
+        glBindTexture(GL_TEXTURE_2D, teslaArcTex);
+        glEnable(GL_BLEND);
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE);
+        glDisable(GL_CULL_FACE);
+        glDepthMask(GL_FALSE);
+        glVertexPointer(3, GL_FLOAT, 0, verts);
+        glTexCoordPointer(2, GL_FLOAT, 0, uvs);
+        glDrawArrays(GL_TRIANGLES, 0, 6);
+        glDepthMask(GL_TRUE);
+        glDisable(GL_BLEND);
+        glColor4f(1, 1, 1, 1);
+        glEnableClientState(GL_COLOR_ARRAY);
+    }
 }
 
 /* The pocket dimension's throne of eyes, billboarded. */
@@ -6390,6 +6550,7 @@ int main(void) {
             }
             updatePocketDimension();
             updatePlayerCondition();
+            teslaUpdate();
             decalsUpdate();
             if (femurTimer > 0.0f) {
                 femurTimer += 1.0f;
@@ -6648,6 +6809,7 @@ int main(void) {
             drawItems(camPos);
             draw173(camPos);
             draw106(camPos);
+            drawTeslaArcs(camPos);
             drawPocketPillars();
             drawPocketThrone();
             drawIntroHumans(camPos);
@@ -6707,6 +6869,11 @@ int main(void) {
             if (hurt > 0.01f) {
                 drawQuad(0, 0, SCREEN_W, SCREEN_H, 0, 0.6f, 0.0f, 0.0f,
                          hurt > 0.85f ? 0.85f : hurt);
+            }
+            /* A Tesla gate discharging nearby whites out the screen. */
+            if (teslaFlash > 0.01f) {
+                drawQuad(0, 0, SCREEN_W, SCREEN_H, 0, 0.8f, 0.9f, 1.0f,
+                         teslaFlash > 0.85f ? 0.85f : teslaFlash);
             }
             /* Low sanity darkens the edges with a cold, unstable tint. */
             if (sanity < 50.0f) {
