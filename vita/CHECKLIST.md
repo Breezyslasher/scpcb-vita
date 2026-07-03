@@ -27,7 +27,7 @@ Updated as features land. States: **done** / **partial** / **missing**.
 | --- | --- | --- |
 | Movement, sprint, crouch, stamina, blink | done | Source metrics |
 | Lean | missing | D-pad left/right taken by inventory/menus |
-| Health | partial | Fall damage + guard gunfire only; no bleeding, infections, injuries-per-source (008, 049, 106 etc.) |
+| Health (injuries/bloodloss/sanity) | done | Damage adds injuries that bleed into bloodloss (fatal at 100, warning vignette + HUD bar); first aid clots it; sanity drains in the dark / pocket dimension / near 106 and distorts the view when low. No 008 zombie infection / vomit yet |
 | Save types per difficulty | partial | Save-anywhere / save-on-quit / no-saves honored; Euclid's save-on-screens saves anywhere (no monitor interaction) |
 | Console | missing | Select is reserved but no console |
 | Achievements / end screen | missing | |

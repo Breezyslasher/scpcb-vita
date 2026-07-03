@@ -804,7 +804,14 @@ static int fogOn = 1;
 
 /* Vitals (approximate Main_Core.bb rates). */
 static float blinkTimer = 100.0f;   /* 0..100, drains ~10s */
-static float health = 100.0f;
+static float health = 100.0f;       /* derived HUD value = 100 - bloodloss */
+/* Injury / bleeding / sanity model (Main_Core.bb): damage adds
+ * injuries; injuries bleed into bloodloss; bloodloss >= 100 is fatal;
+ * first aid clots it. Sanity drops in the dark / pocket dimension and
+ * near SCP-106, distorting the view when low. */
+static float injuries;              /* 0..~5 */
+static float bloodloss;             /* 0..100 */
+static float sanity = 100.0f;       /* 0..100 (source uses 0..-850) */
 static float damageFlash;           /* red flash on taking damage */
 static float fallPeakY;             /* apex of the current fall */
 static char deathCause[64] = "SCP-173";
@@ -863,6 +870,9 @@ static void regenerateMap(uint32_t seed) {
     inPocket = 0;
     femurTimer = 0.0f;
     npc106Contained = 0;
+    injuries = 0.0f;
+    bloodloss = 0.0f;
+    sanity = 100.0f;
     equippedNav = -1;
     navVisible = 1;
     health = 100.0f;
@@ -2141,11 +2151,12 @@ static void introUpdate(void) {
                 if (++escortShotTick >= 40 && deathTimer == 0) {
                     escortShotTick = 0;
                     audioPlay(sndGunshot[rand() % 2], 1.0f, 0.0f);
-                    health -= 34.0f;
+                    injuries += 1.0f;
+                    bloodloss += 28.0f;
                     damageFlash = 0.7f;
                     audioPlay(sndDamage[rand() % 4], 1.0f, 0.0f);
-                    if (health <= 0.0f) {
-                        health = 0.0f;
+                    if (bloodloss >= 100.0f) {
+                        bloodloss = 100.0f;
                         snprintf(deathCause, sizeof(deathCause),
                                  "THE GUARDS");
                         deathTimer = 180;
@@ -2924,13 +2935,20 @@ static const char *useInventoryItem(int slot) {
         return msg;
     }
     if (strstr(name, "First Aid Kit")) {
-        if (health >= 100.0f) return "YOU ARE NOT INJURED";
-        health = 100.0f;
+        if (injuries <= 0.0f && bloodloss <= 0.0f) {
+            return "YOU ARE NOT INJURED";
+        }
+        int fine = strstr(name, "Fine") || strstr(name, "Compact");
+        injuries = 0.0f;
+        bloodloss = fine ? 0.0f
+                         : (bloodloss > 40.0f ? bloodloss - 40.0f : 0.0f);
         consumeSlot(slot);
         return "YOU BANDAGE YOUR WOUNDS";
     }
     if (strcmp(name, "SCP-500-01") == 0) {
-        health = 100.0f;
+        injuries = 0.0f;
+        bloodloss = 0.0f;
+        sanity = 100.0f;
         blinkTimer = 100.0f;
         stamina = 100.0f;
         staminaBlocked = 0;
@@ -2941,8 +2959,8 @@ static const char *useInventoryItem(int slot) {
         return "THE BOTTLE OF PILLS - USE ONE FROM YOUR INVENTORY";
     }
     if (strstr(name, "420-J")) {
-        health += 30.0f;
-        if (health > 100.0f) health = 100.0f;
+        injuries = 0.0f;
+        sanity = 100.0f;
         consumeSlot(slot);
         return "MAN, THIS IS SOME REALLY GOOD S***";
     }
@@ -2974,8 +2992,7 @@ static const char *useInventoryItem(int slot) {
         return msg;
     }
     if (strcmp(name, "Pizza Slice") == 0) {
-        health += 10.0f;
-        if (health > 100.0f) health = 100.0f;
+        bloodloss = bloodloss > 10.0f ? bloodloss - 10.0f : 0.0f;
         consumeSlot(slot);
         return "YOU EAT THE PIZZA SLICE. IT'S COLD";
     }
@@ -3270,6 +3287,49 @@ static void gameMusicStart(void) {
     audioStreamMusic(ZONE_MUSIC[z], 0.55f, 1);
 }
 
+/* Bleeding, healing and sanity, run each gameplay frame
+ * (Main_Core.bb's injury model). */
+static void updatePlayerCondition(void) {
+    if (introPhase >= 0) { health = 100.0f - bloodloss; return; }
+    if (deathTimer == 0) {
+        /* Injuries above 1 bleed into bloodloss; the vest already cut
+         * the incoming injury. */
+        if (injuries > 1.0f) {
+            float r = (injuries < 3.5f ? injuries : 3.5f) / 300.0f;
+            bloodloss += r;
+            if (bloodloss > 100.0f) bloodloss = 100.0f;
+        }
+        /* Wounds clot slowly on their own. */
+        injuries -= 0.0025f;
+        if (injuries < 0.0f) injuries = 0.0f;
+        if (bloodloss >= 100.0f) {
+            snprintf(deathCause, sizeof(deathCause), "BLOOD LOSS");
+            deathTimer = 180;
+        }
+
+        /* Sanity drains in the dark, in the pocket dimension and near
+         * SCP-106; it recovers in the light. */
+        float drain = 0.0f;
+        if (inPocket) {
+            drain = 0.14f;
+        } else if (introDark) {
+            drain = 0.05f;
+        } else if (npc106Active && npc106State != N106_DORMANT) {
+            float dx = camPos[0] - npc106Pos[0];
+            float dz = camPos[2] - npc106Pos[2];
+            if (dx * dx + dz * dz < 1400.0f * 1400.0f) drain = 0.09f;
+        }
+        sanity += drain > 0.0f ? -drain : 0.04f;
+        if (sanity < 0.0f) sanity = 0.0f;
+        if (sanity > 100.0f) sanity = 100.0f;
+        if (sanity < 30.0f) {
+            float sv = (30.0f - sanity) / 30.0f * 1.8f;
+            if (camShake < sv) camShake = sv;
+        }
+    }
+    health = 100.0f - bloodloss;
+}
+
 /* Called each gameplay frame: swap the track when the zone changes. */
 static void updateZoneMusic(void) {
     if (radioChannel >= 0 || !worldReady) return;
@@ -3373,6 +3433,7 @@ static int saveGame(void) {
     fprintf(f, "vitals=%f %f\n", blinkTimer, stamina);
     fprintf(f, "cond=%f %d %d %d %d %d\n", health, wearGasMask, wearNVG,
             wear268, wearVest, radioChannel);
+    fprintf(f, "condx=%f %f %f\n", injuries, bloodloss, sanity);
     fprintf(f, "npc173=%f %f %f %f %d\n", npc173Pos[0], npc173Pos[1],
             npc173Pos[2], npc173YawDeg, npc173Active);
     fprintf(f, "nav=%s\n",
@@ -3411,6 +3472,7 @@ static int loadGameFrom(const char *path) {
     float px = 0, py = 0, pz = 0, yaw = 0, pitch = 0, bt = 100, st = 100;
     float nx = 0, ny = 0, nz = 0, nyaw = 0;
     float condHealth = 100.0f;
+    float condInjuries = 0.0f, condBloodloss = 0.0f, condSanity = 100.0f;
     int condWear[4] = { 0, 0, 0, 0 };
     int condRadio = -1;
     int nact = 1;
@@ -3446,6 +3508,11 @@ static int loadGameFrom(const char *path) {
             p = line + 7;
             bt = strtof(p, &p);
             st = strtof(p, &p);
+        } else if (strncmp(line, "condx=", 6) == 0) {
+            p = line + 6;
+            condInjuries = strtof(p, &p);
+            condBloodloss = strtof(p, &p);
+            condSanity = strtof(p, &p);
         } else if (strncmp(line, "cond=", 5) == 0) {
             p = line + 5;
             condHealth = strtof(p, &p);
@@ -3498,6 +3565,9 @@ static int loadGameFrom(const char *path) {
     blinkTimer = bt;
     stamina = st;
     health = condHealth;
+    injuries = condInjuries;
+    bloodloss = condBloodloss;
+    sanity = condSanity;
     wearGasMask = condWear[0];
     wearNVG = condWear[1];
     wear268 = condWear[2];
@@ -5264,6 +5334,7 @@ int main(void) {
                 updateRoomEvents();
             }
             updatePocketDimension();
+            updatePlayerCondition();
             if (femurTimer > 0.0f) {
                 femurTimer += 1.0f;
                 /* Lure phase: 106 rises out of the pit to feed. */
@@ -5320,6 +5391,9 @@ int main(void) {
                 npc173EnemyX = npc173EnemyZ = 0.0f;
                 npc173LastDist = 1e9f;
                 health = 100.0f;
+                injuries = 0.0f;
+                bloodloss = 0.0f;
+                sanity = 100.0f;
                 snprintf(toastMsg, sizeof(toastMsg),
                          "YOU WERE KILLED BY %s", deathCause);
                 toastTimer = 240;
@@ -5443,11 +5517,12 @@ int main(void) {
                     if (drop > 700.0f && deathTimer == 0) {
                         float dmg = (drop - 700.0f) * 0.08f;
                         if (wearVest) dmg *= 0.6f;
-                        health -= dmg;
+                        injuries += dmg / 20.0f;
+                        bloodloss += dmg * 0.8f;
                         damageFlash = 0.6f;
                         audioPlay(sndDamage[rand() % 4], 1.0f, 0.0f);
-                        if (health <= 0.0f) {
-                            health = 0.0f;
+                        if (bloodloss >= 100.0f) {
+                            bloodloss = 100.0f;
                             snprintf(deathCause, sizeof(deathCause),
                                      "THE FALL");
                             deathTimer = 180;
@@ -5562,14 +5637,21 @@ int main(void) {
             glDisable(GL_BLEND);
             glColor4f(1, 1, 1, 1);
         }
-        /* Injuries: a red vignette that deepens as health drops, plus
+        /* Bleeding: a red vignette that deepens with bloodloss, plus
          * a flash when damage lands. */
         if (haveData && deathTimer == 0) {
-            float hurt = (100.0f - health) / 100.0f * 0.30f + damageFlash;
+            float hurt = bloodloss / 100.0f * 0.6f + damageFlash;
             if (damageFlash > 0.0f) damageFlash -= 0.02f;
             if (hurt > 0.01f) {
                 drawQuad(0, 0, SCREEN_W, SCREEN_H, 0, 0.6f, 0.0f, 0.0f,
-                         hurt > 0.8f ? 0.8f : hurt);
+                         hurt > 0.85f ? 0.85f : hurt);
+            }
+            /* Low sanity darkens the edges with a cold, unstable tint. */
+            if (sanity < 50.0f) {
+                float sv = (50.0f - sanity) / 50.0f;
+                float jit = sinf(fpsFrames * 0.9f) * 0.05f * sv;
+                drawQuad(0, 0, SCREEN_W, SCREEN_H, 0, 0.0f, 0.05f, 0.03f,
+                         sv * 0.5f + jit);
             }
         }
         if (haveData && walkMode && !invOpen && !pauseOpen) {
@@ -5577,6 +5659,13 @@ int main(void) {
                       blinkTimer / 100.0f);
             drawMeter(20, SCREEN_H - 110, hudSprintIcon, hudStaminaBar,
                       stamina / 100.0f);
+            /* Blood and sanity bars above the vitals meters. */
+            drawQuad(20, SCREEN_H - 132, 120, 6, 0, 0.15f, 0.02f, 0.02f, 1);
+            drawQuad(20, SCREEN_H - 132, 120 * (bloodloss / 100.0f), 6, 0,
+                     0.8f, 0.1f, 0.1f, 1);
+            drawQuad(20, SCREEN_H - 146, 120, 6, 0, 0.05f, 0.1f, 0.1f, 1);
+            drawQuad(20, SCREEN_H - 146, 120 * (sanity / 100.0f), 6, 0,
+                     0.3f, 0.7f, 0.8f, 1);
             if (equippedNav >= 0 && navVisible) drawNav();
         }
         if (invOpen) {
