@@ -1501,6 +1501,8 @@ static int pdPillarsOn;       /* active this frame */
 /* SCP-682's arm: at a roar's climax a huge reptilian arm smashes
  * through and sweeps the room (Events_Core scp_682_arm), then retracts. */
 static ModelRT arm682RT;
+/* SCP-860-1's forest room copse (built with the door assets). */
+static ModelRT tree860RT;
 static int arm682Active;
 static float arm682Roll;      /* swing angle, 180 -> 360 */
 static float arm682Pos[3];
@@ -1737,7 +1739,6 @@ static float npc860Pos[3];
 static float npc860YawDeg;
 static float npc860Frame;
 static int npc860Cool;
-static ModelRT tree860RT;
 #define MAX_TREES 14
 static float tree860Pos[MAX_TREES][3];
 static int tree860Count;
