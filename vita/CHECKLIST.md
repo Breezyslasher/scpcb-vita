@@ -15,7 +15,7 @@ Updated as features land. States: **done** / **partial** / **missing**.
 | Room-internal doors (FillRoom) | done | 257 extracted; types, locks, buttonless, keypad codes |
 | Runtime-expression doors | missing | ~30 CreateDoor calls with computed coordinates skipped by the extractor |
 | Elevators | missing | Elevator doors render but do not travel |
-| Levers, buttons w/ custom parents | missing | e.g. SCP-914 levers, intro cell block buttons |
+| Levers, buttons w/ custom parents | partial | 31 levers + 30 standalone buttons render, flip/press with sound; the events they drive are not ported so they are cosmetic-interactive |
 | Security cameras / decals / particles / sprites | missing | Cosmetic layers of FillRoom |
 | Lightmap blend model | partial | Source multiplies (TextureBlend 5/2) with AmbientLightRoomTex; port adds the lightmap additively |
 | Glass / alpha surfaces | done | Alpha-blended like LoadRMesh's Alpha mesh |

@@ -28,6 +28,7 @@
 #include "game/doors.h"
 #include "game/item_spawns.h"
 #include "game/room_doors.h"
+#include "game/room_fixtures.h"
 #include "game/mapgen.h"
 #include "input.h"
 #include "render/scene.h"
@@ -397,6 +398,67 @@ static void spawnRoomDoors(void) {
     }
 }
 
+/* Room levers and standalone buttons (room_fixtures.h). Cosmetic +
+ * interactive fixtures: levers flip on/off, buttons depress and
+ * click. World coords via the same room transform as items/doors. */
+typedef struct {
+    float x, y, z;
+    float yawDeg;   /* world yaw of the base */
+    int on;
+    float pitch;    /* animated handle pitch, 80 (off) .. -80 (on) */
+} WorldLever;
+
+typedef struct {
+    float x, y, z;
+    float pitch, yaw, roll; /* world eulers */
+    int btnId;
+    int locked;
+    float press;    /* 0..1 depress animation */
+} WorldButton;
+
+#define MAX_FIXTURES 96
+static WorldLever worldLevers[MAX_FIXTURES];
+static int worldLeverCount;
+static WorldButton worldButtons[MAX_FIXTURES];
+static int worldButtonCount;
+
+static void spawnRoomFixtures(void) {
+    worldLeverCount = 0;
+    worldButtonCount = 0;
+    const int NL = (int)(sizeof(ROOM_LEVERS) / sizeof(ROOM_LEVERS[0]));
+    const int NB = (int)(sizeof(ROOM_BUTTONS) / sizeof(ROOM_BUTTONS[0]));
+    for (uint32_t r = 0; r < map.roomCount; r++) {
+        const RoomPlacement *p = &map.rooms[r];
+        const char *nm = tplList.items[p->templateIndex].name;
+        float roomYaw = (float)(p->angle * 90);
+        for (int i = 0; i < NL && worldLeverCount < MAX_FIXTURES; i++) {
+            const RoomLeverDef *ld = &ROOM_LEVERS[i];
+            if (strcmp(ld->room, nm) != 0) continue;
+            float local[3] = { ld->x, ld->y, ld->z }, w[3];
+            localToWorld(p, local, w);
+            WorldLever *lv = &worldLevers[worldLeverCount++];
+            lv->x = w[0]; lv->y = w[1]; lv->z = w[2];
+            lv->yawDeg = ld->rotDeg + roomYaw;
+            lv->on = ld->on;
+            lv->pitch = ld->on ? -80.0f : 80.0f;
+        }
+        for (int i = 0; i < NB && worldButtonCount < MAX_FIXTURES; i++) {
+            const RoomButtonDef *bd = &ROOM_BUTTONS[i];
+            if (strcmp(bd->room, nm) != 0) continue;
+            float local[3] = { bd->x, bd->y, bd->z }, w[3];
+            localToWorld(p, local, w);
+            WorldButton *bt = &worldButtons[worldButtonCount++];
+            bt->x = w[0]; bt->y = w[1]; bt->z = w[2];
+            bt->pitch = bd->pitch;
+            bt->yaw = bd->yaw + roomYaw;
+            bt->roll = bd->roll;
+            bt->btnId = bd->btnId;
+            bt->locked = bd->locked;
+            bt->press = 0.0f;
+        }
+    }
+}
+
 /* ---- intro sequence (cont1_173_intro, "placed automatically in all
  * maps" per rooms.ini): the Class-D cell block and 173's chamber on
  * an isolated off-grid cell. ---- */
@@ -691,6 +753,7 @@ static void regenerateMap(uint32_t seed) {
         appendIntroRoom();
         doorsGenerate(&map, &tplList, mapSeed ^ 0x9E3779B9u, &doors);
         spawnRoomDoors();
+        spawnRoomFixtures();
         spawnItems();
         reset173();
         snprintf(statusLine, sizeof(statusLine), "map seed %u: %u rooms %u doors",
@@ -823,7 +886,8 @@ static int npcAggressive = 0;
 static int sndDoorOpen[3], sndDoorClose[3];
 static int sndBigOpen[3], sndBigClose[3];
 static int sndStep[8], sndRun[7];
-static int sndButton[2], sndKeycardUse[2], sndDoorLock;
+static int sndButton[2], sndKeycardUse[2], sndDoorLock, sndLever;
+static GLuint texButtonRed;
 static int sndPick[4];
 static int sndDamage[4];
 static int sndAmbience;
@@ -858,6 +922,7 @@ static void loadSounds(void) {
         sndKeycardUse[i] = audioLoad(p);
     }
     sndDoorLock = audioLoad(SFX_DIR "/Interact/DoorLock.ogg");
+    sndLever = audioLoad(SFX_DIR "/Interact/LeverFlip.ogg");
     for (int i = 0; i < 4; i++) {
         snprintf(p, sizeof(p), SFX_DIR "/Character/D9341/Damage%d.ogg", i);
         sndDamage[i] = audioLoad(p);
@@ -892,6 +957,8 @@ static ModelRT elevatorRT, big1RT, big2RT, bigFrameRT;
 static ModelRT officeRT, officeFrameRT, woodenRT, woodenFrameRT;
 static ModelRT oneSidedRT, door914RT;
 static ModelRT buttonRT, buttonKeycardRT;
+static ModelRT buttonKeypadRT, buttonScannerRT, buttonElevatorRT;
+static ModelRT leverBaseRT, leverHandleRT;
 static char toastMsg[128];
 static int toastTimer;
 
@@ -976,6 +1043,22 @@ static void buildDoorAssets(void) {
     buildModelRT(&buttonKeycardRT, "ButtonKeycard.b3d", 0, 0, 0, NULL);
     buttonKeycardRT.scale[0] = buttonKeycardRT.scale[1] =
         buttonKeycardRT.scale[2] = 7.68f;
+    buildModelRT(&buttonKeypadRT, "ButtonCode.b3d", 0, 0, 0, NULL);
+    buildModelRT(&buttonScannerRT, "ButtonScanner.b3d", 0, 0, 0, NULL);
+    buildModelRT(&buttonElevatorRT, "ButtonElevator.b3d", 0, 0, 0, NULL);
+    buttonKeypadRT.scale[0] = buttonKeypadRT.scale[1] =
+        buttonKeypadRT.scale[2] = 7.68f;
+    buttonScannerRT.scale[0] = buttonScannerRT.scale[1] =
+        buttonScannerRT.scale[2] = 7.68f;
+    buttonElevatorRT.scale[0] = buttonElevatorRT.scale[1] =
+        buttonElevatorRT.scale[2] = 7.68f;
+    /* CreateLever scales base and handle to 0.036 world = 9.216 raw. */
+    buildModelRT(&leverBaseRT, "LeverBase.b3d", 0, 0, 0, NULL);
+    buildModelRT(&leverHandleRT, "LeverHandle.b3d", 0, 0, 0, NULL);
+    leverBaseRT.scale[0] = leverBaseRT.scale[1] = leverBaseRT.scale[2]
+        = 9.216f;
+    leverHandleRT.scale[0] = leverHandleRT.scale[1] = leverHandleRT.scale[2]
+        = 9.216f;
 }
 
 static void drawModelRT(const ModelRT *rt);
@@ -2786,6 +2869,24 @@ static void drawModelRT(const ModelRT *rt) {
     glPopMatrix();
 }
 
+/* Draw a model with every batch's diffuse swapped for texOverride
+ * (the locked button's red panel), restoring the originals after. */
+static void drawModelRTTinted(const ModelRT *rt, GLuint texOverride) {
+    if (!rt->ok) return;
+    GLuint saved[16];
+    uint32_t n = rt->scene->batchCount;
+    if (n > 16) n = 16;
+    for (uint32_t i = 0; i < n; i++) {
+        saved[i] = rt->gl[i].diffuse;
+        rt->gl[i].diffuse = texOverride;
+    }
+    glPushMatrix();
+    glScalef(rt->scale[0], rt->scale[1], rt->scale[2]);
+    drawBatchSet(rt->scene, rt->gl, 0);
+    glPopMatrix();
+    for (uint32_t i = 0; i < n; i++) rt->gl[i].diffuse = saved[i];
+}
+
 static void drawDoors(const float viewPos[3]) {
     for (uint32_t i = 0; i < doors.count; i++) {
         const Door *d = &doors.items[i];
@@ -2855,6 +2956,80 @@ static void drawDoors(const float viewPos[3]) {
 
         glPopMatrix();
     }
+}
+
+static const ModelRT *buttonModelFor(int btnId) {
+    switch (btnId) {
+        case 1: return &buttonKeycardRT;
+        case 2: return &buttonKeypadRT;
+        case 3: return &buttonScannerRT;
+        case 4: return &buttonElevatorRT;
+        default: return &buttonRT;
+    }
+}
+
+static void drawFixtures(const float viewPos[3]) {
+    for (int i = 0; i < worldLeverCount; i++) {
+        WorldLever *lv = &worldLevers[i];
+        float dx = lv->x - viewPos[0], dz = lv->z - viewPos[2];
+        if (dx * dx + dz * dz > VIEW_RANGE * VIEW_RANGE) continue;
+        /* Ease the handle toward its target pitch. */
+        float target = lv->on ? -80.0f : 80.0f;
+        lv->pitch += (target - lv->pitch) * 0.25f;
+        glPushMatrix();
+        glTranslatef(lv->x, lv->y, lv->z);
+        glPushMatrix();
+        glRotatef(-lv->yawDeg, 0.0f, 1.0f, 0.0f);
+        drawModelRT(&leverBaseRT);
+        glPopMatrix();
+        glRotatef(-(lv->yawDeg - 180.0f), 0.0f, 1.0f, 0.0f);
+        glRotatef(lv->pitch, 1.0f, 0.0f, 0.0f);
+        drawModelRT(&leverHandleRT);
+        glPopMatrix();
+    }
+    for (int i = 0; i < worldButtonCount; i++) {
+        WorldButton *bt = &worldButtons[i];
+        float dx = bt->x - viewPos[0], dz = bt->z - viewPos[2];
+        if (dx * dx + dz * dz > VIEW_RANGE * VIEW_RANGE) continue;
+        if (bt->press > 0.0f) bt->press -= 0.08f;
+        glPushMatrix();
+        glTranslatef(bt->x, bt->y, bt->z);
+        glRotatef(-bt->yaw, 0.0f, 1.0f, 0.0f);
+        glRotatef(bt->pitch, 1.0f, 0.0f, 0.0f);
+        glRotatef(bt->roll, 0.0f, 0.0f, 1.0f);
+        /* Depress into the panel a touch when pressed. */
+        if (bt->press > 0.0f) glTranslatef(0.0f, 0.0f, -bt->press * 3.0f);
+        const ModelRT *m = buttonModelFor(bt->btnId);
+        if (bt->locked && texButtonRed) {
+            drawModelRTTinted(m, texButtonRed);
+        } else {
+            drawModelRT(m);
+        }
+        glPopMatrix();
+    }
+}
+
+/* Nearest lever/button to the player within reach; type 1 = lever,
+ * 2 = button. Returns the index or -1. */
+static int fixtureNearest(const float pos[3], int *type) {
+    float best = 200.0f * 200.0f;
+    int bi = -1, bt = 0;
+    for (int i = 0; i < worldLeverCount; i++) {
+        float dx = worldLevers[i].x - pos[0];
+        float dy = worldLevers[i].y - (pos[1] - EYE_HEIGHT * 0.4f);
+        float dz = worldLevers[i].z - pos[2];
+        float d = dx * dx + dy * dy + dz * dz;
+        if (d < best) { best = d; bi = i; bt = 1; }
+    }
+    for (int i = 0; i < worldButtonCount; i++) {
+        float dx = worldButtons[i].x - pos[0];
+        float dy = worldButtons[i].y - (pos[1] - EYE_HEIGHT * 0.4f);
+        float dz = worldButtons[i].z - pos[2];
+        float d = dx * dx + dy * dy + dz * dz;
+        if (d < best) { best = d; bi = i; bt = 2; }
+    }
+    if (type) *type = bt;
+    return bi;
 }
 
 static GLuint hudBlinkIcon, hudBlinkBar, hudSprintIcon, hudStaminaBar;
@@ -4020,6 +4195,7 @@ int main(void) {
         buildNpcAssets();
         loadHudTextures();
         loadMenuTextures();
+        texButtonRed = textureGet("keypad_locked.png");
         optionsLoad();
         mkdir(SAVES_DIR, 0777);
         if (audioInit()) {
@@ -4228,8 +4404,29 @@ int main(void) {
         if (haveData && !invOpen && !pauseOpen && !pausedAtFrameStart
             && !keypadOpen && !introCameraLocked()
             && inputHit(ACTION_INTERACT)) {
-            int picked = itemPickupNearest(camPos);
-            if (picked >= 0) {
+            int fxType = 0;
+            int fx = fixtureNearest(camPos, &fxType);
+            int picked = fx < 0 ? itemPickupNearest(camPos) : -1;
+            if (fx >= 0) {
+                if (fxType == 1) {
+                    WorldLever *lv = &worldLevers[fx];
+                    lv->on = !lv->on;
+                    float lp[3] = { lv->x, camPos[1], lv->z };
+                    audioPlay3D(sndLever, lp, camPos, camYaw, 1200.0f);
+                } else {
+                    WorldButton *bt = &worldButtons[fx];
+                    bt->press = 1.0f;
+                    float bp[3] = { bt->x, camPos[1], bt->z };
+                    audioPlay3D(bt->locked ? sndDoorLock
+                                           : sndButton[rand() % 2],
+                                bp, camPos, camYaw, 1200.0f);
+                    if (bt->locked) {
+                        snprintf(toastMsg, sizeof(toastMsg),
+                                 "IT WON'T BUDGE");
+                        toastTimer = 120;
+                    }
+                }
+            } else if (picked >= 0) {
                 snprintf(toastMsg, sizeof(toastMsg), "PICKED UP %s",
                          ITEM_TEMPLATES[picked].name);
                 toastTimer = 150;
@@ -4494,6 +4691,7 @@ int main(void) {
                 glPopMatrix();
             }
             drawDoors(camPos);
+            drawFixtures(camPos);
             drawItems(camPos);
             draw173(camPos);
             drawIntroHumans(camPos);
