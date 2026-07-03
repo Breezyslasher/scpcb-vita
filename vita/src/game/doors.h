@@ -26,6 +26,7 @@ typedef struct {
     float openState;   /* 0..180, animated */
     int keycard;       /* 0 = none; >0 = required keycard level */
     int locked;
+    int code;          /* >0 = keypad door: the 4-digit code */
     int nobuttons;     /* FillRoom removed the buttons */
     int denials;       /* failed button presses (debug force-open) */
 } Door;
@@ -50,7 +51,7 @@ int doorsGenerate(const GeneratedMap *map, const RoomTemplateList *templates,
  * span axis (0 or 90); y is the door base height; type as in Door. */
 int doorsAddInternal(DoorList *list, float x, float y, float z, int angle,
                      int type, int open, int keycard, int locked,
-                     int nobuttons);
+                     int nobuttons, int code);
 void doorsFree(DoorList *list);
 
 /* Advance the open/close animation one frame (UpdateDoors: 2 deg). */
@@ -65,7 +66,8 @@ typedef enum {
     DOOR_PRESS_NONE = 0,   /* no button in reach */
     DOOR_PRESS_TOGGLED,
     DOOR_PRESS_LOCKED,
-    DOOR_PRESS_KEYCARD     /* denied: keycard required */
+    DOOR_PRESS_KEYCARD,    /* denied: keycard required */
+    DOOR_PRESS_CODE        /* keypad door: open the code entry UI */
 } DoorPressResult;
 
 /* Press the nearest button within reach (the game's |dx|,|dz| < 1.0
