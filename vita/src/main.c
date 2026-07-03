@@ -1382,12 +1382,6 @@ static void introStart(void) {
     camPitch = 0.0f;
     velY = 0.0f;
     npc173Active = 0; /* nothing hunts until the breach */
-    {
-        int leaf = itemTplFind("Class D Orientation Leaflet");
-        if (leaf >= 0 && inventoryCount < (unsigned)invSlotCap) {
-            inventory[inventoryCount++] = leaf;
-        }
-    }
     introPlaceHumans();
     introPhase = 0;
     introTimer = 0;
@@ -3182,6 +3176,12 @@ static int startNewGame(void) {
     pauseOpen = 0;
     if (introEnabled) {
         introStart();
+        /* You wake with the orientation leaflet (the no-intro path
+         * hands it over on spawn instead). */
+        int leaf = itemTplFind("Class D Orientation Leaflet");
+        if (leaf >= 0 && inventoryCount < (unsigned)invSlotCap) {
+            inventory[inventoryCount++] = leaf;
+        }
     } else {
         introPhase = -1;
         gameMusicStart();
