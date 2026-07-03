@@ -1082,6 +1082,33 @@ static void appendPocketRoom(void) {
     buildPocketComposite();
 }
 
+/* The pocket-dimension labyrinth doors (Rooms_Core dimension_106, the
+ * "For i = 0 To 9 / Select" block the door extractor skips because the
+ * coordinates come from loop variables). Ten KEY_005 DEFAULT_DOORs at
+ * fixed local offsets - x = xTemp, y = 2574, z = 32 + zTemp in raw
+ * units - placed with the same room transform as every other
+ * dimension_106 door. Call after spawnRoomDoors (which runs after
+ * doorsGenerate resets the list). */
+static void spawnPocketLabyrinthDoors(void) {
+    if (pdRoomIdx < 0) return;
+    static const struct { float x, z, ang; } PD_LABYRINTH[10] = {
+        { 5187.0f, 2555.0f, 180.0f }, { 5521.0f, 1673.0f, 180.0f },
+        { 9128.0f, 2192.0f, 180.0f }, { 8523.0f, 1760.0f, 180.0f },
+        { 9880.0f, 1244.0f, 180.0f }, { 5299.0f,  392.0f,  90.0f },
+        { 7807.0f, 1291.0f,  90.0f }, { 8196.0f, 1436.0f,  90.0f },
+        { 8143.0f,  392.0f,  90.0f }, { 9709.0f,  920.0f,  90.0f },
+    };
+    const RoomPlacement *p = &map.rooms[pdRoomIdx];
+    for (int i = 0; i < 10; i++) {
+        float local[3] = { PD_LABYRINTH[i].x, 2574.0f, PD_LABYRINTH[i].z };
+        float w[3];
+        localToWorld(p, local, w);
+        int a = (int)(PD_LABYRINTH[i].ang / 90.0f + 0.5f) * 90 + p->angle * 90;
+        a = ((a % 360) + 360) % 360;
+        doorsAddInternal(&doors, w[0], w[1], w[2], a, 0, 0, 0, 0, 0, 0);
+    }
+}
+
 static void appendMaskRoom(void) {
     maskRoomIdx = -1;
     int tplIdx = -1;
@@ -1595,6 +1622,7 @@ static void regenerateMap(uint32_t seed) {
         appendMaskRoom();
         doorsGenerate(&map, &tplList, mapSeed ^ 0x9E3779B9u, &doors);
         spawnRoomDoors();
+        spawnPocketLabyrinthDoors();
         appendGateRooms();
         setupMaintenanceTunnel();
         spawnRoomFixtures();
@@ -6959,11 +6987,12 @@ static void drawDoors(const float viewPos[3]) {
         /* Frame and panels by door type (Loading_Core.bb models). */
         const ModelRT *frame = &doorFrameRT;
         const ModelRT *p1 = &doorPanelRT, *p2 = &doorPanelRT;
-        int hinged = 0, single = 0;
+        int hinged = 0, single = 0, bigLeaves = 0;
         switch (d->type) {
             case 1: p1 = p2 = &elevatorRT; break;
             case 2: p1 = &heavy1RT; p2 = &heavy2RT; break;
-            case 3: frame = &bigFrameRT; p1 = &big1RT; p2 = &big2RT; break;
+            case 3: frame = &bigFrameRT; p1 = &big1RT; p2 = &big2RT;
+                    bigLeaves = 1; break;
             case 4: frame = &officeFrameRT; p1 = &officeRT; hinged = 1; break;
             case 5: frame = &woodenFrameRT; p1 = &woodenRT; hinged = 1; break;
             case 6: p1 = &oneSidedRT; single = 1; break;
@@ -6989,8 +7018,18 @@ static void drawDoors(const float viewPos[3]) {
 
             if (!single) {
                 glPushMatrix();
-                glRotatef(180.0f, 0.0f, 1.0f, 0.0f);
-                glTranslatef(slide, 0.0f, 0.0f);
+                if (bigLeaves) {
+                    /* The big containment gate is two distinct halves
+                     * (contdoorleft/right) that meet at the centre and
+                     * slide apart along the same axis - the source does
+                     * NOT mirror OBJ2 (Angle + (Not BIG_DOOR)*180) and
+                     * moves it -SinValue. Flipping it 180 would pile both
+                     * halves on one side and leave the other half open. */
+                    glTranslatef(-slide, 0.0f, 0.0f);
+                } else {
+                    glRotatef(180.0f, 0.0f, 1.0f, 0.0f);
+                    glTranslatef(slide, 0.0f, 0.0f);
+                }
                 drawDoorPart(p2, corr);
                 glPopMatrix();
             }
