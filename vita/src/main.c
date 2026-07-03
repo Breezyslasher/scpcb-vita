@@ -590,6 +590,17 @@ static int inPocket;          /* player is in the pocket dimension */
 static float pocketTimer;     /* frames until it collapses (death) */
 static float pdCircle;        /* 106's orbit angle in the start room */
 static int pdLunging;         /* 106 has broken off to attack */
+/* The 8-state flow (Events_Core UpdateDimension106): the player is
+ * shuffled between sub-rooms of the composite - the start room, the
+ * four-way / throne / trenches / exit area (dim_3) and the tower /
+ * labyrinth area (dim_4) - by choice and by random teleport, until an
+ * exit is found or 106 / a hazard kills them. */
+enum { PD_START = 0, PD_FOURWAY, PD_THRONE, PD_TRENCHES, PD_EXIT,
+       PD_FAKETUNNEL, PD_TOWER, PD_LABYRINTH };
+static int pdState;
+static float pdEventState;    /* e\EventState per-state timer */
+static float pdStateTimer;    /* frames since the last state change */
+static int pd106Hidden;       /* 106 not present in this sub-room */
 static int npc106Contained;   /* femur breaker: 106 permanently stopped */
 static float femurTimer;      /* femur breaker sequence progress */
 static float femurSpot[3];    /* world pos of the breaker pit */
@@ -2722,13 +2733,17 @@ static void enterPocketDimension(void) {
     float o[3] = { camPos[0], 1500.0f, camPos[2] };
     float hy;
     camPos[1] = (rayDownWorld(o, 3000.0f, &hy) ? hy : 0.0f) + EYE_HEIGHT;
-    camYaw = 2.35f; /* face the far exit corner */
+    camYaw = 2.35f; /* face into the start room */
     camPitch = 0.0f;
     velY = 0.0f;
     inPocket = 1;
-    pocketTimer = 5400.0f; /* ~90 s */
+    pocketTimer = 18000.0f; /* ~5 min overall safety collapse */
     pdCircle = 0.0f;
     pdLunging = 0;
+    pdState = PD_START;
+    pdEventState = 0.0f;
+    pdStateTimer = 0.0f;
+    pd106Hidden = 0;
     npc106Active = skin106 != NULL;
     npc106State = N106_CHASING; /* so draw106 shows it */
     blinkFrames = 20;
@@ -2761,108 +2776,370 @@ static void leavePocketDimension(int escaped) {
     }
 }
 
+/* Origin of each sub-room within the composite (raw world). The base
+ * room + tunnels sit at the PD origin; dim_3 (four-way / throne /
+ * trenches / exit) at z+8192; dim_4 (tower / labyrinth) at z+16384. */
+static void pdRegionOrigin(int state, float *ox, float *oz) {
+    float bx = PD_GX * ROOM_SPACING, bz = PD_GY * ROOM_SPACING;
+    *ox = bx;
+    switch (state) {
+        case PD_FOURWAY: case PD_THRONE:
+        case PD_TRENCHES: case PD_EXIT:
+            *oz = bz + 8192.0f; break;
+        case PD_TOWER: case PD_LABYRINTH:
+            *oz = bz + 16384.0f; break;
+        default:
+            *oz = bz; break;
+    }
+}
+
+/* Drop the player onto the floor at (x,z), blinking (the game blinks
+ * on every pocket-dimension teleport). */
+static void pdPlacePlayer(float x, float z) {
+    camPos[0] = x;
+    camPos[2] = z;
+    float o[3] = { x, 2500.0f, z };
+    float hy;
+    camPos[1] = (rayDownWorld(o, 8000.0f, &hy) ? hy : 0.0f) + EYE_HEIGHT;
+    velY = 0.0f;
+    blinkFrames = 18;
+    blinkTimer = 100.0f;
+}
+
+/* The teleport table (UpdateDimension106's Select Random): each bucket
+ * lands the player in a specific sub-room, or exits the dimension. */
+static void pdTeleportRandom(int r) {
+    float ox, oz;
+    pdLunging = 0;
+    pdStateTimer = 0.0f;
+    pdEventState = 0.0f;
+    audioPlay(snd106Corr[rand() % 3], 0.9f, 0.0f);
+    if (r >= 1 && r <= 5) {              /* rotate into the start room */
+        pdState = PD_START;
+        pdPlacePlayer(PD_GX * ROOM_SPACING + 300.0f,
+                      PD_GY * ROOM_SPACING);
+    } else if (r >= 6 && r <= 13) {      /* the four-way room */
+        pdState = PD_FOURWAY;
+        pdRegionOrigin(PD_FOURWAY, &ox, &oz);
+        pdPlacePlayer(ox, oz);
+    } else if (r >= 14 && r <= 17) {     /* middle of the start room */
+        pdState = PD_START;
+        pdPlacePlayer(PD_GX * ROOM_SPACING, PD_GY * ROOM_SPACING);
+    } else if (r == 18) {                /* the exit room */
+        pdState = PD_EXIT;
+        pdRegionOrigin(PD_EXIT, &ox, &oz);
+        pdPlacePlayer(ox - 400.0f, oz);
+    } else if (r >= 19 && r <= 23) {     /* random exit to the facility */
+        leavePocketDimension(1);
+    } else if (r >= 24 && r <= 26) {     /* the fake HCZ tunnel */
+        pdState = PD_FAKETUNNEL;
+        pdRegionOrigin(PD_FOURWAY, &ox, &oz);
+        pdPlacePlayer(ox, oz + 1000.0f);
+    } else if (r >= 27 && r <= 30) {     /* the tower room */
+        pdState = PD_TOWER;
+        pdEventState = 15.0f;
+        pdRegionOrigin(PD_TOWER, &ox, &oz);
+        pdPlacePlayer(ox, oz);
+    } else if (r == 31) {                /* the labyrinth */
+        pdState = PD_LABYRINTH;
+        pdRegionOrigin(PD_LABYRINTH, &ox, &oz);
+        pdPlacePlayer(ox - 500.0f, oz - 500.0f);
+        npc106Pos[0] = ox + 500.0f;
+        npc106Pos[2] = oz + 500.0f;
+    } else {                             /* 32: exit back to SCP-005 */
+        leavePocketDimension(1);
+    }
+}
+
+/* SCP-106's orbit-and-lunge in the start room (shared by PD_StartRoom
+ * and used as its threat). Returns 1 if it caught the player. */
+static int pdOrbit106(float cx, float cz) {
+    if (!npc106Active || !skin106) return 0;
+    if (!pdLunging) {
+        pdCircle += 0.6f;
+        float a = pdCircle * 3.14159265f / 180.0f;
+        npc106Pos[0] = cx + sinf(a) * 950.0f;
+        npc106Pos[2] = cz + cosf(a) * 950.0f;
+        float o[3] = { npc106Pos[0], camPos[1] + 200.0f, npc106Pos[2] };
+        float hy;
+        npc106Pos[1] = rayDownWorld(o, 3000.0f, &hy) ? hy
+                                                     : camPos[1] - EYE_HEIGHT;
+        npc106Frame += 0.7f;
+        if (npc106Frame > 333.0f || npc106Frame < 284.0f) {
+            npc106Frame = 284.0f;
+        }
+        npc106YawDeg = -atan2f(camPos[0] - npc106Pos[0],
+                               camPos[2] - npc106Pos[2])
+                     * 180.0f / 3.14159265f + 180.0f;
+        /* After a long dwell (~70*65 frames) it may pounce. */
+        if (pdEventState > 4550.0f && rand() % 800 == 0) {
+            pdLunging = 1;
+            audioPlay(snd106Laugh, 1.0f, 0.0f);
+        }
+        return 0;
+    }
+    float dx = camPos[0] - npc106Pos[0];
+    float dz = camPos[2] - npc106Pos[2];
+    float d = sqrtf(dx * dx + dz * dz);
+    if (d < 150.0f) return 1;
+    if (d > 1.0f) {
+        npc106Pos[0] += dx / d * 40.0f;
+        npc106Pos[2] += dz / d * 40.0f;
+        npc106YawDeg = -atan2f(dx, dz) * 180.0f / 3.14159265f + 180.0f;
+    }
+    npc106Frame += 0.7f;
+    if (npc106Frame > 333.0f) npc106Frame = 284.0f;
+    return 0;
+}
+
+/* A slow relentless homing chase (tower / labyrinth), 106 walking
+ * toward the player at the given speed. */
+static void pdChase106(float speed) {
+    if (!npc106Active || !skin106) return;
+    float dx = camPos[0] - npc106Pos[0];
+    float dz = camPos[2] - npc106Pos[2];
+    float d = sqrtf(dx * dx + dz * dz);
+    if (d > 1.0f) {
+        npc106Pos[0] += dx / d * speed;
+        npc106Pos[2] += dz / d * speed;
+        npc106YawDeg = atan2f(dx, dz) * 180.0f / 3.14159265f;
+    }
+    float o[3] = { npc106Pos[0], npc106Pos[1] + 250.0f, npc106Pos[2] };
+    float hy;
+    if (rayDownWorld(o, 6000.0f, &hy)) npc106Pos[1] = hy;
+    npc106Frame += 0.7f;
+    if (npc106Frame > 333.0f) npc106Frame = 284.0f;
+}
+
+static void pdKill(const char *cause) {
+    snprintf(deathCause, sizeof(deathCause), "%s", cause);
+    audioPlay(sndPdExplode, 1.0f, 0.0f);
+    deathTimer = 180;
+    inPocket = 0;
+    audioLoopAmbience(-1, 0.0f);
+}
+
+/* Camera-pull toward a world point (the throne kneel): ease the yaw and
+ * pitch to look at it, harder as sanity falls. */
+static void pdLookAt(const float target[3], float rate) {
+    float dx = target[0] - camPos[0];
+    float dy = target[1] - camPos[1];
+    float dz = target[2] - camPos[2];
+    float wantYaw = -atan2f(dx, dz);
+    float horiz = sqrtf(dx * dx + dz * dz);
+    float wantPitch = -atan2f(dy, horiz);
+    float dyaw = wantYaw - camYaw;
+    while (dyaw > 3.14159265f) dyaw -= 6.2831853f;
+    while (dyaw < -3.14159265f) dyaw += 6.2831853f;
+    camYaw += dyaw * rate;
+    camPitch += (wantPitch - camPitch) * rate;
+}
+
 static void updatePocketDimension(void) {
     if (!inPocket || deathTimer > 0) return;
+    pdStateTimer += 1.0f;
     pocketTimer -= 1.0f;
     if (pocketTimer <= 0.0f) {
         leavePocketDimension(0);
         return;
     }
+    float bx = PD_GX * ROOM_SPACING, bz = PD_GY * ROOM_SPACING;
+    pdPillarsOn = 0;
+    pd106Hidden = !(pdState == PD_START || pdState == PD_TOWER
+                    || pdState == PD_LABYRINTH);
 
-    /* SCP-106 circles the start room (PD_StartRoom: it orbits until it
-     * lunges - after a while, or at random). */
-    float cx = PD_GX * ROOM_SPACING, cz = PD_GY * ROOM_SPACING;
-    if (npc106Active && skin106) {
-        if (!pdLunging) {
-            pdCircle += 0.6f;
-            float a = pdCircle * 3.14159265f / 180.0f;
-            npc106Pos[0] = cx + sinf(a) * 950.0f;
-            npc106Pos[2] = cz + cosf(a) * 950.0f;
-            float o[3] = { npc106Pos[0], camPos[1] + 200.0f, npc106Pos[2] };
-            float hy;
-            npc106Pos[1] = rayDownWorld(o, 3000.0f, &hy) ? hy
-                                                         : camPos[1]
-                                                           - EYE_HEIGHT;
-            npc106Frame += 0.7f;
-            if (npc106Frame > 333.0f || npc106Frame < 284.0f) {
-                npc106Frame = 284.0f;
+    switch (pdState) {
+        case PD_START: {
+            pdEventState += 1.0f;
+            if (pdOrbit106(bx, bz)) { pdKill("SCP-106"); return; }
+            /* Walking out past the tunnel ring shuffles the player to a
+             * random sub-room (EntityDistanceSquared > 1200*RoomScale). */
+            float dx = camPos[0] - bx, dz = camPos[2] - bz;
+            if (dx * dx + dz * dz > 1100.0f * 1100.0f) {
+                pdTeleportRandom(1 + rand() % 30);
             }
-            /* Face along the orbit toward the player. */
-            npc106YawDeg = -atan2f(camPos[0] - npc106Pos[0],
-                                   camPos[2] - npc106Pos[2])
-                         * 180.0f / 3.14159265f + 180.0f;
-            if (pocketTimer < 1500.0f || rand() % 1400 == 0) {
-                pdLunging = 1;
-                audioPlay(snd106Laugh, 1.0f, 0.0f);
+            break;
+        }
+        case PD_FOURWAY: {
+            pdEventState += 1.0f;
+            float ox, oz;
+            pdRegionOrigin(PD_FOURWAY, &ox, &oz);
+            /* Two flying pillars orbit and crush on contact. */
+            pdPillarsOn = pdPillarRT.ok;
+            if (pdPillarsOn) {
+                float t = pdEventState * 0.03f;
+                float sv = sinf(t * 1.6f) * 200.0f;
+                float cv = cosf(t * 0.8f) * 260.0f;
+                pdPillar[0][0] = ox + 700.0f + cv;
+                pdPillar[0][1] = 0.0f;
+                pdPillar[0][2] = oz + sv;
+                pdPillar[1][0] = ox + sv;
+                pdPillar[1][1] = 0.0f;
+                pdPillar[1][2] = oz + 700.0f + cv;
+                for (int i = 0; i < 2; i++) {
+                    float px = camPos[0] - pdPillar[i][0];
+                    float pz = camPos[2] - pdPillar[i][2];
+                    if (px * px + pz * pz < 220.0f * 220.0f) {
+                        float b = sqrtf(px * px + pz * pz);
+                        if (b > 1.0f) {
+                            camPos[0] += px / b * 200.0f;
+                            camPos[2] += pz / b * 200.0f;
+                        }
+                        pdKill("A FLYING PILLAR");
+                        return;
+                    }
+                }
             }
-        } else {
-            /* Lunge straight at the player; contact is fatal. */
+            /* Near the throne of eyes: kneel before it (throne room). */
+            float tx = bx, tz = bz + 8192.0f - 2848.0f;
+            float ddx = camPos[0] - tx, ddz = camPos[2] - tz;
+            if (ddx * ddx + ddz * ddz < 2000.0f * 2000.0f) {
+                pdState = PD_THRONE;
+                pdEventState = 0.0f;
+                pdStateTimer = 0.0f;
+                audioPlay(snd106Breath, 0.8f, 0.0f);
+                break;
+            }
+            /* Fell into a pit: to a random room if far from the centre,
+             * else killed by the fall (death 106_2). */
+            if (camPos[1] < -1600.0f) {
+                float fdx = camPos[0] - ox, fdz = camPos[2] - oz;
+                if (fdx * fdx + fdz * fdz > 4750.0f * 4750.0f) {
+                    pdTeleportRandom(14 + rand() % 17);
+                } else {
+                    pdKill("THE POCKET DIMENSION");
+                    return;
+                }
+            }
+            break;
+        }
+        case PD_THRONE: {
+            pdEventState += 1.0f;
+            float tx = bx, ty = 1376.0f, tz = bz + 8192.0f - 2848.0f;
+            float target[3] = { tx, ty, tz };
+            /* The throne drags the camera to it and drains sanity. */
+            pdLookAt(target, 0.06f);
+            injuries += 0.00025f;
+            sanity -= 0.25f;
+            if (sanity < -1000.0f) sanity = -1000.0f;
+            float ddx = camPos[0] - tx, ddz = camPos[2] - tz;
+            if (ddx * ddx + ddz * ddz >= 2000.0f * 2000.0f) {
+                pdState = PD_FOURWAY;
+                pdEventState = 0.0f;
+                break;
+            }
+            /* Crouch to kneel: dropped into the trenches. */
+            if (inputHit(ACTION_CROUCH)) {
+                float ox, oz;
+                pdRegionOrigin(PD_TRENCHES, &ox, &oz);
+                pdPlacePlayer(ox - 1344.0f, oz - 1184.0f);
+                pdState = PD_TRENCHES;
+                pdEventState = 0.0f;
+                pdStateTimer = 0.0f;
+                audioPlay(sndPdExplode, 0.8f, 0.0f);
+            }
+            break;
+        }
+        case PD_TRENCHES: {
+            /* The trench plane hunts the player across the flats. The
+             * plane mesh and its line-of-sight texture swap are not
+             * ported; approximated as a mounting dread that injures over
+             * time and shakes the view, with the sinkhole exit reached
+             * by walking to the low ground (or after a grace period). */
+            pdEventState += 1.0f;
+            injuries += 0.0003f;
+            camShake = 2.0f;
+            if (rand() % 200 == 0) {
+                audioPlay(snd106Corr[rand() % 3], 0.7f, 0.0f);
+            }
+            if (camPos[1] < -1600.0f || pdStateTimer > 2400.0f) {
+                camShake = 0.0f;
+                pdTeleportRandom(18);
+            }
+            break;
+        }
+        case PD_EXIT: {
+            pdEventState += 1.0f;
+            float ox, oz;
+            pdRegionOrigin(PD_EXIT, &ox, &oz);
+            /* The sinkhole exit: nearing it blurs the view, reaching it
+             * spits the player back into the facility (escape). */
+            float ex = ox + 1024.0f, ez = oz;
+            float dx = camPos[0] - ex, dz = camPos[2] - ez;
+            float d2 = dx * dx + dz * dz;
+            if (d2 < 640.0f * 640.0f) {
+                blinkTimer = 100.0f * (d2 / (640.0f * 640.0f));
+                if (d2 < 130.0f * 130.0f) {
+                    leavePocketDimension(1);
+                    return;
+                }
+            }
+            /* Wander off and it collapses into another shuffle. */
+            if (pdStateTimer > 3000.0f) pdTeleportRandom(19 + rand() % 5);
+            break;
+        }
+        case PD_FAKETUNNEL: {
+            /* A convincing fake HCZ corridor; opening a door or standing
+             * too long drops the floor away, back to the four-way room. */
+            pdEventState += 1.0f;
+            if (pdStateTimer == 1.0f) audioPlay(sndHorror11, 0.8f, 0.0f);
+            if (camPos[1] < -1600.0f || pdStateTimer > 1200.0f) {
+                pdTeleportRandom(6 + rand() % 8);
+            }
+            break;
+        }
+        case PD_TOWER: {
+            /* SCP-106 idols ring the tower and wake one by one; when the
+             * countdown runs out the real 106 attacks. Reaching the low
+             * exit shuffles the player onward. */
+            pdEventState -= 0.02f;
+            if (pdEventState > 12.0f) {
+                /* Idols dormant: 106 stands watch nearby. */
+                if (rand() % 750 == 0) {
+                    blinkFrames = 18;
+                    blinkTimer = 100.0f;
+                    audioPlay(snd106Laugh, 0.8f, 0.0f);
+                    pdEventState -= 1.0f;
+                }
+            } else {
+                pdChase106(46.0f);
+                float dx = camPos[0] - npc106Pos[0];
+                float dz = camPos[2] - npc106Pos[2];
+                if (dx * dx + dz * dz < 150.0f * 150.0f) {
+                    pdKill("SCP-106");
+                    return;
+                }
+            }
+            if (camPos[1] < -1600.0f || pdStateTimer > 2700.0f) {
+                pdTeleportRandom(12 + rand() % 17);
+            }
+            break;
+        }
+        case PD_LABYRINTH: {
+            /* The rockmoss maze: 106 hunts at triple speed. Break far
+             * enough from the centre and the dimension spits you out. */
+            pdEventState += 1.0f;
+            injuries += 0.0001f;
+            pdChase106(52.0f * 3.0f * 0.4f);
             float dx = camPos[0] - npc106Pos[0];
             float dz = camPos[2] - npc106Pos[2];
-            float d = sqrtf(dx * dx + dz * dz);
-            if (d < 150.0f) {
-                snprintf(deathCause, sizeof(deathCause), "SCP-106");
-                audioPlay(sndPdExplode, 1.0f, 0.0f);
-                deathTimer = 180;
-                inPocket = 0;
-                audioLoopAmbience(-1, 0.0f);
+            if (dx * dx + dz * dz < 150.0f * 150.0f) {
+                pdKill("SCP-106");
                 return;
             }
-            if (d > 1.0f) {
-                npc106Pos[0] += dx / d * 40.0f;
-                npc106Pos[2] += dz / d * 40.0f;
-                npc106YawDeg = -atan2f(dx, dz) * 180.0f / 3.14159265f
-                             + 180.0f;
+            float ox, oz;
+            pdRegionOrigin(PD_LABYRINTH, &ox, &oz);
+            float cdx = camPos[0] - ox, cdz = camPos[2] - oz;
+            if (cdx * cdx + cdz * cdz > 3678.0f * 3678.0f) {
+                pdTeleportRandom(32);
             }
-            npc106Frame += 0.7f;
-            if (npc106Frame > 333.0f) npc106Frame = 284.0f;
+            break;
         }
+        default:
+            break;
     }
-    /* The flying pillars orbit the room and crush on contact
-     * (PD_FourWayRoom: Sin/Cos wander + spin, lethal within reach). */
-    pdPillarsOn = pdPillarRT.ok;
-    if (pdPillarsOn) {
-        float t = (5400.0f - pocketTimer) * 0.03f;
-        float sv = sinf(t * 1.6f) * 200.0f;
-        float cv = cosf(t * 0.8f) * 260.0f;
-        pdPillar[0][0] = cx + 700.0f + cv;
-        pdPillar[0][1] = 0.0f;
-        pdPillar[0][2] = cz + sv;
-        pdPillar[1][0] = cx + sv;
-        pdPillar[1][1] = 0.0f;
-        pdPillar[1][2] = cz + 700.0f + cv;
-        for (int i = 0; i < 2; i++) {
-            float pdx = camPos[0] - pdPillar[i][0];
-            float pdz = camPos[2] - pdPillar[i][2];
-            if (pdx * pdx + pdz * pdz < 220.0f * 220.0f
-                && deathTimer == 0) {
-                /* Shoved and crushed (death 106_1). */
-                float b = sqrtf(pdx * pdx + pdz * pdz);
-                if (b > 1.0f) {
-                    camPos[0] += pdx / b * 200.0f;
-                    camPos[2] += pdz / b * 200.0f;
-                }
-                snprintf(deathCause, sizeof(deathCause),
-                         "A FLYING PILLAR");
-                audioPlay(sndPdExplode, 1.0f, 0.0f);
-                deathTimer = 180;
-                inPocket = 0;
-                audioLoopAmbience(-1, 0.0f);
-                return;
-            }
-        }
-    }
-
-    /* Exit at the far corner; reaching it escapes. */
-    float ex = PD_GX * ROOM_SPACING + 400.0f;
-    float ez = PD_GY * ROOM_SPACING + 400.0f;
-    float dx = camPos[0] - ex, dz = camPos[2] - ez;
-    if (dx * dx + dz * dz < 200.0f * 200.0f) {
-        leavePocketDimension(1);
-        return;
-    }
-    /* Fall out of the bottom: also collapses. */
-    if (camPos[1] < -4000.0f) leavePocketDimension(0);
+    /* Fall clean out of the world: collapse. */
+    if (inPocket && camPos[1] < -6000.0f) leavePocketDimension(0);
 }
 
 static void update106(void) {
@@ -3031,7 +3308,7 @@ static void drawPocketComposite(int alphaPass) {
 
 static void drawPocketPillars(void) {
     if (!inPocket || !pdPillarsOn || !pdPillarRT.ok) return;
-    float t = (5400.0f - pocketTimer) * 0.03f;
+    float t = pdEventState * 0.03f;
     for (int i = 0; i < 2; i++) {
         glPushMatrix();
         glTranslatef(pdPillar[i][0], pdPillar[i][1], pdPillar[i][2]);
@@ -3054,6 +3331,7 @@ static void drawPocketThrone(void) {
 
 static void draw106(const float viewPos[3]) {
     if (!npc106Active || !skin106 || npc106State == N106_DORMANT) return;
+    if (inPocket && pd106Hidden) return; /* absent from this sub-room */
     float dx = npc106Pos[0] - viewPos[0], dz = npc106Pos[2] - viewPos[2];
     if (dx * dx + dz * dz > VIEW_RANGE * VIEW_RANGE) return;
     GLuint *ibos = skinIBOsFor(skin106);
