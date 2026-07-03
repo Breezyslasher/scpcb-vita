@@ -53,6 +53,13 @@ typedef struct {
     int startX, startY; /* player spawn tile */
 } GeneratedMap;
 
+/* Zone band of a grid row, matching Math_Core.bb GetZone(): the top of
+ * the grid (high y) is LCZ, the bottom EZ. Returns the port's 1-based
+ * convention (1 = LCZ, 2 = HCZ, 3 = EZ) to line up with rooms.ini's
+ * Zone fields. This is a room's true zone (source r\Zone = GetZone(y)),
+ * not its template's declared Zone list. */
+int mapZoneOf(int gridY);
+
 /* Parse Data/rooms.ini. Returns 0 on I/O failure. */
 int templatesLoad(const char *iniPath, RoomTemplateList *out);
 void templatesFree(RoomTemplateList *list);

@@ -250,8 +250,13 @@ void doorsCollide(const DoorList *list, float pos[3], float radius) {
             lz = dz;
         }
 
-        /* One box across the whole doorway. */
-        if (fabsf(lx) >= 220.0f + radius) continue;
+        /* One box across the whole doorway. The big containment gate's
+         * two halves (contdoorleft/right, scaled 55) each reach ~244 raw
+         * from the centre, wider than the default door's ~203, so its
+         * closed box has to span further or the player slips past a shut
+         * gate's edges. */
+        float halfSpan = d->type == 3 ? 264.0f : 220.0f;
+        if (fabsf(lx) >= halfSpan + radius) continue;
         if (fabsf(lz) >= DOOR_PANEL_HALF_D + radius) continue;
         float push = (DOOR_PANEL_HALF_D + radius - fabsf(lz))
                    * (lz >= 0.0f ? 1.0f : -1.0f);
