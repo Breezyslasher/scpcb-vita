@@ -7130,6 +7130,48 @@ static int fixtureNearest(const float pos[3], int *type) {
     return bi;
 }
 
+/* Rooms whose lever/button drives a bespoke, unported subsystem rather
+ * than a door - they must not fall through to the generic door control:
+ *   cont1_106  the femur breaker + magnet (its own handler),
+ *   room2_nuke the Omega Warhead arming,
+ *   cont1_914  the SCP-914 refinement knob,
+ *   gate_a/b   the Gate A/B endings.
+ * Everything else (containment chambers, checkpoints, guard/server/
+ * storage rooms) uses its fixtures as door controls, which the port
+ * has. */
+static int fixtureDrivesDoor(const char *room) {
+    return strcmp(room, "cont1_106") != 0
+        && strcmp(room, "room2_nuke") != 0
+        && strcmp(room, "cont1_914") != 0
+        && strcmp(room, "gate_a") != 0
+        && strcmp(room, "gate_b") != 0;
+}
+
+/* Open/close the nearest door to a just-operated fixture within the same
+ * room (a wall control panel authorises the door, so any lock/keycard
+ * gives way). Returns the door, or NULL if none is in reach. */
+static Door *fixtureOperateDoor(const float fxPos[3], const float ear[3]) {
+    Door *best = NULL;
+    float bestD2 = 1400.0f * 1400.0f; /* within the room */
+    for (uint32_t i = 0; i < doors.count; i++) {
+        Door *d = &doors.items[i];
+        if (d->type == 1) continue; /* elevator cars ride, not toggle */
+        float dx = d->x - fxPos[0], dz = d->z - fxPos[2];
+        float dy = d->y - fxPos[1];
+        float d2 = dx * dx + dz * dz + dy * dy;
+        if (d2 < bestD2) { bestD2 = d2; best = d; }
+    }
+    if (!best) return NULL;
+    best->locked = 0;
+    best->open = !best->open;
+    float dpos[3] = { best->x, ear[1], best->z };
+    int v = rand() % 3;
+    int snd = best->heavy ? (best->open ? sndBigOpen[v] : sndBigClose[v])
+                          : (best->open ? sndDoorOpen[v] : sndDoorClose[v]);
+    audioPlay3D(snd, dpos, ear, camYaw, 2500.0f);
+    return best;
+}
+
 static GLuint hudBlinkIcon, hudBlinkBar, hudSprintIcon, hudStaminaBar;
 
 static void loadHudTextures(void) {
@@ -8560,9 +8602,20 @@ int main(void) {
                     lv->on = !lv->on;
                     float lp[3] = { lv->x, camPos[1], lv->z };
                     audioPlay3D(sndLever, lp, camPos, camYaw, 1200.0f);
-                    if (strcmp(roomNameAt(camPos), "cont1_106") == 0) {
+                    const char *rm = roomNameAt(camPos);
+                    if (strcmp(rm, "cont1_106") == 0) {
                         audioPlay(lv->on ? sndMagnetUp : sndMagnetDown,
                                   0.8f, 0.0f);
+                    } else if (fixtureDrivesDoor(rm)) {
+                        /* Containment/checkpoint/guard-room levers throw
+                         * their room's door (the ported subsystem). */
+                        float fp[3] = { lv->x, lv->y, lv->z };
+                        if (fixtureOperateDoor(fp, camPos)) {
+                            snprintf(toastMsg, sizeof(toastMsg),
+                                     lv->on ? "THE DOOR SLIDES OPEN"
+                                            : "THE DOOR SLIDES SHUT");
+                            toastTimer = 120;
+                        }
                     }
                 } else {
                     WorldButton *bt = &worldButtons[fx];
@@ -8571,14 +8624,14 @@ int main(void) {
                     audioPlay3D(bt->locked ? sndDoorLock
                                            : sndButton[rand() % 2],
                                 bp, camPos, camYaw, 1200.0f);
+                    const char *brm = roomNameAt(camPos);
                     if (bt->locked) {
                         snprintf(toastMsg, sizeof(toastMsg),
                                  "IT WON'T BUDGE");
                         toastTimer = 120;
                     } else if (!bt->btnId && femurTimer <= 0.0f
                                && !npc106Contained
-                               && strcmp(roomNameAt(camPos),
-                                         "cont1_106") == 0) {
+                               && strcmp(brm, "cont1_106") == 0) {
                         /* The femur breaker: the magnet (a chamber
                          * lever) must be engaged first (source: the
                          * button does nothing until EventState2). */
@@ -8605,6 +8658,16 @@ int main(void) {
                             snprintf(toastMsg, sizeof(toastMsg),
                                      "THE FEMUR BREAKER ACTIVATES...");
                             toastTimer = 200;
+                        }
+                    } else if (fixtureDrivesDoor(brm)) {
+                        /* A plain wall button throws its room's door. */
+                        float fp[3] = { bt->x, bt->y, bt->z };
+                        Door *od = fixtureOperateDoor(fp, camPos);
+                        if (od) {
+                            snprintf(toastMsg, sizeof(toastMsg),
+                                     od->open ? "THE DOOR SLIDES OPEN"
+                                              : "THE DOOR SLIDES SHUT");
+                            toastTimer = 120;
                         }
                     }
                 }
