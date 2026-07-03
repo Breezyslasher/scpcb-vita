@@ -405,6 +405,8 @@ static void generateAccessCodes(uint32_t seed) {
 /* FillRoom's room-internal doors (containment chambers, elevator
  * covers, locked service doors) from room_doors.h, placed with the
  * same transform as item spawns. */
+static void spawnRoomDecals(void); /* defined with the decal system */
+
 static void spawnRoomDoors(void) {
     const int N = (int)(sizeof(ROOM_DOORS) / sizeof(ROOM_DOORS[0]));
     for (uint32_t r = 0; r < map.roomCount; r++) {
