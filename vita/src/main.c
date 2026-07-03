@@ -1647,6 +1647,7 @@ static void removeInventoryByName(const char *name);
 static void spawn079(void);
 static void spawn895(void);
 static void spawn012(void);
+static void spawn372(void);
 
 static void regenerateMap(uint32_t seed) {
     memset(roomVisited, 0, sizeof(roomVisited));
@@ -1704,6 +1705,7 @@ static void regenerateMap(uint32_t seed) {
         spawn079();
         spawn895();
         spawn012();
+        spawn372();
         eventRng = mapSeed ^ 0xA5A5F00Du;
         spawnItems();
         spawnRoomDecals();
@@ -2328,6 +2330,20 @@ static float npc966YawDeg;
 static float npc966Frame;
 static float npc966Drowsy;      /* insomnia buildup / aggression */
 
+/* ---- SCP-372: the peripheral jumper (cont3_372). Invisible until it
+ * flits into view; centring it in your gaze makes it dart back to the
+ * edge of sight (UpdateNPCType372). ---- */
+static SkinnedMesh *skin372;
+static float skin372Scale = 1.0f;
+static GLuint vbo372;
+static int posed372;
+static int npc372Ok;            /* present in this map */
+static int npc372Idle;          /* 1 = hidden, 0 = flitting nearby */
+static float npc372Pos[3];
+static float npc372YawDeg;
+static float npc372Frame;
+static float npc372State;       /* remaining active duration */
+
 /* ---- SCP-1499-1: the hooded people of the mask dimension. They roam
  * and, once roused, converge and kill on contact (UpdateNPCType1499_1).
  * Shared walk phase, drawn per instance. ---- */
@@ -2431,6 +2447,12 @@ static void buildNpcAssets(void) {
         if (skin860) {
             skinnedBounds(skin860, mn, mx);
             if (mx[1] > mn[1]) skin860Scale = 320.0f / (mx[1] - mn[1]);
+        }
+        B3DModel *m372 = propModelGet("scp_372.b3d");
+        skin372 = m372 ? skinnedCreate(m372) : NULL;
+        if (skin372) {
+            skinnedBounds(skin372, mn, mx);
+            if (mx[1] > mn[1]) skin372Scale = 200.0f / (mx[1] - mn[1]);
         }
     }
     buildHumanRT(&introScientistRT, "class_d.b3d", "scientist.png");
@@ -6210,6 +6232,101 @@ static void draw860(const float viewPos[3]) {
                   npc860YawDeg);
 }
 
+/* ---- SCP-372: the peripheral jumper (cont3_372) ---- */
+
+static void spawn372(void) {
+    npc372Ok = 0;
+    npc372Idle = 1;
+    npc372State = 0.0f;
+    npc372Frame = 0.0f;
+    if (!skin372) return;
+    for (uint32_t r = 0; r < map.roomCount; r++) {
+        if (strcmp(tplList.items[map.rooms[r].templateIndex].name,
+                   "cont3_372") == 0) {
+            npc372Ok = 1;
+            break;
+        }
+    }
+    npc372Pos[0] = npc372Pos[1] = npc372Pos[2] = 0.0f;
+}
+
+/* UpdateNPCType372: idle and hidden, it now and then flits to a spot
+ * ~450 raw off to the player's side and lingers; while active it bobs and
+ * spins, but the instant you centre it in your gaze it darts back toward
+ * the edge of sight. Purely a startle - it never touches you. */
+static void update372(void) {
+    if (!npc372Ok || !skin372) return;
+    if (strcmp(roomNameAt(camPos), "cont3_372") != 0) {
+        npc372Idle = 1;
+        return;
+    }
+    if (npc372Idle) {
+        if ((rand() % 45) == 0) {
+            float ang = camYaw + (float)((rand() % 180) - 90) * 0.0174533f;
+            float dist = 400.0f + (float)(rand() % 130);
+            npc372Pos[0] = camPos[0] + sinf(ang) * dist;
+            npc372Pos[2] = camPos[2] - cosf(ang) * dist;
+            npc372Pos[1] = camPos[1] - EYE_HEIGHT * 0.4f;
+            npc372Idle = 0;
+            npc372State = 60.0f + (float)(rand() % 120);
+            if ((rand() % 4) == 0) {
+                audioPlay3D(sndRattle[rand() % 3], npc372Pos, camPos, camYaw,
+                            900.0f);
+            }
+        }
+        return;
+    }
+    /* Active: bob and advance the anim. */
+    npc372Frame += 3.0f;
+    if (npc372Frame > 300.0f) npc372Frame = 1.0f;
+    /* If the player centres it in view it darts to the periphery: cos of
+     * the angle between the view forward and the direction to it - beyond
+     * ~22 deg off-centre it stops fleeing and lingers at the edge of
+     * sight. */
+    float dx = npc372Pos[0] - camPos[0], dz = npc372Pos[2] - camPos[2];
+    float len = sqrtf(dx * dx + dz * dz);
+    if (len < 1.0f) len = 1.0f;
+    float fx = sinf(camYaw), fz = -cosf(camYaw);   /* view forward */
+    float cosang = (dx * fx + dz * fz) / len;
+    if (cosang > 0.927f) {
+        float rx = -fz, rz = fx;                    /* view right */
+        float s = (dx * rx + dz * rz >= 0.0f) ? 1.0f : -1.0f;
+        npc372Pos[0] += rx * s * 16.0f;             /* dart to that side */
+        npc372Pos[2] += rz * s * 16.0f;
+        if ((rand() % 30) == 0) {
+            audioPlay3D(sndRattle[rand() % 3], npc372Pos, camPos, camYaw,
+                        900.0f);
+        }
+    }
+    npc372State -= 0.8f;
+    if (npc372State <= 0.0f) npc372Idle = 1; /* vanishes */
+}
+
+static void draw372(const float viewPos[3]) {
+    if (!npc372Ok || npc372Idle || !skin372) return;
+    float dx = npc372Pos[0] - viewPos[0], dz = npc372Pos[2] - viewPos[2];
+    if (dx * dx + dz * dz > VIEW_RANGE * VIEW_RANGE) return;
+    GLuint *ibos = skinIBOsFor(skin372);
+    if (!ibos) return;
+    if (!vbo372) glGenBuffers(1, &vbo372);
+    static int poseTick;
+    if (!posed372 || ((poseTick++) & 1) == 0) {
+        skinnedEval(skin372, npc372Frame);
+        uint32_t vc;
+        const SceneVertex *v = skinnedVertices(skin372, &vc);
+        glBindBuffer(GL_ARRAY_BUFFER, vbo372);
+        glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)(vc * sizeof(SceneVertex)),
+                     v, GL_DYNAMIC_DRAW);
+        glBindBuffer(GL_ARRAY_BUFFER, 0);
+        posed372 = 1;
+    }
+    /* A slow spin, source-style (RotateEntity roll = MilliSec/5). */
+    float bob = sinf(gTick * 0.08f) * 12.0f;
+    float p[3] = { npc372Pos[0], npc372Pos[1] + 76.0f + bob, npc372Pos[2] };
+    drawSkinnedAt(skin372, vbo372, ibos, skin372Scale, p,
+                  (float)((gTick * 2) % 360));
+}
+
 /* ---------------- items and inventory ---------------- */
 
 /* Templates and per-room spawns generated from the Blitz sources by
@@ -9330,6 +9447,7 @@ int main(void) {
             update079();
             update895();
             update012();
+            update372();
             update173();
             update106();
             update096();
@@ -9622,6 +9740,7 @@ int main(void) {
             camerasDraw(camPos);
             draw079(camPos);
             draw895(camPos);
+            draw372(camPos);
             drawItems(camPos);
             draw173(camPos);
             draw106(camPos);
