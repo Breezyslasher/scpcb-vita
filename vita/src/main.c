@@ -1646,6 +1646,7 @@ static void reset860(void);
 static void removeInventoryByName(const char *name);
 static void spawn079(void);
 static void spawn895(void);
+static void spawn012(void);
 
 static void regenerateMap(uint32_t seed) {
     memset(roomVisited, 0, sizeof(roomVisited));
@@ -1702,6 +1703,7 @@ static void regenerateMap(uint32_t seed) {
         spawn860();
         spawn079();
         spawn895();
+        spawn012();
         eventRng = mapSeed ^ 0xA5A5F00Du;
         spawnItems();
         spawnRoomDecals();
@@ -2088,6 +2090,12 @@ static float scp895GuardYaw;  /* corpse yaw (room-facing) */
 static int scp895State;       /* 0 dread, 1 guard revealed/screaming */
 static float scp895Timer;
 static float scp895IdleT;     /* idle-murmur cadence */
+/* SCP-012 (cont2_012): "A Bad Composition". Standing at the score forces
+ * the eyes open and floods the screen with a bloody compulsion overlay. */
+static int scp012Ok;
+static float scp012Pos[3];    /* the score's world position */
+static GLuint scp012OvTex;    /* scp_012_overlay.png */
+static float scp012Comp;      /* 0..1 compulsion strength (drives overlay) */
 static char toastMsg[128];
 static int toastTimer;
 
@@ -2214,6 +2222,7 @@ static void buildDoorAssets(void) {
         snprintf(nm, sizeof(nm), "scp_079_overlay(%d).png", i + 1);
         scp079Ov[i] = textureGet(nm);
     }
+    scp012OvTex = textureGet("scp_012_overlay.png");
 }
 
 static void drawModelRT(const ModelRT *rt);
@@ -7587,6 +7596,51 @@ static void draw895(const float viewPos[3]) {
     glPopMatrix();
 }
 
+/* ---- SCP-012 (cont2_012): "A Bad Composition" ---- */
+
+static void spawn012(void) {
+    scp012Ok = 0;
+    scp012Comp = 0.0f;
+    for (uint32_t r = 0; r < map.roomCount; r++) {
+        const RoomPlacement *p = &map.rooms[r];
+        if (strcmp(tplList.items[p->templateIndex].name, "cont2_012") != 0) {
+            continue;
+        }
+        /* The score's display box (Objects[0]) - source local
+         * -360,-130,456. */
+        float local[3] = { -360.0f, -130.0f, 456.0f }, w[3];
+        localToWorld(p, local, w);
+        scp012Pos[0] = w[0]; scp012Pos[1] = w[1]; scp012Pos[2] = w[2];
+        scp012Ok = 1;
+        break;
+    }
+}
+
+/* Main_Core scribe_event: standing at the score (DistanceSquared < 0.36
+ * world = 0.6 world -> 153 raw) pins the eyes open and paints the bloody
+ * compulsion overlay, with a horror sting. Sanity bleeds while it holds
+ * you. The overlay itself is drawn in the HUD pass from scp012Comp. */
+static void update012(void) {
+    if (!scp012Ok) return;
+    float dx = camPos[0] - scp012Pos[0];
+    float dz = camPos[2] - scp012Pos[2];
+    int atScore = (dx * dx + dz * dz) < 153.0f * 153.0f;
+    if (atScore) {
+        if (scp012Comp < 0.02f && sndHorror11 >= 0) {
+            audioPlay(sndHorror11, 0.7f, 0.0f); /* HorrorSFX[11] */
+        }
+        blinkFrames = 0;               /* it forces the eyes open */
+        blinkTimer = 100.0f;
+        scp012Comp += 0.05f;
+        if (scp012Comp > 1.0f) scp012Comp = 1.0f;
+        sanity -= 0.15f;
+        if (sanity < -1000.0f) sanity = -1000.0f;
+    } else if (scp012Comp > 0.0f) {
+        scp012Comp -= 0.04f;
+        if (scp012Comp < 0.0f) scp012Comp = 0.0f;
+    }
+}
+
 static const ModelRT *buttonModelFor(int btnId) {
     switch (btnId) {
         case 1: return &buttonKeycardRT;
@@ -9275,6 +9329,7 @@ int main(void) {
             cameraCheckUpdate();
             update079();
             update895();
+            update012();
             update173();
             update106();
             update096();
@@ -9650,6 +9705,15 @@ int main(void) {
                 float jit = sinf(fpsFrames * 0.9f) * 0.05f * sv;
                 drawQuad(0, 0, SCREEN_W, SCREEN_H, 0, 0.0f, 0.05f, 0.03f,
                          sv * 0.5f + jit);
+            }
+            /* SCP-012 floods the view with its bloody compulsion overlay,
+             * jittering it about like the source (Rand offset per frame). */
+            if (scp012Comp > 0.01f && scp012OvTex) {
+                float jx = (float)(rand() % 80) - 40.0f;
+                float jy = (float)(rand() % 40) - 20.0f;
+                drawQuad(jx - 60.0f, jy - 60.0f, SCREEN_W + 120.0f,
+                         SCREEN_H + 120.0f, scp012OvTex, 1.0f, 1.0f, 1.0f,
+                         scp012Comp);
             }
         }
         if (haveData && walkMode && !invOpen && !pauseOpen) {
