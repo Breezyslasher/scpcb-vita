@@ -8,7 +8,7 @@ Updated as features land. States: **done** / **partial** / **missing**.
 | Feature | Status | Notes |
 | --- | --- | --- |
 | Map generation (CreateMap) | done | Hallway walk, shape/angle tables, forced iconic rooms, force-more-ROOM1 pass, 50-seed CI check |
-| Zones | partial | Everything generates as one LCZ-style zone; the source's LCZ/HCZ/EZ zone bands with checkpoint transitions and per-zone room pools are not split |
+| Zones | done | The grid is split into LCZ/HCZ/EZ bands by an exact port of Math_Core's GetZone(y), with the source's transition rows. Each band draws from its own room pool (rooms.ini Zone fields) and gets its forced iconic rooms (SetRoom queues per shape+zone: e.g. 173 in LCZ, nuke/MT/106 in HCZ, the gates/O5/cafeteria in EZ). Checkpoint rooms (room2_checkpoint_lcz_hcz / hcz_ez) are placed on the hallways that cross a band boundary. A room's runtime zone is its grid band (source r\Zone), so per-zone music, Tesla-gate variants and keycard placement all follow the band the room sits in |
 | Room loading | done | Incremental (mesh/collision, then textures, then VBOs), 5x5 prefetch ring |
 | Room ambience emitters | done | RMESH soundemitter entities loop the nearest in-range ambience per room |
 | Grid doors between rooms | done | Placement rules, dedup, keycard checkpoints |

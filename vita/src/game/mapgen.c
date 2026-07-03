@@ -154,12 +154,20 @@ void templatesFree(RoomTemplateList *list) {
 
 /* ---------------- generation ---------------- */
 
-/* Zone band for a grid row (Map_Core.bb 5620): the top of the grid
- * (high y) is LCZ (1), the bottom EZ (3). */
+/* Zone band for a grid row. Exact port of Math_Core.bb GetZone():
+ *   GetZone(y) = Min(Floor((GridSize - y) / GridSize * 3), 2)
+ * giving 0 = LCZ (high y) .. 2 = EZ (low y). Returned +1 so the port
+ * uses 1 = LCZ, 2 = HCZ, 3 = EZ, matching rooms.ini's Zone fields.
+ * The integer form (GRID - y) * 3 / GRID floors for y in 1..GRID. */
+int mapZoneOf(int y) {
+    int z = (GRID - y) * 3 / GRID;
+    if (z < 0) z = 0;
+    if (z > 2) z = 2;
+    return z + 1;
+}
+
 static int zoneOf(int y) {
-    if (y < GRID / 3 + 1) return 3;
-    if (y < (int)(GRID * (2.0 / 3.0))) return 2;
-    return 1;
+    return mapZoneOf(y);
 }
 
 static int templateInZone(const RoomTemplateInfo *t, int zone) {
@@ -447,7 +455,7 @@ int mapGenerate(const RoomTemplateList *templates, uint32_t seed,
     int roomAmount[SHAPE_COUNT][3];
     memset(roomAmount, 0, sizeof(roomAmount));
     for (y = GRID - 1; y >= 1; y--) {
-        int zi = 3 - zoneOf(y);
+        int zi = zoneOf(y) - 1;  /* 0 = LCZ, 1 = HCZ, 2 = EZ */
         for (x = 1; x <= GRID - 2; x++) {
             if (AT(grid, x, y) == TILE_NONE
                 || AT(grid, x, y) == TILE_CHECKPOINT) {

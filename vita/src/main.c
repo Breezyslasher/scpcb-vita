@@ -1243,16 +1243,18 @@ static const char *roomNameAt(const float pos[3]) {
     return "(void)";
 }
 
-/* Zone of the player's current room (rooms.ini Zone1: 1 LCZ, 2 HCZ,
- * 3 EZ), for per-zone music. Defaults to LCZ. */
+/* Zone of the player's current room (1 LCZ, 2 HCZ, 3 EZ), for per-zone
+ * music/spawns. Matches the source, where a room's zone is its grid band
+ * (r\Zone = GetZone(y)), not its template's declared Zone list - a room
+ * valid in several zones takes the zone of the band it was placed in.
+ * Defaults to LCZ. */
 static int zoneAt(const float pos[3]) {
     if (inIntroBounds(pos[0], pos[2])) return 1;
     int px = (int)floorf(pos[0] / ROOM_SPACING + 0.5f);
     int py = (int)floorf(pos[2] / ROOM_SPACING + 0.5f);
     for (uint32_t i = 0; i < map.roomCount; i++) {
         if (map.rooms[i].gridX == px && map.rooms[i].gridY == py) {
-            int z = tplList.items[map.rooms[i].templateIndex].zones[0];
-            return z >= 1 && z <= 3 ? z : 1;
+            return mapZoneOf(map.rooms[i].gridY);
         }
     }
     return 1;
@@ -6059,9 +6061,7 @@ static void spawnItems(void) {
     for (int k = 0; k < 3; k++) {
         for (uint32_t i = 0; i < map.roomCount; i++) {
             const RoomPlacement *p = &map.rooms[i];
-            int zone = (p->gridY < MAPGEN_GRID / 3 + 1) ? 3
-                     : (p->gridY < (int)(MAPGEN_GRID * (2.0 / 3.0))) ? 2 : 1;
-            if (zone != k + 1) continue;
+            if (mapZoneOf(p->gridY) != k + 1) continue;
             worldItemAdd(itemTplFind(zoneCard[k]),
                          p->gridX * ROOM_SPACING, 60.0f,
                          p->gridY * ROOM_SPACING);
