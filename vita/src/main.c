@@ -30,6 +30,7 @@
 #include "game/room_doors.h"
 #include "game/room_fixtures.h"
 #include "game/room_decals.h"
+#include "game/room_cameras.h"
 #include "game/mapgen.h"
 #include "input.h"
 #include "render/scene.h"
@@ -463,6 +464,52 @@ static WorldLever worldLevers[MAX_FIXTURES];
 static int worldLeverCount;
 static WorldButton worldButtons[MAX_FIXTURES];
 static int worldButtonCount;
+
+/* A security camera (CreateSecurityCam): a fixed base with a head that
+ * sweeps within +-turn or tracks the player, red light blinking. */
+typedef struct {
+    float x, y, z;      /* base world position (raw) */
+    float roomYaw;      /* base mount yaw (room angle) */
+    float yawBase;      /* head yaw centre (room angle + sc\Angle) */
+    float pitch;        /* head down-tilt (Pitch1) */
+    float turn;         /* sweep amplitude, 0 = static */
+    int follow;         /* track the player */
+    float currAngle;    /* animated sweep offset */
+    int dir;            /* sweep direction */
+    float headYaw, headPitch; /* animated head orientation (world) */
+} WorldCamera;
+
+#define MAX_CAMERAS 48
+static WorldCamera worldCameras[MAX_CAMERAS];
+static int worldCameraCount;
+
+static void spawnRoomCameras(void) {
+    worldCameraCount = 0;
+    const int NC = (int)(sizeof(ROOM_CAMERAS) / sizeof(ROOM_CAMERAS[0]));
+    for (uint32_t r = 0;
+         r < map.roomCount && worldCameraCount < MAX_CAMERAS; r++) {
+        const RoomPlacement *p = &map.rooms[r];
+        const char *nm = tplList.items[p->templateIndex].name;
+        float roomYaw = (float)(p->angle * 90);
+        for (int i = 0; i < NC && worldCameraCount < MAX_CAMERAS; i++) {
+            const RoomCameraDef *cd = &ROOM_CAMERAS[i];
+            if (strcmp(cd->room, nm) != 0) continue;
+            float local[3] = { cd->x, cd->y, cd->z }, w[3];
+            localToWorld(p, local, w);
+            WorldCamera *c = &worldCameras[worldCameraCount++];
+            c->x = w[0]; c->y = w[1]; c->z = w[2];
+            c->roomYaw = roomYaw;
+            c->yawBase = roomYaw + cd->angle;
+            c->pitch = cd->pitch;
+            c->turn = cd->turn;
+            c->follow = cd->follow;
+            c->currAngle = 0.0f;
+            c->dir = 0;
+            c->headYaw = c->yawBase;
+            c->headPitch = cd->pitch;
+        }
+    }
+}
 
 static void spawnRoomFixtures(void) {
     worldLeverCount = 0;
@@ -1629,6 +1676,7 @@ static void regenerateMap(uint32_t seed) {
         appendGateRooms();
         setupMaintenanceTunnel();
         spawnRoomFixtures();
+        spawnRoomCameras();
         spawnRoomEvents();
         teslaSpawn();
         spawn096();
@@ -1959,6 +2007,10 @@ static ModelRT oneSidedRT, door914RT;
 static ModelRT buttonRT, buttonKeycardRT;
 static ModelRT buttonKeypadRT, buttonScannerRT, buttonElevatorRT;
 static ModelRT leverBaseRT, leverHandleRT;
+/* Security cameras (CreateSecurityCam): a static base + a head that
+ * sweeps or tracks the player, its red light blinking. */
+static ModelRT camBaseRT, camHeadRT;
+static GLuint camHeadRedTex;
 /* SCP-106 rots the doors it passes (UpdateNPCType106 swaps the panel /
  * frame texture): Door01_Corrosive for sliding doors, containment for
  * heavy. Loaded with the door assets. */
@@ -2086,6 +2138,14 @@ static void buildDoorAssets(void) {
     doorCorrTex = textureGet("Door01_Corrosive.png");
     doorCorrHeavyTex = textureGet("containment_doors_Corrosive.png");
     teslaArcTex = textureGet("tesla_overlay.png");
+    /* Security cameras: base ScaleEntity 0.0015, head 0.01 (world), so
+     * *256 in raw. camera(1) is the default head texture, camera(2) the
+     * red-light one. */
+    buildModelRT(&camBaseRT, "CamBase.b3d", 0, 0, 0, NULL);
+    camBaseRT.scale[0] = camBaseRT.scale[1] = camBaseRT.scale[2] = 0.384f;
+    buildModelRT(&camHeadRT, "CamHead.b3d", 0, 0, 0, "camera(1).png");
+    camHeadRT.scale[0] = camHeadRT.scale[1] = camHeadRT.scale[2] = 2.56f;
+    camHeadRedTex = textureGet("camera(2).png");
 }
 
 static void drawModelRT(const ModelRT *rt);
@@ -7127,6 +7187,75 @@ static void drawDoors(const float viewPos[3]) {
     }
 }
 
+/* Shortest signed difference a-b, in (-180, 180]. */
+static float yawDelta(float a, float b) {
+    float d = a - b;
+    while (d > 180.0f) d -= 360.0f;
+    while (d < -180.0f) d += 360.0f;
+    return d;
+}
+
+/* Swivel/track the security-camera heads near the player (UpdateSecurity
+ * Cams): follow-cams point at the player, sweep-cams oscillate within
+ * +-Turn (0.2 deg/frame, reversing at +-Turn*1.3), the rest sit still. */
+static void camerasUpdate(void) {
+    for (int i = 0; i < worldCameraCount; i++) {
+        WorldCamera *c = &worldCameras[i];
+        float dx = camPos[0] - c->x, dz = camPos[2] - c->z;
+        if (dx * dx + dz * dz > VIEW_RANGE * VIEW_RANGE) continue;
+        if (c->follow) {
+            float dy = camPos[1] - (c->y - 21.0f);
+            float dist = sqrtf(dx * dx + dz * dz);
+            float tYaw = atan2f(dx, dz) * (180.0f / 3.14159265f);
+            float tPitch = -atan2f(dy, dist) * (180.0f / 3.14159265f);
+            c->headYaw += yawDelta(tYaw, c->headYaw) * 0.12f;
+            c->headPitch += (tPitch - c->headPitch) * 0.12f;
+        } else if (c->turn > 0.0f) {
+            if (!c->dir) {
+                c->currAngle += 0.2f;
+                if (c->currAngle > c->turn * 1.3f) c->dir = 1;
+            } else {
+                c->currAngle -= 0.2f;
+                if (c->currAngle < -c->turn * 1.3f) c->dir = 0;
+            }
+            float cl = c->currAngle;
+            if (cl > c->turn) cl = c->turn;
+            if (cl < -c->turn) cl = -c->turn;
+            c->headYaw = c->yawBase + cl;
+            c->headPitch = c->pitch;
+        } else {
+            c->headYaw = c->yawBase;
+            c->headPitch = c->pitch;
+        }
+    }
+}
+
+static void camerasDraw(const float viewPos[3]) {
+    /* Red light blinks: default texture for the first ~800 of every
+     * ~1350 ms (source MilliSec Mod 1350), red for the rest. At ~60 fps
+     * that is 48 of every 81 frames. */
+    int red = (int)(gTick % 81) >= 48;
+    for (int i = 0; i < worldCameraCount; i++) {
+        const WorldCamera *c = &worldCameras[i];
+        float dx = c->x - viewPos[0], dz = c->z - viewPos[2];
+        if (dx * dx + dz * dz > VIEW_RANGE * VIEW_RANGE) continue;
+
+        glPushMatrix();
+        glTranslatef(c->x, c->y, c->z);
+        glRotatef(-c->roomYaw, 0.0f, 1.0f, 0.0f);
+        drawModelRT(&camBaseRT);
+        glPopMatrix();
+
+        glPushMatrix();
+        glTranslatef(c->x, c->y - 21.0f, c->z); /* head sits below base */
+        glRotatef(-c->headYaw, 0.0f, 1.0f, 0.0f);
+        glRotatef(c->headPitch, 1.0f, 0.0f, 0.0f);
+        if (red) drawModelRTTinted(&camHeadRT, camHeadRedTex);
+        else drawModelRT(&camHeadRT);
+        glPopMatrix();
+    }
+}
+
 static const ModelRT *buttonModelFor(int btnId) {
     switch (btnId) {
         case 1: return &buttonKeycardRT;
@@ -8811,6 +8940,7 @@ int main(void) {
             blurAmount *= 0.88f;
             if (blurAmount < 0.02f) blurAmount = 0.0f;
             doorsUpdate(&doors);
+            camerasUpdate();
             update173();
             update106();
             update096();
@@ -9100,6 +9230,7 @@ int main(void) {
             decalsDraw();
             drawDoors(camPos);
             drawFixtures(camPos);
+            camerasDraw(camPos);
             drawItems(camPos);
             draw173(camPos);
             draw106(camPos);
