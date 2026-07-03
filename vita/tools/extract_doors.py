@@ -121,10 +121,20 @@ for li, line in enumerate(lines):
             locked = 1
         else:
             keycard = KEYCARDS.get(k, 0)
-    # Keypad-code doors (8th arg nonzero) cannot be opened without the
-    # code; the port treats them as locked until a keypad UI exists.
+    # Keypad-code doors (8th arg): keep which code they use so the
+    # keypad UI can check it (CODE_LOCKED never opens).
+    CODES = {"CODE_DR_HARP": 1, "CODE_DR_L": 2, "CODE_CONT1_035": 3,
+             "CODE_DR_MAYNARD": 4, "CODE_O5_COUNCIL": 5,
+             "CODE_MAINTENANCE_TUNNELS": 6, "CODE_DR_GEARS": 7}
+    code_id = 0
     if len(args) > 7 and args[7].strip() not in ("0", ""):
-        locked = 1
+        c = args[7].strip()
+        if c == "CODE_LOCKED":
+            locked = 1
+        else:
+            code_id = CODES.get(c, 0)
+            if code_id == 0:
+                locked = 1
     # Follow-up lines on the assigned door: `d\Locked = 1` locks it,
     # FreeEntity(d\Buttons[..]) removes its buttons.
     nobuttons = 0
@@ -138,7 +148,7 @@ for li, line in enumerate(lines):
                 nobuttons = 1
     for room in active:
         doors.append((room, x, y, z, ang % 360.0, is_open, dtype,
-                      keycard, locked, nobuttons))
+                      keycard, locked, nobuttons, code_id))
 
 
 def cf(v):
@@ -161,12 +171,15 @@ with open(OUT, "w") as f:
             "    float x, y, z;    /* room-local raw units */\n"
             "    float angleDeg;   /* Blitz yaw within the room */\n"
             "    unsigned char open, type, keycard, locked, nobuttons;\n"
+            "    unsigned char codeId; /* 1 harp 2 drL 3 035 4 maynard\n"
+            "                             5 o5 6 maintenance 7 gears */\n"
             "} RoomDoorDef;\n\n"
             "static const RoomDoorDef ROOM_DOORS[] = {\n")
-    for room, x, y, z, ang, is_open, dtype, keycard, locked, nob in doors:
-        f.write('    { "%s", %s, %s, %s, %s, %d, %d, %d, %d, %d },\n'
+    for (room, x, y, z, ang, is_open, dtype, keycard, locked, nob,
+         cid) in doors:
+        f.write('    { "%s", %s, %s, %s, %s, %d, %d, %d, %d, %d, %d },\n'
                 % (room, cf(x), cf(y), cf(z), cf(ang), 1 if is_open else 0,
-                   dtype, keycard, locked, nob))
+                   dtype, keycard, locked, nob, cid))
     f.write("};\n\n#endif\n")
 
 print("room doors:", len(doors))

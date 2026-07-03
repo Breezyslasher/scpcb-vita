@@ -34,6 +34,7 @@ static int addDoor(DoorList *list, float x, float z, int angle, int heavy,
     d->openState = open ? 180.0f : 0.0f;
     d->keycard = keycard;
     d->locked = 0;
+    d->code = 0;
     d->nobuttons = 0;
     d->denials = 0;
     return 1;
@@ -143,7 +144,7 @@ void doorsUpdate(DoorList *list) {
 
 int doorsAddInternal(DoorList *list, float x, float y, float z, int angle,
                      int type, int open, int keycard, int locked,
-                     int nobuttons) {
+                     int nobuttons, int code) {
     int heavy = type == 1 || type == 2 || type == 3;
     if (!addDoor(list, x, z, angle, heavy, open, keycard)) return 0;
     Door *d = &list->items[list->count - 1];
@@ -151,6 +152,7 @@ int doorsAddInternal(DoorList *list, float x, float y, float z, int angle,
     d->type = type;
     d->locked = locked;
     d->nobuttons = nobuttons;
+    d->code = code;
     return 1;
 }
 
@@ -209,6 +211,7 @@ DoorPressResult doorsPressButton(DoorList *list, const float pos[3],
     if (outDoor) *outDoor = best;
 
     if (best->locked) return DOOR_PRESS_LOCKED;
+    if (best->code > 0) return DOOR_PRESS_CODE;
     if (best->keycard > 0 && keycardLevel < best->keycard) {
         best->denials++;
         if (best->denials >= 3) {

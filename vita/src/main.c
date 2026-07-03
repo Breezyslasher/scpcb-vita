@@ -346,6 +346,33 @@ static void localToWorld(const RoomPlacement *p, const float l[3],
     w[2] = z + p->gridY * ROOM_SPACING;
 }
 
+/* Keypad access codes: the fixed ones from Map_Core plus the
+ * per-run set derived from Dr. Maynard's like InitNewGame (Maynard is
+ * 4 random digits; O5/maintenance/Gears are multiples mod 10000,
+ * bumped past 1000). Deterministic from the map seed so saves
+ * reproduce them. */
+static int accessCodes[8];
+
+static void generateAccessCodes(uint32_t seed) {
+    uint32_t h = seed * 2654435761u;
+    int maynard = 0;
+    for (int i = 0; i < 4; i++) {
+        maynard += (int)((h >> (i * 8)) % 10u) * (int)powf(10.0f, (float)i);
+    }
+    if (maynard == 7816 || maynard == 5731 || maynard == 2411) maynard++;
+    accessCodes[0] = 0;
+    accessCodes[1] = 7816;                    /* CODE_DR_HARP */
+    accessCodes[2] = 2411;                    /* CODE_DR_L */
+    accessCodes[3] = 5731;                    /* CODE_CONT1_035 */
+    accessCodes[4] = maynard;                 /* CODE_DR_MAYNARD */
+    accessCodes[5] = (maynard * 2) % 10000;   /* CODE_O5_COUNCIL */
+    if (accessCodes[5] < 1000) accessCodes[5] += 1000;
+    accessCodes[6] = (maynard * 3) % 10000;   /* CODE_MAINTENANCE_TUNNELS */
+    if (accessCodes[6] < 1000) accessCodes[6] += 1000;
+    accessCodes[7] = (maynard * 4) % 10000;   /* CODE_DR_GEARS */
+    if (accessCodes[7] < 1000) accessCodes[7] += 1000;
+}
+
 /* FillRoom's room-internal doors (containment chambers, elevator
  * covers, locked service doors) from room_doors.h, placed with the
  * same transform as item spawns. */
@@ -364,7 +391,8 @@ static void spawnRoomDoors(void) {
             a = ((a % 360) + 360) % 360;
             doorsAddInternal(&doors, w[0], w[1], w[2], a, rd->type,
                              rd->open, rd->keycard, rd->locked,
-                             rd->nobuttons);
+                             rd->nobuttons,
+                             rd->codeId ? accessCodes[rd->codeId] : 0);
         }
     }
 }
@@ -659,6 +687,7 @@ static void regenerateMap(uint32_t seed) {
     doorsFree(&doors);
     mapSeed = seed;
     if (mapGenerate(&tplList, mapSeed, &map)) {
+        generateAccessCodes(mapSeed);
         appendIntroRoom();
         doorsGenerate(&map, &tplList, mapSeed ^ 0x9E3779B9u, &doors);
         spawnRoomDoors();
@@ -1605,13 +1634,14 @@ static void introUpdate(void) {
             Door *d = &doors.items[i];
             if ((int)i == introGateDoor || d->open) continue;
             if (!inIntroBounds(d->x, d->z)) continue;
-            float dx = d->x - camPos[0], dz = d->z - camPos[2];
-            float near2 = 400.0f * 400.0f;
-            int nearDoor = dx * dx + dz * dz < near2;
-            if (!nearDoor && ulgrin) {
+            /* Only the escort opens doors (the source scripts each
+             * one); opening every door near the player let side doors
+             * open that never should. */
+            int nearDoor = 0;
+            if (ulgrin) {
                 float ux = INTRO_GX * ROOM_SPACING + ulgrin->x - d->x;
                 float uz = INTRO_GY * ROOM_SPACING + ulgrin->z - d->z;
-                nearDoor = ux * ux + uz * uz < near2;
+                nearDoor = ux * ux + uz * uz < 380.0f * 380.0f;
             }
             if (nearDoor) {
                 d->open = 1;
@@ -2231,6 +2261,11 @@ static void drawItems(const float viewPos[3]) {
 
 static int pauseOpen;
 static int pauseSel;
+/* Keypad code entry for keypad doors. */
+static int keypadOpen;
+static int keypadDoor = -1;   /* index into doors.items */
+static int keypadDigits[4];
+static int keypadPos;
 static uint32_t pendingSeed;
 
 /* 0 = main menu, 1 = playing. The world only exists after the first
@@ -4100,7 +4135,53 @@ int main(void) {
                 }
             }
         }
-        if (!pauseOpen && inputHit(ACTION_INVENTORY)) {
+        if (keypadOpen && !pauseOpen) {
+            menuPollTap();
+            /* D-pad: left/right pick a digit slot, up/down change it;
+             * X submits, Circle cancels; touch taps the number pad. */
+            if (inputHit(ACTION_LEAN_LEFT) && keypadPos > 0) keypadPos--;
+            if (inputHit(ACTION_LEAN_RIGHT) && keypadPos < 3) keypadPos++;
+            if (inputHit(ACTION_SAVE)) {
+                keypadDigits[keypadPos] = (keypadDigits[keypadPos] + 1) % 10;
+            }
+            if (inputDpadDownHit()) {
+                keypadDigits[keypadPos] = (keypadDigits[keypadPos] + 9) % 10;
+            }
+            if (menuTapped) {
+                float kx = SCREEN_W / 2.0f - 150.0f, ky = 160.0f;
+                for (int n = 0; n < 10; n++) {
+                    float bx = kx + (n % 5) * 60.0f, by = ky + 130.0f
+                             + (n / 5) * 58.0f;
+                    if (tapIn(bx, by, 52.0f, 50.0f)) {
+                        keypadDigits[keypadPos] = n;
+                        if (keypadPos < 3) keypadPos++;
+                    }
+                }
+                if (!tapIn(kx - 20.0f, ky - 20.0f, 340.0f, 320.0f)) {
+                    keypadOpen = 0;
+                }
+            }
+            if (inputHit(ACTION_INTERACT) && keypadDoor >= 0
+                && keypadDoor < (int)doors.count) {
+                Door *kd = &doors.items[keypadDoor];
+                int entered = keypadDigits[0] * 1000 + keypadDigits[1] * 100
+                            + keypadDigits[2] * 10 + keypadDigits[3];
+                if (entered == kd->code) {
+                    kd->code = 0; /* unlocked for good */
+                    kd->open = 1;
+                    keypadOpen = 0;
+                    audioPlay(sndKeycardUse[rand() % 2], 0.9f, 0.0f);
+                    snprintf(toastMsg, sizeof(toastMsg), "ACCESS GRANTED");
+                    toastTimer = 120;
+                } else {
+                    audioPlay(sndDoorLock, 0.9f, 0.0f);
+                    snprintf(toastMsg, sizeof(toastMsg), "WRONG CODE");
+                    toastTimer = 120;
+                }
+            }
+            if (inputHit(ACTION_CROUCH)) keypadOpen = 0;
+        }
+        if (!pauseOpen && !keypadOpen && inputHit(ACTION_INVENTORY)) {
             invOpen = !invOpen;
             if (!invOpen) docOpen = 0;
         }
@@ -4145,7 +4226,8 @@ int main(void) {
         /* pausedAtFrameStart: a Cross that activated a menu entry this
          * frame must not also interact with the world. */
         if (haveData && !invOpen && !pauseOpen && !pausedAtFrameStart
-            && !introCameraLocked() && inputHit(ACTION_INTERACT)) {
+            && !keypadOpen && !introCameraLocked()
+            && inputHit(ACTION_INTERACT)) {
             int picked = itemPickupNearest(camPos);
             if (picked >= 0) {
                 snprintf(toastMsg, sizeof(toastMsg), "PICKED UP %s",
@@ -4183,6 +4265,14 @@ int main(void) {
                     snprintf(toastMsg, sizeof(toastMsg), "THE DOOR IS LOCKED");
                     toastTimer = 150;
                     audioPlay(sndDoorLock, 0.9f, 0.0f);
+                    break;
+                case DOOR_PRESS_CODE:
+                    keypadOpen = 1;
+                    keypadDoor = (int)(pressed - doors.items);
+                    keypadDigits[0] = keypadDigits[1] = keypadDigits[2]
+                        = keypadDigits[3] = 0;
+                    keypadPos = 0;
+                    audioPlay(sndButton[rand() % 2], 0.9f, 0.0f);
                     break;
                 default:
                     break;
@@ -4232,7 +4322,8 @@ int main(void) {
 
         StickState look = inputLook();
         StickState move = inputMove();
-        if (invOpen || pauseOpen || deathTimer > 0 || introCameraLocked()) {
+        if (invOpen || pauseOpen || keypadOpen || deathTimer > 0
+            || introCameraLocked()) {
             /* Freeze the camera and player while a menu is open, the
              * death screen is playing, or the intro wake-up cinematic
              * drives the camera. */
@@ -4477,6 +4568,47 @@ int main(void) {
             } else {
                 drawInventory();
             }
+        }
+        if (keypadOpen && !pauseOpen) {
+            /* Keypad panel: code display, digit cursor, number pad. */
+            float kx = SCREEN_W / 2.0f - 150.0f, ky = 160.0f;
+            drawQuad(0, 0, SCREEN_W, SCREEN_H, 0, 0, 0, 0, 0.55f);
+            drawQuad(kx - 20, ky - 20, 340, 320, 0, 0.05f, 0.05f, 0.06f,
+                     0.95f);
+            drawQuad(kx - 20, ky - 20, 340, 2, 0, 0.6f, 0.6f, 0.6f, 1);
+            drawQuad(kx - 20, ky + 298, 340, 2, 0, 0.6f, 0.6f, 0.6f, 1);
+            for (int n = 0; n < 4; n++) {
+                float bx = kx + 20.0f + n * 70.0f;
+                int cur = n == keypadPos;
+                drawQuad(bx, ky, 56, 70, 0, cur ? 0.25f : 0.1f,
+                         cur ? 0.3f : 0.12f, cur ? 0.25f : 0.1f, 1.0f);
+                char dg[2] = { (char)('0' + keypadDigits[n]), 0 };
+                glPushMatrix();
+                glScalef(4.0f, 4.0f, 1.0f);
+                glColor4f(0.6f, 1.0f, 0.6f, 1.0f);
+                drawText((bx + 16.0f) / 4.0f, (ky + 18.0f) / 4.0f, dg);
+                glColor4f(1, 1, 1, 1);
+                glPopMatrix();
+            }
+            for (int n = 0; n < 10; n++) {
+                float bx = kx + (n % 5) * 60.0f, by = ky + 130.0f
+                         + (n / 5) * 58.0f;
+                drawQuad(bx, by, 52, 50, 0, 0.12f, 0.12f, 0.14f, 1.0f);
+                char dg[2] = { (char)('0' + n), 0 };
+                glPushMatrix();
+                glScalef(2.5f, 2.5f, 1.0f);
+                glColor4f(0.85f, 0.85f, 0.85f, 1.0f);
+                drawText((bx + 20.0f) / 2.5f, (by + 17.0f) / 2.5f, dg);
+                glColor4f(1, 1, 1, 1);
+                glPopMatrix();
+            }
+            glPushMatrix();
+            glScalef(1.5f, 1.5f, 1.0f);
+            glColor4f(0.6f, 0.6f, 0.6f, 1.0f);
+            drawText((kx - 10.0f) / 1.5f, (ky + 305.0f) / 1.5f,
+                     "dpad: digits   X: enter   O: cancel");
+            glColor4f(1, 1, 1, 1);
+            glPopMatrix();
         }
         if (pauseOpen) {
             drawPauseMenu();
