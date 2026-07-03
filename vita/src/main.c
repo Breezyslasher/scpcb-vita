@@ -1411,6 +1411,7 @@ typedef struct {
     const char *texOverride;
     float animStart, animEnd, animSpeed; /* frames, frames/game-tick */
     float frame;
+    SceneVertex *buf;    /* private posed copy (re-skinned at ~15 Hz) */
 } IntroHuman;
 
 static IntroHuman INTRO_HUMANS[8];
@@ -1448,20 +1449,27 @@ static void introPlaceHumans(void) {
             defs[i].skinScale = skinClassDScale;
         }
     }
+    /* Private pose buffers, allocated once per slot and reused (the
+     * roster is fixed, so slot i always maps to the same model). */
+    static SceneVertex *slotBuf[8];
     introHumanCount = 0;
     for (int i = 0; i < 8; i++) {
-        if (defs[i].skin || defs[i].rt->ok) {
-            INTRO_HUMANS[introHumanCount++] = defs[i];
+        if (!defs[i].skin && !defs[i].rt->ok) continue;
+        if (defs[i].skin) {
+            if (!slotBuf[i]) slotBuf[i] = skinnedNewBuffer(defs[i].skin);
+            defs[i].buf = slotBuf[i];
+            if (!defs[i].buf) defs[i].skin = NULL; /* static fallback */
+            else skinnedEvalInto(defs[i].skin, defs[i].frame, defs[i].buf);
         }
+        INTRO_HUMANS[introHumanCount++] = defs[i];
     }
 }
 
-/* Draw a posed skeleton with client arrays (the buffer changes every
- * frame, so VBOs would just be re-uploads). */
+/* Draw a posed skeleton with client arrays (the buffer changes, so
+ * VBOs would just be re-uploads). The pose itself is re-skinned on
+ * the caller's schedule, not per draw. */
 static void drawSkinnedHuman(IntroHuman *h) {
-    skinnedEval(h->skin, h->frame);
-    uint32_t vcount;
-    const SceneVertex *verts = skinnedVertices(h->skin, &vcount);
+    const SceneVertex *verts = h->buf;
     glBindBuffer(GL_ARRAY_BUFFER, 0);
     glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
     glVertexPointer(3, GL_FLOAT, sizeof(SceneVertex), &verts[0].x);
@@ -1492,10 +1500,15 @@ static void drawIntroHumans(const float viewPos[3]) {
         float dx = wx - viewPos[0], dz = wz - viewPos[2];
         if (dx * dx + dz * dz > VIEW_RANGE * VIEW_RANGE) continue;
 
-        /* Advance the idle loop. */
-        if (h->animSpeed > 0.0f) {
+        /* Advance the idle loop; re-skin staggered at ~15 Hz (the
+         * CPU skin of every figure every frame is what tanked the
+         * framerate). */
+        if (h->animSpeed > 0.0f && h->skin && h->buf) {
             h->frame += h->animSpeed;
             if (h->frame > h->animEnd) h->frame = h->animStart;
+            if (((introTimer + i) & 3) == 0) {
+                skinnedEvalInto(h->skin, h->frame, h->buf);
+            }
         }
 
         glPushMatrix();

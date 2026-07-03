@@ -37,6 +37,11 @@ void skinnedBounds(const SkinnedMesh *s, float mn[3], float mx[3]);
 void skinnedEval(SkinnedMesh *s, float frame);
 
 const SceneVertex *skinnedVertices(const SkinnedMesh *s, uint32_t *count);
+
+/* Private per-instance buffer (a copy of the template, so several
+ * figures can share one skeleton and re-pose on their own schedule). */
+SceneVertex *skinnedNewBuffer(const SkinnedMesh *s);
+void skinnedEvalInto(SkinnedMesh *s, float frame, SceneVertex *out);
 uint32_t skinnedBatchCount(const SkinnedMesh *s);
 const SkinBatch *skinnedBatch(const SkinnedMesh *s, uint32_t i);
 
