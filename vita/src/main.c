@@ -492,6 +492,7 @@ static void spawnRoomCameras(void) {
     worldCameraCount = 0;
     camCheckTimer = 0.0f;
     camCheckSpotted = 0;
+    leftFirstZone = 0;
     const int NC = (int)(sizeof(ROOM_CAMERAS) / sizeof(ROOM_CAMERAS[0]));
     for (uint32_t r = 0;
          r < map.roomCount && worldCameraCount < MAX_CAMERAS; r++) {
@@ -2076,6 +2077,10 @@ static GLuint monFeedTex;
 static int monFeedCam = -1;   /* worldCameras index the feed shows */
 static float monFeedTick;
 static int monFeedActive;     /* a feed was captured this frame */
+/* SCP-895 CoffinEffect / SCP-079 broadcast: once the player leaves the
+ * first zone, SCP-079 broadcasts SCP-895's coffin feed onto the monitors
+ * (source CoffinEffect 2/3), scrambling them red. */
+static int leftFirstZone;
 /* SCP-106 rots the doors it passes (UpdateNPCType106 swaps the panel /
  * frame texture): Door01_Corrosive for sliding doors, containment for
  * heavy. Loaded with the door assets. */
@@ -7508,6 +7513,8 @@ static void camerasDraw(const float viewPos[3]) {
 
 static void cameraCheckUpdate(void) {
     if (!worldReady) return;
+    /* SCP-079 begins broadcasting SCP-895's feed once you clear the LCZ. */
+    if (zoneAt(camPos) >= 2) leftFirstZone = 1;
     if (camCheckTimer <= 0.0f) {
         if ((rand() % 10800) == 0) {  /* ~1 sweep per 3 min */
             camCheckTimer = 1.0f;
@@ -7637,6 +7644,7 @@ static void drawMonitors(const float viewPos[3]) {
         glPopMatrix();
 
         int lit = (i == monFeedCam && monFeedActive && monFeedTex);
+        int broadcast = leftFirstZone && scp895Ok;
         glPushMatrix();
         glTranslatef(c->mx, c->my, c->mz);
         glRotatef(-c->myaw, 0.0f, 1.0f, 0.0f);
@@ -7649,13 +7657,23 @@ static void drawMonitors(const float viewPos[3]) {
             -62.0f,  46.0f, 0.0f,  62.0f, -46.0f, 0.0f, -62.0f, -46.0f, 0.0f,
         };
         if (lit) {
-            /* The capture is bottom-up; flip V. */
-            static const GLfloat uv[12] = { 0,1, 1,1, 1,0, 0,1, 1,0, 0,0 };
+            /* The capture is bottom-up; flip V. Under the SCP-895/079
+             * broadcast the feed jitters and bleeds red. */
+            float j = broadcast ? ((rand() % 20) - 10) / 100.0f : 0.0f;
+            GLfloat uv[12] = { 0, 1 + j, 1, 1 + j, 1, j,
+                               0, 1 + j, 1, j, 0, j };
             glEnable(GL_TEXTURE_2D);
             glBindTexture(GL_TEXTURE_2D, monFeedTex);
             glEnableClientState(GL_TEXTURE_COORD_ARRAY);
             glTexCoordPointer(2, GL_FLOAT, 0, uv);
-            glColor4f(1.0f, 1.0f, 1.0f, 1.0f);
+            if (broadcast) glColor4f(1.0f, 0.35f, 0.3f, 1.0f);
+            else glColor4f(1.0f, 1.0f, 1.0f, 1.0f);
+        } else if (broadcast) {
+            /* No live feed here, but the broadcast still scrambles it:
+             * a flickering red static. */
+            glDisable(GL_TEXTURE_2D);
+            float f = 0.15f + (rand() % 40) / 100.0f;
+            glColor4f(f, 0.02f, 0.02f, 1.0f);
         } else {
             glDisable(GL_TEXTURE_2D);
             glColor4f(0.02f, 0.03f, 0.05f, 1.0f);
