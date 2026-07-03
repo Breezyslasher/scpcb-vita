@@ -1326,7 +1326,7 @@ static int introHumanCount;
 /* The escort route from the cell block to the chamber gate, BFS'd
  * over the intro mesh floors (room-local raw units). */
 static const float ESCORT_WP[][2] = {
-    { -4264.0f, 856.0f },  { -7976.0f, 856.0f },  { -7976.0f, 280.0f },
+    { -4300.0f, 856.0f },  { -7976.0f, 856.0f },  { -7976.0f, 280.0f },
     { -7912.0f, 280.0f },  { -7912.0f, -872.0f }, { -7720.0f, -872.0f },
     { -7720.0f, -1064.0f },{ -6568.0f, -1064.0f },{ -6568.0f, -1192.0f },
     { -1064.0f, -1192.0f },{ -1064.0f, -936.0f }, { -808.0f, -936.0f },
@@ -1716,21 +1716,24 @@ static void introPlaceHumans(void) {
      * frame like SetNPCFrame(182). */
     IntroHuman defs[8] = {
         /* Positions from UpdateIntro (block corridor floor y=0). The
-         * guard idle (77-201) is authored very subtle; it plays at
-         * 2x so the breathing/shift reads on a small screen. */
-        { &introGuardRT, -4205.0f, 0.0f, 870.0f, 180.0f,
+         * standing yaws face the cells like the original (the draw
+         * convention showed their backs before). Ulgrin waits right
+         * across from the player's cell door. The guard idle (77-201)
+         * is authored very subtle; it plays at 2x so the
+         * breathing/shift reads on a small screen. */
+        { &introGuardRT, -4130.0f, 0.0f, 830.0f, 0.0f,
           NULL, 1, NULL, 77, 201, 0.4f, 77 },                /* Ulgrin */
-        { &introGuardRT, -3985.0f, 0.0f, 786.0f, 135.0f,
+        { &introGuardRT, -3985.0f, 0.0f, 786.0f, 315.0f,
           NULL, 1, NULL, 77, 201, 0.4f, 120 },
-        { &introGuardRT, -8064.0f, 0.0f, 1096.0f, 180.0f,
+        { &introGuardRT, -8064.0f, 0.0f, 1096.0f, 0.0f,
           NULL, 1, NULL, 77, 201, 0.4f, 160 },               /* radio guy */
-        { &introClassDRT, -3550.0f, 0.0f, 800.0f, 0.0f,
+        { &introClassDRT, -3550.0f, 0.0f, 800.0f, 180.0f,
           NULL, 1, NULL, 357, 381, 0.12f, 357 },             /* inmate */
-        { &introGuardRT, 328.0f, 480.0f, 1072.0f, 180.0f,
+        { &introGuardRT, 328.0f, 480.0f, 1072.0f, 0.0f,
           NULL, 1, NULL, 77, 201, 0.4f, 40 },                /* balcony */
-        { &introFranklinRT, -3424.0f, -100.0f, -2208.0f, 0.0f,
+        { &introFranklinRT, -3424.0f, -100.0f, -2208.0f, 180.0f,
           NULL, 1, "Franklin.png", 357, 381, 0.12f, 366 },
-        { &introScientistRT, -3073.0f, -315.0f, -2165.0f, 45.0f,
+        { &introScientistRT, -3073.0f, -315.0f, -2165.0f, 225.0f,
           NULL, 1, "scientist.png", 182, 182, 0.0f, 182 },
         { &introGuardRT, -4000.0f, 0.0f, 950.0f, 160.0f,
           NULL, 1, NULL, 77, 201, 0.4f, 90 },
