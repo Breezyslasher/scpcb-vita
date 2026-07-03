@@ -24,10 +24,13 @@ static void mMul(float out[16], const float a[16], const float b[16]) {
     memcpy(out, r, sizeof(r));
 }
 
-/* b3d stores w,x,y,z; mirroring LH Blitz space into our RH space
- * flips the X and Y axis components (same as scene.c). */
+/* b3d stores w,x,y,z. Unlike scene.c's static path (which flips x,y
+ * to mirror Blitz space), skinning uses the full conjugate (x,y,z
+ * flipped) for BOTH bind and key quaternions - what matters is that
+ * bind and animation agree, and this pairing poses the CB rigs
+ * correctly (verified against software renders of guard/class_d). */
 static void mFromQuat(float m[16], const float q[4]) {
-    float w = q[0], x = -q[1], y = -q[2], z = q[3];
+    float w = q[0], x = -q[1], y = -q[2], z = -q[3];
     float n = w * w + x * x + y * y + z * z;
     float s = n > 0.0f ? 2.0f / n : 0.0f;
     mIdentity(m);
@@ -387,6 +390,7 @@ static void animLocal(const B3DNode *n, float frame, float out[16]) {
     }
 
     float pos[3], scl[3], quat[4];
+    int quatFromKey = 0;
     memcpy(pos, n->position, sizeof(pos));
     memcpy(scl, n->scale, sizeof(scl));
     memcpy(quat, n->rotation, sizeof(quat));
@@ -422,14 +426,28 @@ static void animLocal(const B3DNode *n, float frame, float out[16]) {
         if (len2 > 1e-12f) {
             float inv = 1.0f / sqrtf(len2);
             for (int i = 0; i < 4; i++) quat[i] *= inv;
+            quatFromKey = 1;
         } else {
             memcpy(quat, n->rotation, sizeof(quat));
         }
     }
 
+    (void)quatFromKey;
     float rot[16];
     mFromQuat(rot, quat);
     mCompose(out, pos, rot, scl);
+}
+
+SceneVertex *skinnedNewBuffer(const SkinnedMesh *s) {
+    SceneVertex *buf = (SceneVertex *)malloc(
+        (size_t)s->vertCount * sizeof(SceneVertex));
+    if (buf) memcpy(buf, s->verts, (size_t)s->vertCount * sizeof(SceneVertex));
+    return buf;
+}
+
+void skinnedEvalInto(SkinnedMesh *s, float frame, SceneVertex *out) {
+    skinnedEval(s, frame);
+    memcpy(out, s->verts, (size_t)s->vertCount * sizeof(SceneVertex));
 }
 
 void skinnedEval(SkinnedMesh *s, float frame) {
