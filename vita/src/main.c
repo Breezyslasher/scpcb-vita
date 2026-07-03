@@ -591,6 +591,20 @@ static void appendIntroRoom(void) {
  * before the timer runs out. */
 #define PD_GX -16
 #define PD_GY -16
+/* SCP-1499's mask dimension: donning the mask exiles the player to
+ * dimension_1499 where its hooded people swarm; taking the mask off
+ * returns them. An off-grid room like the pocket dimension. */
+#define MASK_GX -16
+#define MASK_GY 16
+static int maskRoomIdx = -1;
+static int inMask;            /* wearing SCP-1499, in its dimension */
+static float maskReturn[4];   /* pre-mask pos + yaw */
+#define MAX_1499 6
+static float npc1499Pos[MAX_1499][3];
+static float npc1499Yaw[MAX_1499];
+static int npc1499Active[MAX_1499];
+static float npc1499Frame;    /* shared walk phase */
+static int npc1499Count;
 static int pdRoomIdx = -1;
 static int inPocket;          /* player is in the pocket dimension */
 static float pocketTimer;     /* frames until it collapses (death) */
@@ -786,6 +800,29 @@ static void appendPocketRoom(void) {
     pdRoomIdx = (int)map.roomCount;
     map.roomCount++;
     buildPocketComposite();
+}
+
+static void appendMaskRoom(void) {
+    maskRoomIdx = -1;
+    int tplIdx = -1;
+    for (uint32_t i = 0; i < tplList.count; i++) {
+        if (strcmp(tplList.items[i].name, "dimension_1499") == 0) {
+            tplIdx = (int)i;
+            break;
+        }
+    }
+    if (tplIdx < 0) return;
+    RoomPlacement *grown = (RoomPlacement *)realloc(
+        map.rooms, (map.roomCount + 1) * sizeof(RoomPlacement));
+    if (!grown) return;
+    map.rooms = grown;
+    RoomPlacement *p = &map.rooms[map.roomCount];
+    p->templateIndex = tplIdx;
+    p->gridX = MASK_GX;
+    p->gridY = MASK_GY;
+    p->angle = 0;
+    maskRoomIdx = (int)map.roomCount;
+    map.roomCount++;
 }
 
 /* Active set: placements within one cell of the player. */
@@ -1085,6 +1122,8 @@ static void regenerateMap(uint32_t seed) {
     currentMusicZone = -1;
     currentAmbienceId = 0;
     inPocket = 0;
+    inMask = 0;
+    npc1499Count = 0;
     pdLunging = 0;
     femurTimer = 0.0f;
     npc106Contained = 0;
@@ -1114,6 +1153,7 @@ static void regenerateMap(uint32_t seed) {
         generateAccessCodes(mapSeed);
         appendIntroRoom();
         appendPocketRoom();
+        appendMaskRoom();
         doorsGenerate(&map, &tplList, mapSeed ^ 0x9E3779B9u, &doors);
         spawnRoomDoors();
         spawnRoomFixtures();
@@ -1655,6 +1695,14 @@ static float npc966YawDeg;
 static float npc966Frame;
 static float npc966Drowsy;      /* insomnia buildup / aggression */
 
+/* ---- SCP-1499-1: the hooded people of the mask dimension. They roam
+ * and, once roused, converge and kill on contact (UpdateNPCType1499_1).
+ * Shared walk phase, drawn per instance. ---- */
+static SkinnedMesh *skin1499;
+static float skin1499Scale = 1.0f;
+static GLuint vbo1499;
+static int posed1499;
+
 static void buildHumanRT(ModelRT *rt, const char *model, const char *tex) {
     buildModelRT(rt, model, 0, 0, 0, tex);
     if (!rt->ok || !rt->scene) return;
@@ -1721,6 +1769,12 @@ static void buildNpcAssets(void) {
         if (skin966) {
             skinnedBounds(skin966, mn, mx);
             if (mx[1] > mn[1]) skin966Scale = 300.0f / (mx[1] - mn[1]);
+        }
+        B3DModel *m1499 = propModelGet("scp_1499_1.b3d");
+        skin1499 = m1499 ? skinnedCreate(m1499) : NULL;
+        if (skin1499) {
+            skinnedBounds(skin1499, mn, mx);
+            if (mx[1] > mn[1]) skin1499Scale = 285.0f / (mx[1] - mn[1]);
         }
     }
     buildHumanRT(&introScientistRT, "class_d.b3d", "scientist.png");
@@ -2138,7 +2192,8 @@ static void updateRoomEvents(void) {
 }
 
 static void update173(void) {
-    if (!npc173Active || deathTimer > 0 || !walkMode || inPocket) return;
+    if (!npc173Active || deathTimer > 0 || !walkMode || inPocket || inMask)
+        return;
     float dx = camPos[0] - npc173Pos[0];
     float dz = camPos[2] - npc173Pos[2];
     float dist = sqrtf(dx * dx + dz * dz);
@@ -3101,6 +3156,7 @@ static void draw096(const float viewPos[3]);
 static void draw049(const float viewPos[3]);
 static void draw939(const float viewPos[3]);
 static void draw966(const float viewPos[3]);
+static void draw1499(const float viewPos[3]);
 
 static void spawn106Near(void) {
     /* Behind the player, out of the cell if possible, on the floor. */
@@ -3822,7 +3878,7 @@ static void spawn096(void) {
  * contact. Looking away after the trigger does not stop it. */
 static void update096(void) {
     if (!npc096Active || !skin096 || deathTimer > 0 || !walkMode
-        || introPhase >= 0 || inPocket) {
+        || introPhase >= 0 || inPocket || inMask) {
         return;
     }
     float dx = camPos[0] - npc096Pos[0];
@@ -3999,7 +4055,7 @@ static void doctorStep(const float from[3], float speed, float out[3]) {
  * effects yet). Phases closer when far, like 173/106. */
 static void update049(void) {
     if (!npc049Active || !skin049 || deathTimer > 0 || !walkMode
-        || introPhase >= 0 || inPocket) {
+        || introPhase >= 0 || inPocket || inMask) {
         return;
     }
     float dx = camPos[0] - npc049Pos[0];
@@ -4111,7 +4167,7 @@ static void update049(void) {
  * down independently. */
 static void update0492(void) {
     if (!npc0492Count || !skin0492 || deathTimer > 0 || !walkMode
-        || introPhase >= 0 || inPocket) {
+        || introPhase >= 0 || inPocket || inMask) {
         return;
     }
     npc0492Frame += 0.5f;
@@ -4172,7 +4228,7 @@ static void spawn939(void) {
  * player barely registers. Enough bites kill. */
 static void update939(void) {
     if (!npc939Active || !skin939 || deathTimer > 0 || !walkMode
-        || introPhase >= 0 || inPocket) {
+        || introPhase >= 0 || inPocket || inMask) {
         return;
     }
     /* Only prowls its storage room. */
@@ -4294,7 +4350,7 @@ static void spawn966(void) {
  * it kills. The goggles are the counter - watched, it holds back. */
 static void update966(void) {
     if (!npc966Active || !skin966 || deathTimer > 0 || !walkMode
-        || introPhase >= 0 || inPocket) {
+        || introPhase >= 0 || inPocket || inMask) {
         return;
     }
     float dx = camPos[0] - npc966Pos[0];
@@ -4339,6 +4395,84 @@ static void update966(void) {
         snprintf(deathCause, sizeof(deathCause), "SCP-966");
         deathTimer = 180;
     }
+}
+
+/* ---- SCP-1499 mask dimension ---- */
+
+static void enterMaskDimension(void) {
+    if (maskRoomIdx < 0 || !skin1499) return;
+    maskReturn[0] = camPos[0];
+    maskReturn[1] = camPos[1];
+    maskReturn[2] = camPos[2];
+    maskReturn[3] = camYaw;
+    float ox = MASK_GX * ROOM_SPACING, oz = MASK_GY * ROOM_SPACING;
+    camPos[0] = ox;
+    camPos[2] = oz;
+    float o[3] = { ox, 1500.0f, oz };
+    float hy;
+    camPos[1] = (rayDownWorld(o, 3000.0f, &hy) ? hy : 0.0f) + EYE_HEIGHT;
+    velY = 0.0f;
+    inMask = 1;
+    blinkFrames = 20;
+    blinkTimer = 100.0f;
+    /* The hooded people ring the arrival point. */
+    npc1499Count = MAX_1499;
+    npc1499Frame = 2.0f;
+    for (int k = 0; k < npc1499Count; k++) {
+        float a = (float)k * (6.2831853f / (float)npc1499Count);
+        npc1499Pos[k][0] = ox + cosf(a) * 900.0f;
+        npc1499Pos[k][2] = oz + sinf(a) * 900.0f;
+        float o2[3] = { npc1499Pos[k][0], 1500.0f, npc1499Pos[k][2] };
+        float hy2;
+        npc1499Pos[k][1] = rayDownWorld(o2, 3000.0f, &hy2) ? hy2 : 0.0f;
+        npc1499Yaw[k] = 0.0f;
+        npc1499Active[k] = 1;
+    }
+    audioPlay(sndHorror11, 1.0f, 0.0f);
+}
+
+static void leaveMaskDimension(void) {
+    inMask = 0;
+    npc1499Count = 0;
+    for (int k = 0; k < MAX_1499; k++) npc1499Active[k] = 0;
+    camPos[0] = maskReturn[0];
+    camPos[1] = maskReturn[1];
+    camPos[2] = maskReturn[2];
+    camYaw = maskReturn[3];
+    velY = 0.0f;
+    blinkFrames = 16;
+    blinkTimer = 100.0f;
+}
+
+/* The people converge on the player and kill on contact; sanity bleeds
+ * the whole time. Taking the mask off (the item toggle) is the escape. */
+static void update1499(void) {
+    if (!inMask || deathTimer > 0) return;
+    npc1499Frame += 0.4f;
+    if (npc1499Frame > 214.0f) npc1499Frame = 2.0f;
+    for (int k = 0; k < npc1499Count; k++) {
+        if (!npc1499Active[k]) continue;
+        float dx = camPos[0] - npc1499Pos[k][0];
+        float dz = camPos[2] - npc1499Pos[k][2];
+        float d = sqrtf(dx * dx + dz * dz);
+        if (d < 200.0f) {
+            snprintf(deathCause, sizeof(deathCause),
+                     "THE PEOPLE OF SCP-1499");
+            deathTimer = 180;
+            return;
+        }
+        if (d > 1.0f) {
+            npc1499Pos[k][0] += dx / d * 20.0f;
+            npc1499Pos[k][2] += dz / d * 20.0f;
+            npc1499Yaw[k] = atan2f(dx, dz) * 180.0f / 3.14159265f;
+        }
+        float o[3] = { npc1499Pos[k][0], npc1499Pos[k][1] + 250.0f,
+                       npc1499Pos[k][2] };
+        float hy;
+        if (rayDownWorld(o, 600.0f, &hy)) npc1499Pos[k][1] = hy;
+    }
+    sanity -= 0.1f;
+    if (sanity < 0.0f) sanity = 0.0f;
 }
 
 /* ---- Tesla gates ---- */
@@ -4832,6 +4966,32 @@ static void draw966(const float viewPos[3]) {
                   npc966YawDeg);
 }
 
+static void draw1499(const float viewPos[3]) {
+    if (!inMask || !npc1499Count || !skin1499) return;
+    GLuint *ibos = skinIBOsFor(skin1499);
+    if (!ibos) return;
+    if (!vbo1499) glGenBuffers(1, &vbo1499);
+    static int poseTick;
+    if (!posed1499 || ((poseTick++) & 1) == 0) {
+        skinnedEval(skin1499, npc1499Frame);
+        uint32_t vc;
+        const SceneVertex *v = skinnedVertices(skin1499, &vc);
+        glBindBuffer(GL_ARRAY_BUFFER, vbo1499);
+        glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)(vc * sizeof(SceneVertex)),
+                     v, GL_DYNAMIC_DRAW);
+        glBindBuffer(GL_ARRAY_BUFFER, 0);
+        posed1499 = 1;
+    }
+    for (int k = 0; k < npc1499Count; k++) {
+        if (!npc1499Active[k]) continue;
+        float dx = npc1499Pos[k][0] - viewPos[0];
+        float dz = npc1499Pos[k][2] - viewPos[2];
+        if (dx * dx + dz * dz > VIEW_RANGE * VIEW_RANGE) continue;
+        drawSkinnedAt(skin1499, vbo1499, ibos, skin1499Scale, npc1499Pos[k],
+                      npc1499Yaw[k]);
+    }
+}
+
 /* ---------------- items and inventory ---------------- */
 
 /* Templates and per-room spawns generated from the Blitz sources by
@@ -5100,6 +5260,15 @@ static const char *useInventoryItem(int slot) {
         using714 = !using714;
         return using714 ? "YOU SLIP ON THE JADE RING. IT WARDS OFF SICKNESS"
                         : "YOU TAKE OFF THE JADE RING";
+    }
+    if (strcmp(name, "SCP-1499") == 0) {
+        if (inMask) {
+            leaveMaskDimension();
+            return "YOU TEAR THE MASK OFF. THE FACILITY RETURNS";
+        }
+        if (maskRoomIdx < 0 || !skin1499) return "AN OLD SOVIET GAS MASK";
+        enterMaskDimension();
+        return "YOU PULL ON THE MASK. THE WORLD DISSOLVES...";
     }
     return NULL;
 }
@@ -7495,6 +7664,7 @@ int main(void) {
             update0492();
             update939();
             update966();
+            update1499();
             introUpdate();
             if (introPhase < 0 && !inPocket) {
                 updateZoneMusic();
@@ -7564,6 +7734,8 @@ int main(void) {
                 reset049();
                 reset939();
                 npc966Drowsy = 0.0f;
+                inMask = 0;
+                npc1499Count = 0;
                 health = 100.0f;
                 injuries = 0.0f;
                 bloodloss = 0.0f;
@@ -7775,6 +7947,7 @@ int main(void) {
             draw049(camPos);
             draw939(camPos);
             draw966(camPos);
+            draw1499(camPos);
             drawArm682();
             drawTeslaArcs(camPos);
             drawPocketPillars();
