@@ -736,6 +736,9 @@ static int sndTeslaIdle = -1, sndTeslaWind = -1, sndTeslaShock = -1,
 static int sndCamCheck = -1, sndCamFound[2] = { -1, -1 }, sndCamNoFound = -1;
 /* SCP-079 speech (cont1_079 event). */
 static int snd079Speech = -1, snd079Refuse = -1;
+/* SCP-895 camera coffin (cont1_895): the slumped guard's idle murmur and
+ * scream. */
+static int snd895Idle[3] = { -1, -1, -1 }, snd895Scream[3] = { -1, -1, -1 };
 static GLuint teslaArcTex;
 static float teslaFlash;       /* white screen flash when it zaps nearby */
 
@@ -1642,6 +1645,7 @@ static void spawn860(void);
 static void reset860(void);
 static void removeInventoryByName(const char *name);
 static void spawn079(void);
+static void spawn895(void);
 
 static void regenerateMap(uint32_t seed) {
     memset(roomVisited, 0, sizeof(roomVisited));
@@ -1697,6 +1701,7 @@ static void regenerateMap(uint32_t seed) {
         spawn966();
         spawn860();
         spawn079();
+        spawn895();
         eventRng = mapSeed ^ 0xA5A5F00Du;
         spawnItems();
         spawnRoomDecals();
@@ -2023,6 +2028,12 @@ static void loadSounds(void) {
     sndCamNoFound = audioLoad(SFX_DIR "/Character/MTF/AnnouncCameraNoFound.ogg");
     snd079Speech = audioLoad(SFX_DIR "/SCP/079/Speech.ogg");
     snd079Refuse = audioLoad(SFX_DIR "/SCP/079/Refuse.ogg");
+    for (int i = 0; i < 3; i++) {
+        snprintf(p, sizeof(p), SFX_DIR "/Room/895Chamber/GuardIdle%d.ogg", i);
+        snd895Idle[i] = audioLoad(p);
+        snprintf(p, sizeof(p), SFX_DIR "/Room/895Chamber/GuardScream%d.ogg", i);
+        snd895Scream[i] = audioLoad(p);
+    }
     sndAmbience = audioLoad(SFX_DIR "/Ambient/Room ambience/rumble.ogg");
     audioLoopAmbience(sndAmbience, 0.30f);
 }
@@ -2069,6 +2080,14 @@ static float scp079Timer;     /* state timer (frames) */
 static int scp079OvFrame;     /* current flicker overlay 0..6 */
 static float scp079FlickT;    /* flicker cadence */
 static int scp079DocDone;     /* the document has been dropped */
+/* SCP-895 (cont1_895): the camera coffin. A dread aura fills the chamber
+ * and a slumped guard corpse is revealed on a close approach. */
+static int scp895Ok;
+static float scp895Coffin[3]; /* coffin trigger world position */
+static float scp895GuardYaw;  /* corpse yaw (room-facing) */
+static int scp895State;       /* 0 dread, 1 guard revealed/screaming */
+static float scp895Timer;
+static float scp895IdleT;     /* idle-murmur cadence */
 static char toastMsg[128];
 static int toastTimer;
 
@@ -7492,6 +7511,82 @@ static void draw079(const float viewPos[3]) {
     glEnableClientState(GL_COLOR_ARRAY);
 }
 
+/* ---- SCP-895 (cont1_895): the camera coffin ---- */
+
+static void spawn895(void) {
+    scp895Ok = 0;
+    scp895State = 0;
+    scp895Timer = 0.0f;
+    scp895IdleT = 0.0f;
+    for (uint32_t r = 0; r < map.roomCount; r++) {
+        const RoomPlacement *p = &map.rooms[r];
+        if (strcmp(tplList.items[p->templateIndex].name, "cont1_895") != 0) {
+            continue;
+        }
+        float local[3] = { 0.0f, -1532.0f, 2508.0f }, w[3];
+        localToWorld(p, local, w);
+        scp895Coffin[0] = w[0]; scp895Coffin[1] = w[1]; scp895Coffin[2] = w[2];
+        scp895GuardYaw = (float)(p->angle * 90) + 90.0f;
+        scp895Ok = 1;
+        break;
+    }
+}
+
+/* e_cont1_895: the coffin fills its chamber with dread (sanity bleeds,
+ * the view blurs, the trapped guard murmurs), and a close approach makes
+ * the slumped guard corpse lurch into view with a scream. The source's
+ * SCP-106 lure and the SCP-895 camera-feed amplification (CoffinEffect)
+ * need subsystems the port lacks and are left out. */
+static void update895(void) {
+    if (!scp895Ok) return;
+    float dx = camPos[0] - scp895Coffin[0];
+    float dy = camPos[1] - scp895Coffin[1];
+    float dz = camPos[2] - scp895Coffin[2];
+    float d2 = dx * dx + dy * dy + dz * dz;
+    if (d2 > 2200.0f * 2200.0f) return;   /* only inside the chamber */
+    float dist = sqrtf(d2);
+    float prox = 1.0f - dist / 2200.0f;
+    sanity -= 0.04f * prox;
+    if (sanity < -1000.0f) sanity = -1000.0f;
+    if (blurAmount < 0.28f * prox) blurAmount = 0.28f * prox;
+
+    if (scp895State == 0) {
+        scp895IdleT += 1.0f;
+        if (scp895IdleT > 280.0f) {
+            scp895IdleT = 0.0f;
+            audioPlay3D(snd895Idle[rand() % 3], scp895Coffin, camPos, camYaw,
+                        1800.0f);
+        }
+        if (dist < 520.0f) {
+            scp895State = 1;
+            scp895Timer = 0.0f;
+            audioPlay3D(snd895Scream[rand() % 3], scp895Coffin, camPos, camYaw,
+                        3000.0f);
+            if (sndHorror11 >= 0) audioPlay(sndHorror11, 0.7f, 0.0f);
+            if (camShake < 8.0f) camShake = 8.0f;
+            blurAmount = 0.7f;
+            snprintf(toastMsg, sizeof(toastMsg), "SCP-895");
+            toastTimer = 200;
+        }
+    } else {
+        scp895Timer += 1.0f;
+        if (blurAmount < 0.45f) blurAmount = 0.45f;
+        if (dist > 900.0f) scp895State = 0; /* re-arms if you back off */
+    }
+}
+
+static void draw895(const float viewPos[3]) {
+    if (!scp895Ok || scp895State == 0) return;
+    float dx = scp895Coffin[0] - viewPos[0], dz = scp895Coffin[2] - viewPos[2];
+    if (dx * dx + dz * dz > VIEW_RANGE * VIEW_RANGE) return;
+    glPushMatrix();
+    glTranslatef(scp895Coffin[0], scp895Coffin[1], scp895Coffin[2]);
+    glRotatef(-scp895GuardYaw, 0.0f, 1.0f, 0.0f);
+    glRotatef(80.0f, 1.0f, 0.0f, 0.0f); /* slumped over */
+    drawModelRT(&introGuardRT);
+    glPopMatrix();
+}
+
 static const ModelRT *buttonModelFor(int btnId) {
     switch (btnId) {
         case 1: return &buttonKeycardRT;
@@ -9179,6 +9274,7 @@ int main(void) {
             camerasUpdate();
             cameraCheckUpdate();
             update079();
+            update895();
             update173();
             update106();
             update096();
@@ -9470,6 +9566,7 @@ int main(void) {
             drawFixtures(camPos);
             camerasDraw(camPos);
             draw079(camPos);
+            draw895(camPos);
             drawItems(camPos);
             draw173(camPos);
             draw106(camPos);
