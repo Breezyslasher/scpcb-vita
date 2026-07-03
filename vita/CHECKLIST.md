@@ -70,7 +70,8 @@ Updated as features land. States: **done** / **partial** / **missing**.
 | SCP-173 | done | Freeze-on-sight, blink interplay, last-seen search, TeleportCloser, door opening, kill + camera wrench, horror stings, head tracking |
 | Skeletal animation engine | done | B3D BONE/KEYS/ANIM, CPU skin, VBO path |
 | Intro guards / Class-Ds | done | Source roster, idles, walking escort, gunfire enforcement |
-| SCP-106 | missing | Pocket dimension too |
+| SCP-106 | partial | Roaming hunter: dormant timer, spawns behind the player, pursues with corridor pathing + phase-behind teleport, corrosion/laugh/breathing cues, drag-under kill; no femur breaker / pocket dimension room |
+| SCP-682 | partial | Roar set-piece via the e_682_roar event (countdown + roar + camera shake); no roaming battle |
 | SCP-096, 049, 049-2, 939, 966, 860-1, 1499-1 | missing | |
 | Guards/MTF in gameplay | missing | Only intro figures |
 | NPC waypoint pathfinding | done | 173 BFS-routes through room cells/doorways toward the player and last-seen spot |

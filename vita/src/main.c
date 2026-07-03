@@ -806,6 +806,7 @@ static void spawnPlayer(void) {
 
 static void spawnRoomEvents(void);
 static void updateRoomEvents(void);
+static void reset106(void);
 
 static void regenerateMap(uint32_t seed) {
     memset(roomVisited, 0, sizeof(roomVisited));
@@ -836,6 +837,7 @@ static void regenerateMap(uint32_t seed) {
         eventRng = mapSeed ^ 0xA5A5F00Du;
         spawnItems();
         reset173();
+        reset106();
         snprintf(statusLine, sizeof(statusLine), "map seed %u: %u rooms %u doors",
                  mapSeed, map.roomCount, doors.count);
     } else {
@@ -1070,6 +1072,18 @@ static void loadSounds(void) {
         sndNeckSnap[i] = audioLoad(p);
     }
     sndStoneDrag = audioLoad(SFX_DIR "/SCP/173/StoneDrag.ogg");
+    for (int i = 0; i < 3; i++) {
+        snprintf(p, sizeof(p), SFX_DIR "/SCP/106/Corrosion%d.ogg", i);
+        snd106Corr[i] = audioLoad(p);
+        snprintf(p, sizeof(p), SFX_DIR "/SCP/106/WallDecay%d.ogg", i);
+        snd106Wall[i] = audioLoad(p);
+    }
+    for (int i = 0; i < 4; i++) {
+        snprintf(p, sizeof(p), SFX_DIR "/SCP/106/Decay%d.ogg", i);
+        snd106Decay[i] = audioLoad(p);
+    }
+    snd106Laugh = audioLoad(SFX_DIR "/SCP/106/Laugh.ogg");
+    snd106Breath = audioLoad(SFX_DIR "/SCP/106/Breathing.ogg");
     /* UpdateNPCType173: HorrorSFX[3..4] on spotting it, HorrorSFX
      * [1,2,9,10,12] on a very close encounter. */
     sndHorrorSpot[0] = audioLoad(SFX_DIR "/Horror/Horror3.ogg");
@@ -1205,6 +1219,23 @@ static ModelRT introGuardRT, introClassDRT, introScientistRT,
 static SkinnedMesh *skinGuard, *skinClassD;
 static float skinGuardScale = 1.0f, skinClassDScale = 1.0f;
 
+/* ---- SCP-106: a slow roaming hunter that spawns near the player,
+ * pursues, and drags them under on contact (UpdateNPCType106). ---- */
+static SkinnedMesh *skin106;
+static float skin106Scale = 1.0f;
+static GLuint vbo106;
+static int posed106;
+enum { N106_DORMANT = 0, N106_SPAWNING, N106_CHASING, N106_SINKING };
+static int npc106State;
+static int npc106Active;
+static float npc106Pos[3];
+static float npc106YawDeg;
+static float npc106Frame;
+static float npc106Timer;      /* dormant spawn countdown */
+static int npc106Cool;         /* teleport-behind cooldown */
+static int snd106Corr[3], snd106Wall[3], snd106Decay[4];
+static int snd106Laugh, snd106Breath;
+
 static void buildHumanRT(ModelRT *rt, const char *model, const char *tex) {
     buildModelRT(rt, model, 0, 0, 0, tex);
     if (!rt->ok || !rt->scene) return;
@@ -1234,6 +1265,12 @@ static void buildNpcAssets(void) {
         if (skinClassD) {
             skinnedBounds(skinClassD, mn, mx);
             if (mx[1] > mn[1]) skinClassDScale = 285.0f / (mx[1] - mn[1]);
+        }
+        B3DModel *m106 = propModelGet("scp_106.b3d");
+        skin106 = m106 ? skinnedCreate(m106) : NULL;
+        if (skin106) {
+            skinnedBounds(skin106, mn, mx);
+            if (mx[1] > mn[1]) skin106Scale = 300.0f / (mx[1] - mn[1]);
         }
     }
     buildHumanRT(&introScientistRT, "class_d.b3d", "scientist.png");
@@ -2412,6 +2449,118 @@ static void drawIntroHumans(const float viewPos[3]) {
     }
 }
 
+/* ---- SCP-106 ---- */
+static void draw106(const float viewPos[3]);
+
+static void spawn106Near(void) {
+    /* Behind the player, out of the cell if possible, on the floor. */
+    float fx = sinf(camYaw), fz = -cosf(camYaw);
+    float sx = camPos[0] - fx * 700.0f;
+    float sz = camPos[2] - fz * 700.0f;
+    if (!roomExistsAt(sx, sz)) { sx = camPos[0]; sz = camPos[2]; }
+    npc106Pos[0] = sx;
+    npc106Pos[2] = sz;
+    float o[3] = { sx, camPos[1] + 200.0f, sz };
+    float hy;
+    npc106Pos[1] = rayDownWorld(o, 3000.0f, &hy) ? hy : camPos[1] - EYE_HEIGHT;
+    npc106State = N106_SPAWNING;
+    npc106Frame = 111.0f;
+    audioPlay(snd106Decay[rand() % 4], 1.0f, 0.0f);
+}
+
+static void reset106(void) {
+    npc106Active = skin106 != NULL;
+    npc106State = N106_DORMANT;
+    /* First appearance a while into the run (source idles ~22000+
+     * frames; scaled down so it turns up within a session). */
+    npc106Timer = 3600.0f + (float)(rand() % 3000);
+    npc106Cool = 0;
+    posed106 = 0;
+    npc106Pos[1] = -5000.0f;
+}
+
+static void update106(void) {
+    if (!npc106Active || deathTimer > 0 || !walkMode || introPhase >= 0) {
+        return;
+    }
+    float dx = camPos[0] - npc106Pos[0];
+    float dz = camPos[2] - npc106Pos[2];
+    float dist = sqrtf(dx * dx + dz * dz);
+    float feetDy = fabsf((camPos[1] - EYE_HEIGHT) - npc106Pos[1]);
+    int sameLevel = feetDy < 260.0f;
+
+    switch (npc106State) {
+        case N106_DORMANT:
+            /* SCP-268 hides you; time still passes but no spawn. */
+            npc106Timer -= wear268 ? 0.3f : 1.0f;
+            if (npc106Timer <= 0.0f) spawn106Near();
+            break;
+        case N106_SPAWNING:
+            npc106Frame += 2.2f; /* rise anim 111..259 */
+            npc106YawDeg = atan2f(dx, dz) * 180.0f / 3.14159265f;
+            if (npc106Frame >= 259.0f) {
+                npc106State = N106_CHASING;
+                npc106Frame = 284.0f;
+                audioPlay(snd106Laugh, 0.9f, 0.0f);
+            }
+            break;
+        case N106_CHASING: {
+            /* Walk cycle 284..333. */
+            npc106Frame += 0.7f;
+            if (npc106Frame > 333.0f) npc106Frame = 284.0f;
+            if (dist < 150.0f && sameLevel) {
+                /* Caught: dragged under. */
+                snprintf(deathCause, sizeof(deathCause), "SCP-106");
+                audioPlay(snd106Laugh, 1.0f, 0.0f);
+                audioPlay(sndHorror11, 1.0f, 0.0f);
+                deathTimer = 180;
+                reset106();
+                return;
+            }
+            float ndx, ndz;
+            navDir(camPos[0], camPos[2], &ndx, &ndz);
+            if (ndx == 0.0f && ndz == 0.0f && dist > 1.0f) {
+                ndx = dx / dist;
+                ndz = dz / dist;
+            }
+            /* 106 is slow but relentless; it phases (no wall block). */
+            npc106Pos[0] += ndx * 52.0f;
+            npc106Pos[2] += ndz * 52.0f;
+            npc106YawDeg = atan2f(ndx, ndz) * 180.0f / 3.14159265f;
+            float o[3] = { npc106Pos[0], npc106Pos[1] + 250.0f, npc106Pos[2] };
+            float hy;
+            if (rayDownWorld(o, 600.0f, &hy)) npc106Pos[1] = hy;
+
+            /* Occasional corrosion/breathing cues. */
+            if (rand() % 180 == 0) {
+                audioPlay3D(snd106Corr[rand() % 3], npc106Pos, camPos,
+                            camYaw, 2200.0f);
+            }
+            if (dist < 500.0f && rand() % 120 == 0) {
+                audioPlay(snd106Breath, 0.6f, 0.0f);
+            }
+
+            /* Phase-behind: when far and unseen, jump to a cell nearer
+             * the player (the signature "it's suddenly right there"). */
+            if (npc106Cool > 0) npc106Cool--;
+            if (npc106Cool == 0 && dist > ROOM_SPACING * 1.8f) {
+                float wp[2];
+                if (navNextCell(npc106Pos[0], npc106Pos[2], camPos[0],
+                                camPos[2], wp)) {
+                    npc106Pos[0] = wp[0];
+                    npc106Pos[2] = wp[1];
+                    npc106Cool = 120;
+                }
+            }
+            /* Give up if the player breaks away for good. */
+            if (dist > ROOM_SPACING * 4.0f) reset106();
+            break;
+        }
+        default:
+            break;
+    }
+}
+
 static void draw173(const float viewPos[3]) {
     if (!npc173Active || !npc173RT.ok) return;
     float dx = npc173Pos[0] - viewPos[0], dz = npc173Pos[2] - viewPos[2];
@@ -2425,6 +2574,47 @@ static void draw173(const float viewPos[3]) {
      * OBJ2 with n\Angle). */
     glRotatef(npc173HeadYawDeg, 0.0f, 1.0f, 0.0f);
     drawModelRT(&npc173HeadRT);
+    glPopMatrix();
+}
+
+static void draw106(const float viewPos[3]) {
+    if (!npc106Active || !skin106 || npc106State == N106_DORMANT) return;
+    float dx = npc106Pos[0] - viewPos[0], dz = npc106Pos[2] - viewPos[2];
+    if (dx * dx + dz * dz > VIEW_RANGE * VIEW_RANGE) return;
+    GLuint *ibos = skinIBOsFor(skin106);
+    if (!ibos) return;
+    if (!vbo106) glGenBuffers(1, &vbo106);
+    /* Re-skin at ~30 Hz. */
+    static int poseTick;
+    if (!posed106 || ((poseTick++) & 1) == 0) {
+        skinnedEval(skin106, npc106Frame);
+        uint32_t vc;
+        const SceneVertex *verts = skinnedVertices(skin106, &vc);
+        glBindBuffer(GL_ARRAY_BUFFER, vbo106);
+        glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)(vc * sizeof(SceneVertex)),
+                     verts, GL_DYNAMIC_DRAW);
+        glBindBuffer(GL_ARRAY_BUFFER, 0);
+        posed106 = 1;
+    }
+    glPushMatrix();
+    glTranslatef(npc106Pos[0], npc106Pos[1], npc106Pos[2]);
+    glRotatef(-npc106YawDeg + 180.0f, 0.0f, 1.0f, 0.0f);
+    glScalef(skin106Scale, skin106Scale, skin106Scale);
+    glBindBuffer(GL_ARRAY_BUFFER, vbo106);
+    glVertexPointer(3, GL_FLOAT, sizeof(SceneVertex), VTX_OFF(x));
+    glColorPointer(4, GL_UNSIGNED_BYTE, sizeof(SceneVertex), VTX_OFF(r));
+    glTexCoordPointer(2, GL_FLOAT, sizeof(SceneVertex), VTX_OFF(du));
+    for (uint32_t b = 0; b < skinnedBatchCount(skin106); b++) {
+        const SkinBatch *batch = skinnedBatch(skin106, b);
+        GLuint tex = textureGet(batch->textureName);
+        if (tex) { glEnable(GL_TEXTURE_2D); glBindTexture(GL_TEXTURE_2D, tex); }
+        else glDisable(GL_TEXTURE_2D);
+        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, ibos[b]);
+        glDrawElements(GL_TRIANGLES, (GLsizei)batch->indexCount,
+                       GL_UNSIGNED_SHORT, NULL);
+    }
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
     glPopMatrix();
 }
 
@@ -4899,6 +5089,7 @@ int main(void) {
         if (haveData && !pauseOpen) {
             doorsUpdate(&doors);
             update173();
+            update106();
             introUpdate();
             if (introPhase < 0) {
                 updateZoneMusic();
@@ -5129,6 +5320,7 @@ int main(void) {
             drawFixtures(camPos);
             drawItems(camPos);
             draw173(camPos);
+            draw106(camPos);
             drawIntroHumans(camPos);
             glDisable(GL_CULL_FACE);
             for (int i = 0; i < activeCount; i++) {
