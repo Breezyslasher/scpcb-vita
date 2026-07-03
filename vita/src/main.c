@@ -1255,6 +1255,39 @@ static int sndIntroAttention = -1, sndIntroExitCell = -1;
 static int sndIntroEscort = -1, sndIntroDone = -1;
 static int sndIntroOff = -1, sndIntroVent = -1, sndIntroHorror = -1;
 static int sndIntroBreach = -1;
+static int sndEscortRefuse = -1, sndEscortPissed = -1, sndEscortKill = -1;
+static int sndGunshot[2] = { -1, -1 };
+
+typedef struct {
+    ModelRT *rt;         /* static fallback */
+    float x, y, z;       /* intro-room local, raw units */
+    float yawDeg;
+    SkinnedMesh *skin;   /* NULL = draw the static model */
+    float skinScale;
+    const char *texOverride;
+    float animStart, animEnd, animSpeed; /* frames, frames/game-tick */
+    float frame;
+    SceneVertex *buf;    /* private posed copy (re-skinned at ~15 Hz) */
+} IntroHuman;
+
+static IntroHuman INTRO_HUMANS[8];
+static int introHumanCount;
+
+/* The escort route from the cell block to the chamber gate, BFS'd
+ * over the intro mesh floors (room-local raw units). */
+static const float ESCORT_WP[][2] = {
+    { -4264.0f, 856.0f },  { -7976.0f, 856.0f },  { -7976.0f, 280.0f },
+    { -7912.0f, 280.0f },  { -7912.0f, -872.0f }, { -7720.0f, -872.0f },
+    { -7720.0f, -1064.0f },{ -6568.0f, -1064.0f },{ -6568.0f, -1192.0f },
+    { -1064.0f, -1192.0f },{ -1064.0f, -936.0f }, { -808.0f, -936.0f },
+    { -808.0f, -744.0f },  { 280.0f, -744.0f },   { 280.0f, 344.0f },
+};
+#define ESCORT_WP_COUNT (int)(sizeof(ESCORT_WP) / sizeof(ESCORT_WP[0]))
+static int escortWp;            /* current waypoint target */
+static int escortWalking;
+static int escortWarn;          /* 0 fine, 1 warned, 2 final, 3 firing */
+static int escortTimer;
+static int escortShotTick;
 
 static void introLocal(float out[2]) {
     out[0] = camPos[0] - INTRO_GX * ROOM_SPACING;
@@ -1275,6 +1308,19 @@ static void introStart(void) {
     sndIntroHorror = audioLoad(SFX_DIR "/Room/Intro/Horror.ogg");
     sndIntroBreach = audioLoad(SFX_DIR
                                "/Room/Intro/IA/Scripted/Announcement0.ogg");
+    sndEscortRefuse = audioLoad(SFX_DIR
+                                "/Room/Intro/Guard/Ulgrin/EscortRefuse0.ogg");
+    sndEscortPissed = audioLoad(
+        SFX_DIR "/Room/Intro/Guard/Ulgrin/EscortPissedOff0.ogg");
+    sndEscortKill = audioLoad(SFX_DIR
+                              "/Room/Intro/Guard/Ulgrin/EscortKill0.ogg");
+    sndGunshot[0] = audioLoad(SFX_DIR "/Character/Gunshot0.ogg");
+    sndGunshot[1] = audioLoad(SFX_DIR "/Character/Gunshot1.ogg");
+    escortWp = 0;
+    escortWalking = 0;
+    escortWarn = 0;
+    escortTimer = 0;
+    escortShotTick = 0;
 
     /* The chamber gate (BIG door at local 576,383). */
     introGateDoor = -1;
@@ -1319,15 +1365,114 @@ static void introUpdate(void) {
     float l[2];
     introLocal(l);
 
-    /* Doors along the escort route slide open as the player nears
-     * (they are locked, so buttons cannot derail the sequence). */
+    /* Ulgrin leads the way: he walks the route while the player keeps
+     * up, waits when they lag, and the guards open fire if they
+     * refuse to follow. */
+    IntroHuman *ulgrin =
+        introHumanCount > 0 && INTRO_HUMANS[0].rt == &introGuardRT
+            ? &INTRO_HUMANS[0]
+            : NULL;
+    if (ulgrin && introPhase >= 1 && introPhase <= 2) {
+        float pdx = camPos[0] - (INTRO_GX * ROOM_SPACING + ulgrin->x);
+        float pdz = camPos[2] - (INTRO_GY * ROOM_SPACING + ulgrin->z);
+        float pdist = sqrtf(pdx * pdx + pdz * pdz);
+
+        int walking = 0;
+        if (escortWp < ESCORT_WP_COUNT && pdist < 1400.0f) {
+            float tx = ESCORT_WP[escortWp][0], tz = ESCORT_WP[escortWp][1];
+            float dx = tx - ulgrin->x, dz = tz - ulgrin->z;
+            float d = sqrtf(dx * dx + dz * dz);
+            if (d < 48.0f) {
+                escortWp++;
+            } else {
+                float sp = 4.2f;
+                ulgrin->x += dx / d * sp;
+                ulgrin->z += dz / d * sp;
+                ulgrin->yawDeg = -atan2f(dx, dz) * 180.0f / 3.14159265f;
+                walking = 1;
+                /* Keep him on the floor. */
+                float o[3] = { INTRO_GX * ROOM_SPACING + ulgrin->x, 200.0f,
+                               INTRO_GY * ROOM_SPACING + ulgrin->z };
+                float hy;
+                if (rayDownWorld(o, 600.0f, &hy)) ulgrin->y = hy;
+            }
+        }
+        if (walking != escortWalking) {
+            escortWalking = walking;
+            /* Guard walk cycle 236-260, idle 77-201 (NPCs_AI). */
+            ulgrin->animStart = walking ? 236.0f : 77.0f;
+            ulgrin->animEnd = walking ? 260.0f : 201.0f;
+            ulgrin->animSpeed = walking ? 0.45f : 0.2f;
+            ulgrin->frame = ulgrin->animStart;
+        }
+        if (!walking && escortWp < ESCORT_WP_COUNT && pdist >= 1400.0f) {
+            /* Waiting on a straggler: face the player. */
+            ulgrin->yawDeg = -atan2f(pdx, pdz) * 180.0f / 3.14159265f;
+        }
+        if (escortWp >= ESCORT_WP_COUNT && introGateDoor >= 0
+            && !doors.items[introGateDoor].open && introPhase == 1) {
+            doors.items[introGateDoor].open = 1;
+        }
+
+        /* Refusing to follow gets you shot (EscortRefuse ->
+         * EscortPissedOff -> gunfire). */
+        if (pdist > 1700.0f) {
+            escortTimer++;
+            if (escortTimer == 240 && escortWarn == 0) {
+                escortWarn = 1;
+                audioPlay(sndEscortRefuse, 1.0f, 0.0f);
+                snprintf(toastMsg, sizeof(toastMsg),
+                         "FOLLOW THE ESCORT");
+                toastTimer = 180;
+            } else if (escortTimer == 480 && escortWarn == 1) {
+                escortWarn = 2;
+                audioPlay(sndEscortPissed, 1.0f, 0.0f);
+                snprintf(toastMsg, sizeof(toastMsg),
+                         "LAST WARNING - FOLLOW THE ESCORT");
+                toastTimer = 180;
+            } else if (escortTimer > 640) {
+                if (escortWarn == 2) {
+                    escortWarn = 3;
+                    audioPlay(sndEscortKill, 1.0f, 0.0f);
+                }
+                if (++escortShotTick >= 40 && deathTimer == 0) {
+                    escortShotTick = 0;
+                    audioPlay(sndGunshot[rand() % 2], 1.0f, 0.0f);
+                    health -= 34.0f;
+                    damageFlash = 0.7f;
+                    audioPlay(sndDamage[rand() % 4], 1.0f, 0.0f);
+                    if (health <= 0.0f) {
+                        health = 0.0f;
+                        snprintf(deathCause, sizeof(deathCause),
+                                 "THE GUARDS");
+                        deathTimer = 180;
+                    }
+                }
+            }
+        } else if (pdist < 1200.0f) {
+            escortWarn = 0;
+            escortTimer = 0;
+            escortShotTick = 0;
+        }
+    }
+
+    /* Doors along the escort route slide open as the player or the
+     * escort nears (they are locked, so buttons cannot derail the
+     * sequence). */
     if (introPhase >= 1) {
         for (uint32_t i = 0; i < doors.count; i++) {
             Door *d = &doors.items[i];
             if ((int)i == introGateDoor || d->open) continue;
             if (!inIntroBounds(d->x, d->z)) continue;
             float dx = d->x - camPos[0], dz = d->z - camPos[2];
-            if (dx * dx + dz * dz < 400.0f * 400.0f) {
+            float near2 = 400.0f * 400.0f;
+            int nearDoor = dx * dx + dz * dz < near2;
+            if (!nearDoor && ulgrin) {
+                float ux = INTRO_GX * ROOM_SPACING + ulgrin->x - d->x;
+                float uz = INTRO_GY * ROOM_SPACING + ulgrin->z - d->z;
+                nearDoor = ux * ux + uz * uz < near2;
+            }
+            if (nearDoor) {
                 d->open = 1;
                 float dpos[3] = { d->x, camPos[1], d->z };
                 audioPlay3D(sndDoorOpen[rand() % 3], dpos, camPos, camYaw,
@@ -1402,21 +1547,6 @@ static void introUpdate(void) {
 /* The intro's people (UpdateIntro's CreateNPC calls): the escort
  * guards outside the cell, inmates, the observation-room staff.
  * Static figures - the port has no NPC animation. */
-typedef struct {
-    ModelRT *rt;         /* static fallback */
-    float x, y, z;       /* intro-room local, raw units */
-    float yawDeg;
-    SkinnedMesh *skin;   /* NULL = draw the static model */
-    float skinScale;
-    const char *texOverride;
-    float animStart, animEnd, animSpeed; /* frames, frames/game-tick */
-    float frame;
-    SceneVertex *buf;    /* private posed copy (re-skinned at ~15 Hz) */
-} IntroHuman;
-
-static IntroHuman INTRO_HUMANS[8];
-static int introHumanCount;
-
 static void introPlaceHumans(void) {
     /* AnimateNPC idle loops: guard state 7 = 77..201 @0.2,
      * Class-D idle = 210..235 @0.1; the scientist sits at a fixed
