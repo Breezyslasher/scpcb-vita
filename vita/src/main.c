@@ -599,12 +599,17 @@ static void appendIntroRoom(void) {
 static int maskRoomIdx = -1;
 static int inMask;            /* wearing SCP-1499, in its dimension */
 static float maskReturn[4];   /* pre-mask pos + yaw */
-#define MAX_1499 6
+#define MAX_1499 8
 static float npc1499Pos[MAX_1499][3];
 static float npc1499Yaw[MAX_1499];
+static float npc1499Home[MAX_1499][3]; /* peaceful post / wander anchor */
+static int npc1499Type[MAX_1499];      /* 0 citizen 1 king-guard 2 king
+                                          3 front-guard */
 static int npc1499Active[MAX_1499];
-static float npc1499Frame;    /* shared walk phase */
+static float npc1499Frame;    /* shared walk/idle phase */
+static float npc1499KingFrame; /* the king's own (seated) phase */
 static int npc1499Count;
+static int mask1499Roused;    /* the congregation has turned hostile */
 static int pdRoomIdx = -1;
 static int inPocket;          /* player is in the pocket dimension */
 static float pocketTimer;     /* frames until it collapses (death) */
@@ -632,6 +637,8 @@ static int snd096Trigger = -1, snd096Scream = -1;
 static int snd049Breath = -1, snd049Horror = -1;
 static int snd049Spot[3] = { -1, -1, -1 }, snd049Search[3] = { -1, -1, -1 };
 static int snd939Attack[3] = { -1, -1, -1 }, snd939Horror = -1;
+static int snd1499Enter = -1, snd1499Exit = -1, snd1499Trig = -1;
+static int snd1499Idle[4] = { -1, -1, -1, -1 };
 
 /* Tesla gates (Events_Core e_tesla): the room2_tesla_* corridors have
  * an electrified gate at their centre that idles, charges, zaps and
@@ -1437,6 +1444,14 @@ static void loadSounds(void) {
         snprintf(p, sizeof(p), SFX_DIR "/SCP/939/0Attack%d.ogg", i);
         snd939Attack[i] = audioLoad(p);
     }
+    snd1499Enter = audioLoad(SFX_DIR "/SCP/1499/Enter.ogg");
+    snd1499Exit = audioLoad(SFX_DIR "/SCP/1499/Exit.ogg");
+    snd1499Trig = audioLoad(SFX_DIR "/SCP/1499/Triggered.ogg");
+    for (int i = 0; i < 4; i++) {
+        char p[128];
+        snprintf(p, sizeof(p), SFX_DIR "/SCP/1499/Idle%d.ogg", i);
+        snd1499Idle[i] = audioLoad(p);
+    }
     for (int i = 0; i < 3; i++) {
         char p[128];
         snprintf(p, sizeof(p), SFX_DIR "/SCP/049/Spotted%d.ogg", i);
@@ -1702,6 +1717,7 @@ static SkinnedMesh *skin1499;
 static float skin1499Scale = 1.0f;
 static GLuint vbo1499;
 static int posed1499;
+static GLuint tex1499King;      /* the king's distinct texture */
 
 static void buildHumanRT(ModelRT *rt, const char *model, const char *tex) {
     buildModelRT(rt, model, 0, 0, 0, tex);
@@ -1775,6 +1791,7 @@ static void buildNpcAssets(void) {
         if (skin1499) {
             skinnedBounds(skin1499, mn, mx);
             if (mx[1] > mn[1]) skin1499Scale = 285.0f / (mx[1] - mn[1]);
+            tex1499King = textureGet("scp_1499_1_king.png");
         }
     }
     buildHumanRT(&introScientistRT, "class_d.b3d", "scientist.png");
@@ -4399,6 +4416,21 @@ static void update966(void) {
 
 /* ---- SCP-1499 mask dimension ---- */
 
+/* Drop a congregation member on the floor at (x,z), recording its post. */
+static void mask1499Place(int k, float x, float z, int type, float yaw) {
+    npc1499Pos[k][0] = x;
+    npc1499Pos[k][2] = z;
+    float o[3] = { x, 3000.0f, z };
+    float hy;
+    npc1499Pos[k][1] = rayDownWorld(o, 6000.0f, &hy) ? hy : 0.0f;
+    npc1499Home[k][0] = npc1499Pos[k][0];
+    npc1499Home[k][1] = npc1499Pos[k][1];
+    npc1499Home[k][2] = npc1499Pos[k][2];
+    npc1499Type[k] = type;
+    npc1499Yaw[k] = yaw;
+    npc1499Active[k] = 1;
+}
+
 static void enterMaskDimension(void) {
     if (maskRoomIdx < 0 || !skin1499) return;
     maskReturn[0] = camPos[0];
@@ -4406,33 +4438,40 @@ static void enterMaskDimension(void) {
     maskReturn[2] = camPos[2];
     maskReturn[3] = camYaw;
     float ox = MASK_GX * ROOM_SPACING, oz = MASK_GY * ROOM_SPACING;
-    camPos[0] = ox;
-    camPos[2] = oz;
-    float o[3] = { ox, 1500.0f, oz };
+    /* Arrive in the nave, facing the altar (-x). */
+    camPos[0] = ox + 2200.0f;
+    camPos[2] = oz + 2380.0f;
+    float o[3] = { camPos[0], 2600.0f, camPos[2] };
     float hy;
-    camPos[1] = (rayDownWorld(o, 3000.0f, &hy) ? hy : 0.0f) + EYE_HEIGHT;
+    camPos[1] = (rayDownWorld(o, 5000.0f, &hy) ? hy : 0.0f) + EYE_HEIGHT;
+    camYaw = -1.5708f;
+    camPitch = 0.0f;
     velY = 0.0f;
     inMask = 1;
+    mask1499Roused = 0;
     blinkFrames = 20;
     blinkTimer = 100.0f;
-    /* The hooded people ring the arrival point. */
-    npc1499Count = MAX_1499;
-    npc1499Frame = 2.0f;
-    for (int k = 0; k < npc1499Count; k++) {
-        float a = (float)k * (6.2831853f / (float)npc1499Count);
-        npc1499Pos[k][0] = ox + cosf(a) * 900.0f;
-        npc1499Pos[k][2] = oz + sinf(a) * 900.0f;
-        float o2[3] = { npc1499Pos[k][0], 1500.0f, npc1499Pos[k][2] };
-        float hy2;
-        npc1499Pos[k][1] = rayDownWorld(o2, 3000.0f, &hy2) ? hy2 : 0.0f;
-        npc1499Yaw[k] = 0.0f;
-        npc1499Active[k] = 1;
+    npc1499Frame = 296.0f;
+    npc1499KingFrame = 509.0f;
+    npc1499Count = 0;
+    /* The congregation, at the source's church coordinates: the king on
+     * the altar, a guard beside him, two guards at the entrance. */
+    mask1499Place(npc1499Count++, ox - 1917.0f, oz + 2308.0f, 2, 90.0f);
+    mask1499Place(npc1499Count++, ox - 1917.0f, oz + 2052.0f, 1, 90.0f);
+    mask1499Place(npc1499Count++, ox + 4055.0f, oz + 1884.0f, 3, -90.0f);
+    mask1499Place(npc1499Count++, ox + 4055.0f, oz + 2876.0f, 3, -90.0f);
+    /* Wandering citizens throng the nave around the player. */
+    for (int c = 0; c < 4 && npc1499Count < MAX_1499; c++) {
+        float a = (float)c * 1.5708f + 0.4f;
+        mask1499Place(npc1499Count++, camPos[0] + cosf(a) * 750.0f,
+                      camPos[2] + sinf(a) * 750.0f, 0, 0.0f);
     }
-    audioPlay(sndHorror11, 1.0f, 0.0f);
+    audioPlay(snd1499Enter, 1.0f, 0.0f);
 }
 
 static void leaveMaskDimension(void) {
     inMask = 0;
+    mask1499Roused = 0;
     npc1499Count = 0;
     for (int k = 0; k < MAX_1499; k++) npc1499Active[k] = 0;
     camPos[0] = maskReturn[0];
@@ -4442,36 +4481,92 @@ static void leaveMaskDimension(void) {
     velY = 0.0f;
     blinkFrames = 16;
     blinkTimer = 100.0f;
+    audioPlay(snd1499Exit, 1.0f, 0.0f);
 }
 
-/* The people converge on the player and kill on contact; sanity bleeds
- * the whole time. Taking the mask off (the item toggle) is the escape. */
+/* The congregation starts peaceful - the king enthroned, guards on post,
+ * citizens milling and murmuring - until the player strays too near one
+ * of them; then the whole church turns and converges (the king watches
+ * from the altar). Contact kills; sanity bleeds throughout. Taking the
+ * mask off (the item toggle) is the escape. */
 static void update1499(void) {
     if (!inMask || deathTimer > 0) return;
-    npc1499Frame += 0.4f;
-    if (npc1499Frame > 214.0f) npc1499Frame = 2.0f;
+    /* Shared phase: idle shuffle when calm, a run cycle when roused; the
+     * king keeps his own seated animation. */
+    if (mask1499Roused) {
+        npc1499Frame += 0.7f;
+        if (npc1499Frame > 62.0f) npc1499Frame = 1.0f;
+    } else {
+        npc1499Frame += 0.25f;
+        if (npc1499Frame > 320.0f) npc1499Frame = 296.0f;
+    }
+    npc1499KingFrame += 0.15f;
+    if (npc1499KingFrame > 601.0f) npc1499KingFrame = 509.0f;
+
+    /* Straying near any member rouses the whole congregation (source: a
+     * citizen screams and flips the rest to State 1). */
+    if (!mask1499Roused) {
+        for (int k = 0; k < npc1499Count; k++) {
+            if (!npc1499Active[k]) continue;
+            float dx = camPos[0] - npc1499Pos[k][0];
+            float dz = camPos[2] - npc1499Pos[k][2];
+            float thr = npc1499Type[k] == 0 ? 650.0f : 480.0f;
+            if (dx * dx + dz * dz < thr * thr) {
+                mask1499Roused = 1;
+                audioPlay(snd1499Trig, 1.0f, 0.0f);
+                break;
+            }
+        }
+    }
+
     for (int k = 0; k < npc1499Count; k++) {
         if (!npc1499Active[k]) continue;
         float dx = camPos[0] - npc1499Pos[k][0];
         float dz = camPos[2] - npc1499Pos[k][2];
         float d = sqrtf(dx * dx + dz * dz);
-        if (d < 200.0f) {
-            snprintf(deathCause, sizeof(deathCause),
-                     "THE PEOPLE OF SCP-1499");
-            deathTimer = 180;
-            return;
-        }
-        if (d > 1.0f) {
-            npc1499Pos[k][0] += dx / d * 20.0f;
-            npc1499Pos[k][2] += dz / d * 20.0f;
+        if (mask1499Roused) {
+            if (npc1499Type[k] == 2) {
+                /* The king does not leave the altar; he only watches. */
+                if (d > 1.0f) {
+                    npc1499Yaw[k] = atan2f(dx, dz) * 180.0f / 3.14159265f;
+                }
+                continue;
+            }
+            if (d < 200.0f) {
+                snprintf(deathCause, sizeof(deathCause),
+                         "THE PEOPLE OF SCP-1499");
+                deathTimer = 180;
+                return;
+            }
+            float sp = (npc1499Type[k] == 1 || npc1499Type[k] == 3)
+                     ? 30.0f : 22.0f;  /* guards are quicker */
+            if (d > 1.0f) {
+                npc1499Pos[k][0] += dx / d * sp;
+                npc1499Pos[k][2] += dz / d * sp;
+                npc1499Yaw[k] = atan2f(dx, dz) * 180.0f / 3.14159265f;
+            }
+        } else if (npc1499Type[k] == 0) {
+            /* Citizens drift near their spot and occasionally murmur. */
+            npc1499Pos[k][0] += sinf(gTick * 0.01f + (float)k) * 0.6f;
+            npc1499Pos[k][2] += cosf(gTick * 0.013f + (float)k) * 0.6f;
+            npc1499Pos[k][0] += (npc1499Home[k][0] - npc1499Pos[k][0]) * 0.01f;
+            npc1499Pos[k][2] += (npc1499Home[k][2] - npc1499Pos[k][2]) * 0.01f;
+            if (rand() % 1500 == 0) {
+                audioPlay3D(snd1499Idle[rand() % 4], npc1499Pos[k], camPos,
+                            camYaw, 3000.0f);
+            }
+        } else if (d > 1.0f) {
+            /* Guards and king track the intruder without leaving post. */
             npc1499Yaw[k] = atan2f(dx, dz) * 180.0f / 3.14159265f;
         }
-        float o[3] = { npc1499Pos[k][0], npc1499Pos[k][1] + 250.0f,
-                       npc1499Pos[k][2] };
+        /* Settle onto the floor (the room finishes loading a frame or
+         * two after arrival, so this can only land once it is active).
+         * Ray from high above so the altar platform is found too. */
+        float o[3] = { npc1499Pos[k][0], 3000.0f, npc1499Pos[k][2] };
         float hy;
-        if (rayDownWorld(o, 600.0f, &hy)) npc1499Pos[k][1] = hy;
+        if (rayDownWorld(o, 6000.0f, &hy)) npc1499Pos[k][1] = hy;
     }
-    sanity -= 0.1f;
+    sanity -= mask1499Roused ? 0.15f : 0.05f;
     if (sanity < 0.0f) sanity = 0.0f;
 }
 
@@ -4847,8 +4942,9 @@ static void draw096(const float viewPos[3]) {
 
 /* Draw a posed skinned mesh (its VBO already filled) at a world
  * position/yaw - shared by 049 and each 049-2. */
-static void drawSkinnedAt(SkinnedMesh *skin, GLuint vbo, GLuint *ibos,
-                          float scale, const float pos[3], float yawDeg) {
+static void drawSkinnedAtTex(SkinnedMesh *skin, GLuint vbo, GLuint *ibos,
+                             float scale, const float pos[3], float yawDeg,
+                             GLuint texOverride) {
     glPushMatrix();
     glTranslatef(pos[0], pos[1], pos[2]);
     glRotatef(-yawDeg + 180.0f, 0.0f, 1.0f, 0.0f);
@@ -4859,7 +4955,7 @@ static void drawSkinnedAt(SkinnedMesh *skin, GLuint vbo, GLuint *ibos,
     glTexCoordPointer(2, GL_FLOAT, sizeof(SceneVertex), VTX_OFF(du));
     for (uint32_t b = 0; b < skinnedBatchCount(skin); b++) {
         const SkinBatch *batch = skinnedBatch(skin, b);
-        GLuint tex = textureGet(batch->textureName);
+        GLuint tex = texOverride ? texOverride : textureGet(batch->textureName);
         if (tex) { glEnable(GL_TEXTURE_2D); glBindTexture(GL_TEXTURE_2D, tex); }
         else glDisable(GL_TEXTURE_2D);
         glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, ibos[b]);
@@ -4869,6 +4965,11 @@ static void drawSkinnedAt(SkinnedMesh *skin, GLuint vbo, GLuint *ibos,
     glBindBuffer(GL_ARRAY_BUFFER, 0);
     glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
     glPopMatrix();
+}
+
+static void drawSkinnedAt(SkinnedMesh *skin, GLuint vbo, GLuint *ibos,
+                          float scale, const float pos[3], float yawDeg) {
+    drawSkinnedAtTex(skin, vbo, ibos, scale, pos, yawDeg, 0);
 }
 
 static void draw049(const float viewPos[3]) {
@@ -4971,24 +5072,36 @@ static void draw1499(const float viewPos[3]) {
     GLuint *ibos = skinIBOsFor(skin1499);
     if (!ibos) return;
     if (!vbo1499) glGenBuffers(1, &vbo1499);
-    static int poseTick;
-    if (!posed1499 || ((poseTick++) & 1) == 0) {
-        skinnedEval(skin1499, npc1499Frame);
-        uint32_t vc;
-        const SceneVertex *v = skinnedVertices(skin1499, &vc);
-        glBindBuffer(GL_ARRAY_BUFFER, vbo1499);
-        glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)(vc * sizeof(SceneVertex)),
-                     v, GL_DYNAMIC_DRAW);
-        glBindBuffer(GL_ARRAY_BUFFER, 0);
-        posed1499 = 1;
-    }
+    uint32_t vc;
+    /* The shared idle/run pose for the citizens and guards. */
+    skinnedEval(skin1499, npc1499Frame);
+    const SceneVertex *v = skinnedVertices(skin1499, &vc);
+    glBindBuffer(GL_ARRAY_BUFFER, vbo1499);
+    glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)(vc * sizeof(SceneVertex)),
+                 v, GL_DYNAMIC_DRAW);
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
     for (int k = 0; k < npc1499Count; k++) {
-        if (!npc1499Active[k]) continue;
+        if (!npc1499Active[k] || npc1499Type[k] == 2) continue;
         float dx = npc1499Pos[k][0] - viewPos[0];
         float dz = npc1499Pos[k][2] - viewPos[2];
         if (dx * dx + dz * dz > VIEW_RANGE * VIEW_RANGE) continue;
         drawSkinnedAt(skin1499, vbo1499, ibos, skin1499Scale, npc1499Pos[k],
                       npc1499Yaw[k]);
+    }
+    /* The king: his own seated pose, in his crowned texture. */
+    for (int k = 0; k < npc1499Count; k++) {
+        if (!npc1499Active[k] || npc1499Type[k] != 2) continue;
+        float dx = npc1499Pos[k][0] - viewPos[0];
+        float dz = npc1499Pos[k][2] - viewPos[2];
+        if (dx * dx + dz * dz > VIEW_RANGE * VIEW_RANGE) continue;
+        skinnedEval(skin1499, npc1499KingFrame);
+        v = skinnedVertices(skin1499, &vc);
+        glBindBuffer(GL_ARRAY_BUFFER, vbo1499);
+        glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)(vc * sizeof(SceneVertex)),
+                     v, GL_DYNAMIC_DRAW);
+        glBindBuffer(GL_ARRAY_BUFFER, 0);
+        drawSkinnedAtTex(skin1499, vbo1499, ibos, skin1499Scale,
+                         npc1499Pos[k], npc1499Yaw[k], tex1499King);
     }
 }
 
