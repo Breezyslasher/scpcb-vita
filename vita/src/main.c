@@ -1180,6 +1180,11 @@ static ModelRT oneSidedRT, door914RT;
 static ModelRT buttonRT, buttonKeycardRT;
 static ModelRT buttonKeypadRT, buttonScannerRT, buttonElevatorRT;
 static ModelRT leverBaseRT, leverHandleRT;
+/* Pocket dimension's flying pillars: animated props that orbit and
+ * kill on contact (PD_FourWayRoom). */
+static ModelRT pdPillarRT;
+static float pdPillar[2][3];  /* world positions, updated per frame */
+static int pdPillarsOn;       /* active this frame */
 static char toastMsg[128];
 static int toastTimer;
 
@@ -1280,6 +1285,8 @@ static void buildDoorAssets(void) {
         = 9.216f;
     leverHandleRT.scale[0] = leverHandleRT.scale[1] = leverHandleRT.scale[2]
         = 9.216f;
+    buildModelRT(&pdPillarRT, "dimension_106_pillar.b3d", 0, 0, 0, NULL);
+    pdPillarRT.scale[0] = pdPillarRT.scale[1] = pdPillarRT.scale[2] = 256.0f;
 }
 
 static void drawModelRT(const ModelRT *rt);
@@ -2663,6 +2670,41 @@ static void updatePocketDimension(void) {
             if (npc106Frame > 333.0f) npc106Frame = 284.0f;
         }
     }
+    /* The flying pillars orbit the room and crush on contact
+     * (PD_FourWayRoom: Sin/Cos wander + spin, lethal within reach). */
+    pdPillarsOn = pdPillarRT.ok;
+    if (pdPillarsOn) {
+        float t = (5400.0f - pocketTimer) * 0.03f;
+        float sv = sinf(t * 1.6f) * 200.0f;
+        float cv = cosf(t * 0.8f) * 260.0f;
+        pdPillar[0][0] = cx + 700.0f + cv;
+        pdPillar[0][1] = 0.0f;
+        pdPillar[0][2] = cz + sv;
+        pdPillar[1][0] = cx + sv;
+        pdPillar[1][1] = 0.0f;
+        pdPillar[1][2] = cz + 700.0f + cv;
+        for (int i = 0; i < 2; i++) {
+            float pdx = camPos[0] - pdPillar[i][0];
+            float pdz = camPos[2] - pdPillar[i][2];
+            if (pdx * pdx + pdz * pdz < 220.0f * 220.0f
+                && deathTimer == 0) {
+                /* Shoved and crushed (death 106_1). */
+                float b = sqrtf(pdx * pdx + pdz * pdz);
+                if (b > 1.0f) {
+                    camPos[0] += pdx / b * 200.0f;
+                    camPos[2] += pdz / b * 200.0f;
+                }
+                snprintf(deathCause, sizeof(deathCause),
+                         "A FLYING PILLAR");
+                audioPlay(sndPdExplode, 1.0f, 0.0f);
+                deathTimer = 180;
+                inPocket = 0;
+                audioLoopAmbience(-1, 0.0f);
+                return;
+            }
+        }
+    }
+
     /* Exit at the far corner; reaching it escapes. */
     float ex = PD_GX * ROOM_SPACING + 400.0f;
     float ez = PD_GY * ROOM_SPACING + 400.0f;
@@ -2821,6 +2863,18 @@ static void drawBillboard(const float pos[3], float w, float h, GLuint tex,
 /* The pocket dimension's throne of eyes, billboarded (positioned
  * properly once the multi-mesh assembly lands in stage 3). */
 static GLuint pdThroneTex;
+static void drawPocketPillars(void) {
+    if (!inPocket || !pdPillarsOn || !pdPillarRT.ok) return;
+    float t = (5400.0f - pocketTimer) * 0.03f;
+    for (int i = 0; i < 2; i++) {
+        glPushMatrix();
+        glTranslatef(pdPillar[i][0], pdPillar[i][1], pdPillar[i][2]);
+        glRotatef(t * 2.0f * 57.29578f, 0.0f, 1.0f, 0.0f);
+        drawModelRT(&pdPillarRT);
+        glPopMatrix();
+    }
+}
+
 static void drawPocketThrone(void) {
     if (!inPocket || !pdThroneTex) return;
     /* For now, across the start room; a pulsing glow. */
@@ -5701,6 +5755,7 @@ int main(void) {
             drawItems(camPos);
             draw173(camPos);
             draw106(camPos);
+            drawPocketPillars();
             drawPocketThrone();
             drawIntroHumans(camPos);
             glDisable(GL_CULL_FACE);
