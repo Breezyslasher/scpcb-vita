@@ -98,6 +98,11 @@ typedef struct {
     int parent;              /* index into the flat array, -1 = root */
     float invBind[16];       /* inverse of the bind-pose global matrix */
     float skinMat[16];       /* animGlobal * invBind, per eval */
+    /* Frame-sorted key pointers per channel (pos/scale/rot), so pose
+     * evaluation is a binary search instead of scanning every key of
+     * every merged KEYS chunk three times. */
+    const B3DKey **chKeys[3];
+    int chCount[3];
 } SkinNode;
 
 typedef struct {
@@ -141,6 +146,34 @@ static void flatten(SkinnedMesh *s, const B3DNode *n, int parent) {
     for (uint32_t i = 0; i < n->childCount; i++) {
         flatten(s, n->children[i], idx);
     }
+}
+
+static int keyFrameCmp(const void *a, const void *b) {
+    const B3DKey *ka = *(const B3DKey *const *)a;
+    const B3DKey *kb = *(const B3DKey *const *)b;
+    return ka->frame - kb->frame;
+}
+
+static int buildChannelKeys(SkinNode *sn) {
+    const B3DNode *n = sn->node;
+    for (int c = 0; c < 3; c++) {
+        int flag = 1 << c;
+        int count = 0;
+        for (uint32_t i = 0; i < n->keyCount; i++) {
+            if (n->keys[i].flags & flag) count++;
+        }
+        sn->chCount[c] = count;
+        if (!count) continue;
+        sn->chKeys[c] = (const B3DKey **)malloc(
+            (size_t)count * sizeof(B3DKey *));
+        if (!sn->chKeys[c]) return 0;
+        int o = 0;
+        for (uint32_t i = 0; i < n->keyCount; i++) {
+            if (n->keys[i].flags & flag) sn->chKeys[c][o++] = &n->keys[i];
+        }
+        qsort(sn->chKeys[c], (size_t)count, sizeof(B3DKey *), keyFrameCmp);
+    }
+    return 1;
 }
 
 static void nodeLocal(const B3DNode *n, float out[16]) {
@@ -189,6 +222,9 @@ SkinnedMesh *skinnedCreate(const B3DModel *model) {
         if (s->nodes[i].node->weightCount > 0) hasBones = 1;
     }
     if (s->meshNodeIdx < 0 || !hasBones) goto fail;
+    for (int i = 0; i < s->nodeCount; i++) {
+        if (!buildChannelKeys(&s->nodes[i])) goto fail;
+    }
     s->mesh = s->nodes[s->meshNodeIdx].node->mesh;
     s->vertCount = s->mesh->vertexCount;
     if (s->vertCount == 0 || s->vertCount > 65535) goto fail;
@@ -327,6 +363,9 @@ fail:
 
 void skinnedFree(SkinnedMesh *s) {
     if (!s) return;
+    for (int i = 0; i < s->nodeCount; i++) {
+        for (int c = 0; c < 3; c++) free(s->nodes[i].chKeys[c]);
+    }
     free(s->nodes);
     free(s->weights);
     free(s->bindPos);
@@ -347,26 +386,28 @@ void skinnedBounds(const SkinnedMesh *s, float mn[3], float mx[3]) {
     memcpy(mx, s->bindMax, sizeof(s->bindMax));
 }
 
-/* Bracketing keys for one channel (a node's keys can come from
- * several KEYS chunks carrying different channels, so each channel
- * interpolates only between keys that actually carry it). Returns 0
- * if the node has no keys for the channel. */
-static int chBracket(const B3DNode *n, float frame, int flag,
+/* Bracketing keys for one channel via binary search over the
+ * frame-sorted per-channel arrays. Returns 0 if the node has no keys
+ * for the channel. */
+static int chBracket(const SkinNode *sn, float frame, int ch,
                      const B3DKey **prevOut, const B3DKey **nextOut) {
-    const B3DKey *prev = NULL, *next = NULL;
-    for (uint32_t i = 0; i < n->keyCount; i++) {
-        const B3DKey *k = &n->keys[i];
-        if (!(k->flags & flag)) continue;
-        if ((float)k->frame <= frame) {
-            if (!prev || k->frame >= prev->frame) prev = k;
-        }
-        if ((float)k->frame >= frame) {
-            if (!next || k->frame < next->frame) next = k;
+    int count = sn->chCount[ch];
+    if (!count) return 0;
+    const B3DKey **keys = sn->chKeys[ch];
+    /* last key with key->frame <= frame */
+    int lo = 0, hi = count - 1, at = -1;
+    while (lo <= hi) {
+        int mid = (lo + hi) / 2;
+        if ((float)keys[mid]->frame <= frame) {
+            at = mid;
+            lo = mid + 1;
+        } else {
+            hi = mid - 1;
         }
     }
-    if (!prev && !next) return 0;
-    if (!prev) prev = next;
-    if (!next) next = prev;
+    const B3DKey *prev = at >= 0 ? keys[at] : keys[0];
+    const B3DKey *next = at + 1 < count ? keys[at + 1] : keys[count - 1];
+    if (at < 0) next = keys[0];
     *prevOut = prev;
     *nextOut = next;
     return 1;
@@ -383,7 +424,8 @@ static float chT(const B3DKey *prev, const B3DKey *next, float frame) {
 
 /* Interpolated node transform at `frame`; nodes without keys keep
  * their base transform. */
-static void animLocal(const B3DNode *n, float frame, float out[16]) {
+static void animLocal(const SkinNode *sn, float frame, float out[16]) {
+    const B3DNode *n = sn->node;
     if (n->keyCount == 0) {
         nodeLocal(n, out);
         return;
@@ -396,20 +438,20 @@ static void animLocal(const B3DNode *n, float frame, float out[16]) {
     memcpy(quat, n->rotation, sizeof(quat));
 
     const B3DKey *prev, *next;
-    if (chBracket(n, frame, 1, &prev, &next)) {
+    if (chBracket(sn, frame, 0, &prev, &next)) {
         float t = chT(prev, next, frame);
         for (int i = 0; i < 3; i++) {
             pos[i] = prev->position[i]
                    + (next->position[i] - prev->position[i]) * t;
         }
     }
-    if (chBracket(n, frame, 2, &prev, &next)) {
+    if (chBracket(sn, frame, 1, &prev, &next)) {
         float t = chT(prev, next, frame);
         for (int i = 0; i < 3; i++) {
             scl[i] = prev->scale[i] + (next->scale[i] - prev->scale[i]) * t;
         }
     }
-    if (chBracket(n, frame, 4, &prev, &next)) {
+    if (chBracket(sn, frame, 2, &prev, &next)) {
         float t = chT(prev, next, frame);
         /* nlerp with hemisphere correction */
         float dot = prev->rotation[0] * next->rotation[0]
@@ -467,7 +509,7 @@ void skinnedEval(SkinnedMesh *s, float frame) {
     }
     for (int i = 0; i < s->nodeCount; i++) {
         float local[16];
-        animLocal(s->nodes[i].node, frame, local);
+        animLocal(&s->nodes[i], frame, local);
         if (s->nodes[i].parent >= 0) {
             mMul(global[i], global[s->nodes[i].parent], local);
         } else {
