@@ -13,6 +13,8 @@
 #include <malloc.h>
 #include <string.h>
 #include <stdint.h>
+#include <stdio.h>
+#include <stdarg.h>
 
 #include <vitaGL.h>
 
@@ -33,6 +35,20 @@
 #define VIDEO_FRAME_BUFFERS 5
 
 #define ALIGN_UP(x, a) (((x) + ((a) - 1)) & ~((a) - 1))
+
+/* Diagnostics -> ux0:data/scpcb-ue/video_log.txt (its own file so it
+ * never races the audio log). Flushed per line so a crash keeps it. */
+static void vlog(const char *fmt, ...) {
+    static FILE *lf;
+    if (!lf) lf = fopen("ux0:data/scpcb-ue/video_log.txt", "w");
+    if (!lf) return;
+    va_list ap;
+    va_start(ap, fmt);
+    vfprintf(lf, fmt, ap);
+    va_end(ap);
+    fputc('\n', lf);
+    fflush(lf);
+}
 
 /* ---- memoryReplacement callbacks ---- */
 
@@ -137,8 +153,10 @@ static int gSysmoduleOk = -1; /* -1 untried, 0 failed, 1 loaded */
 
 int videoInit(void) {
     if (gSysmoduleOk < 0) {
-        gSysmoduleOk =
-            sceSysmoduleLoadModule(SCE_SYSMODULE_AVPLAYER) >= 0 ? 1 : 0;
+        int r = sceSysmoduleLoadModule(SCE_SYSMODULE_AVPLAYER);
+        gSysmoduleOk = r >= 0 ? 1 : 0;
+        vlog("videoInit: sceSysmoduleLoadModule(AVPLAYER)=0x%08X -> %s",
+             (unsigned)r, gSysmoduleOk ? "ok" : "FAILED");
     }
     return gSysmoduleOk;
 }
@@ -176,7 +194,20 @@ static int skipPressed(void) {
 /* ---- play one file ---- */
 
 int videoPlayFile(const char *path) {
-    if (!videoInit()) return 0;
+    vlog("---- videoPlayFile: %s", path);
+    if (!videoInit()) { vlog("  videoInit failed"); return 0; }
+
+    /* Confirm the file is actually on the device (the #1 failure is the
+     * data package not carrying the .mp4 yet). */
+    FILE *probe = fopen(path, "rb");
+    if (!probe) {
+        vlog("  fopen FAILED - file not present on device");
+        return 0;
+    }
+    fseek(probe, 0, SEEK_END);
+    long fsz = ftell(probe);
+    fclose(probe);
+    vlog("  file present, %ld bytes", fsz);
 
     SceAvPlayerInitData init;
     memset(&init, 0, sizeof(init));
@@ -189,13 +220,17 @@ int videoPlayFile(const char *path) {
     init.autoStart = 1;
 
     gPlayer = sceAvPlayerInit(&init);
+    vlog("  sceAvPlayerInit -> handle=%d", gPlayer);
     if (gPlayer < 0) return 0;
-    if (sceAvPlayerAddSource(gPlayer, path) < 0) {
+    int addRc = sceAvPlayerAddSource(gPlayer, path);
+    vlog("  sceAvPlayerAddSource -> 0x%08X", (unsigned)addRc);
+    if (addRc < 0) {
         sceAvPlayerClose(gPlayer);
         return 0;
     }
 
     ensureRing();
+    vlog("  ring ready, entering play loop");
 
     /* Audio on its own thread (the video is pumped here). */
     gAudioRun = 1;
@@ -221,10 +256,13 @@ int videoPlayFile(const char *path) {
     glEnableClientState(GL_TEXTURE_COORD_ARRAY);
 
     int idx = 0, haveFrame = 0, lastW = 0, lastH = 0;
+    int loops = 0, frames = 0, skipped = 0, timedOut = 0;
     uint64_t startUs = sceKernelGetProcessTimeWide();
+    uint64_t nextLogUs = startUs + 1000000ull;
     while (sceAvPlayerIsActive(gPlayer)) {
+        loops++;
         inputUpdate();
-        if (skipPressed()) break;
+        if (skipPressed()) { skipped = 1; break; }
 
         SceAvPlayerFrameInfo frame;
         memset(&frame, 0, sizeof(frame));
@@ -240,7 +278,12 @@ int videoPlayFile(const char *path) {
                                       SCE_GXM_TEXTURE_FILTER_LINEAR);
             lastW = (int)frame.details.video.width;
             lastH = (int)frame.details.video.height;
+            if (!haveFrame) {
+                vlog("  first video frame: %dx%d pData=%p", lastW, lastH,
+                     (void *)frame.pData);
+            }
             haveFrame = 1;
+            frames++;
         }
 
         glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
@@ -248,9 +291,19 @@ int videoPlayFile(const char *path) {
         if (haveFrame) drawFrameQuad(gRing[idx], lastW, lastH);
         vglSwapBuffers(GL_FALSE);
 
+        uint64_t nowUs = sceKernelGetProcessTimeWide();
+        if (nowUs >= nextLogUs) {
+            vlog("  +%llus loops=%d frames=%d active=%d",
+                 (nowUs - startUs) / 1000000ull, loops, frames,
+                 (int)sceAvPlayerIsActive(gPlayer));
+            nextLogUs += 1000000ull;
+        }
         /* Wall-clock safety net against a stalled stream (2 min). */
-        if (sceKernelGetProcessTimeWide() - startUs > 120000000ull) break;
+        if (nowUs - startUs > 120000000ull) { timedOut = 1; break; }
     }
+    vlog("  loop end: reason=%s loops=%d frames=%d haveFrame=%d",
+         skipped ? "skip" : (timedOut ? "timeout" : "stream-ended"), loops,
+         frames, haveFrame);
 
     /* Restore GL matrices. */
     glMatrixMode(GL_PROJECTION);
@@ -267,5 +320,8 @@ int videoPlayFile(const char *path) {
     sceAvPlayerStop(gPlayer);
     sceAvPlayerClose(gPlayer);
     gPlayer = 0;
-    return 1;
+    vlog("  closed, returning played=%d", frames > 0);
+    /* Report "played" only if real frames were shown; otherwise let the
+     * caller fall back (e.g. a decodable container that yielded nothing). */
+    return frames > 0;
 }
