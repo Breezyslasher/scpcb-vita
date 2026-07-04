@@ -762,6 +762,9 @@ static int snd895Idle[3] = { -1, -1, -1 }, snd895Scream[3] = { -1, -1, -1 };
 static int snd205Horror = -1;
 /* SCP-914 (cont1_914): the refinement whir. */
 static int snd914 = -1;
+/* SCP-513-1's bells (declared early: loaded in loadSounds). */
+static int snd513Bell[3] = { -1, -1, -1 };
+static int npc513Active;   /* reset in regenerateMap, so declared early */
 static GLuint teslaArcTex;
 static float teslaFlash;       /* white screen flash when it zaps nearby */
 
@@ -2447,13 +2450,11 @@ static SkinnedMesh *skin513;
 static float skin513Scale = 1.0f;
 static GLuint vbo513;
 static int posed513;
-static int npc513Active;
 static float npc513Pos[3];
 static float npc513Yaw;
 static float npc513Frame;
 static float npc513Timer;      /* reposition cadence */
 static float npc513Bell;       /* bell-ring cadence */
-static int snd513Bell[3] = { -1, -1, -1 };
 
 /* ---- SCP-1499-1: the hooded people of the mask dimension. They roam
  * and, once roused, converge and kill on contact (UpdateNPCType1499_1).
@@ -6390,7 +6391,10 @@ static void update372(void) {
         return;
     }
     if (npc372Idle) {
-        if ((rand() % 45) == 0) {
+        /* Source reveals it during a blink (BlinkTimer window): you blink
+         * and it is suddenly there at the edge of sight. A rare timer
+         * fallback keeps it appearing even if you barely blink. */
+        if ((blinkFrames > 0 && (rand() % 4) == 0) || (rand() % 240) == 0) {
             float ang = camYaw + (float)((rand() % 180) - 90) * 0.0174533f;
             float dist = 400.0f + (float)(rand() % 130);
             npc372Pos[0] = camPos[0] + sinf(ang) * dist;
