@@ -26,6 +26,7 @@
 #include <psp2/kernel/sysmem.h>
 #include <psp2/kernel/threadmgr.h>
 #include <psp2/kernel/processmgr.h>
+#include <psp2/io/fcntl.h>
 
 #include "../input.h"
 
@@ -93,6 +94,43 @@ static void tex_free(void *arg, void *ptr) {
     SceUID blk = sceKernelFindMemBlockByAddr(ptr, 0);
     sceGxmUnmapMemory(ptr);
     if (blk >= 0) sceKernelFreeMemBlock(blk);
+}
+
+/* ---- fileReplacement callbacks ----
+ * The built-in AvPlayer loader rejects our ux0: path (AddSource returns
+ * SCE_AVPLAYER_ERROR_INVALID_PARAM), so we hand it an sceIo reader on
+ * the exact path fopen already proved openable. One file plays at a
+ * time, so a single global fd is enough; objectPointer stays NULL. */
+static SceUID gVidFd = -1;
+
+static int file_open(void *p, const char *filename) {
+    (void)p;
+    gVidFd = sceIoOpen(filename, SCE_O_RDONLY, 0);
+    return gVidFd < 0 ? -1 : 0;
+}
+
+static int file_close(void *p) {
+    (void)p;
+    int r = gVidFd >= 0 ? sceIoClose(gVidFd) : 0;
+    gVidFd = -1;
+    return r < 0 ? -1 : 0;
+}
+
+static int file_readOffset(void *p, uint8_t *buffer, uint64_t position,
+                           uint32_t length) {
+    (void)p;
+    if (gVidFd < 0) return -1;
+    if (sceIoLseek(gVidFd, (SceOff)position, SCE_SEEK_SET) < 0) return -1;
+    return sceIoRead(gVidFd, buffer, length);
+}
+
+static uint64_t file_size(void *p) {
+    (void)p;
+    if (gVidFd < 0) return 0;
+    SceOff cur = sceIoLseek(gVidFd, 0, SCE_SEEK_CUR);
+    SceOff end = sceIoLseek(gVidFd, 0, SCE_SEEK_END);
+    sceIoLseek(gVidFd, cur, SCE_SEEK_SET);
+    return (uint64_t)end;
 }
 
 /* ---- audio pump thread ---- */
@@ -215,6 +253,11 @@ int videoPlayFile(const char *path) {
     init.memoryReplacement.deallocate = mem_free;
     init.memoryReplacement.allocateTexture = tex_alloc;
     init.memoryReplacement.deallocateTexture = tex_free;
+    init.fileReplacement.objectPointer = NULL;
+    init.fileReplacement.open = file_open;
+    init.fileReplacement.close = file_close;
+    init.fileReplacement.readOffset = file_readOffset;
+    init.fileReplacement.size = file_size;
     init.basePriority = 0xA0;
     init.numOutputVideoFrameBuffers = VIDEO_FRAME_BUFFERS;
     init.autoStart = 1;
