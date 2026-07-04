@@ -2415,7 +2415,8 @@ static float skin205Scale = 1.0f;
 static GLuint vbo205;
 static int posed205;
 static int npc205Ok;
-static float npc205Pos[3];      /* demon spawn (world) */
+static float npc205Pos[3];      /* demon current position (world) */
+static float npc205Home[3];     /* its spawn, returned to when you leave */
 static float npc205Yaw;
 static float npc205Frame;
 static float npc205Rise;        /* 0..1 how far it has risen/loomed */
@@ -6446,6 +6447,7 @@ static void spawn205(void) {
         float local[3] = { -1536.0f, 730.0f, 192.0f }, w[3];
         localToWorld(p, local, w);
         npc205Pos[0] = w[0]; npc205Pos[1] = w[1]; npc205Pos[2] = w[2];
+        npc205Home[0] = w[0]; npc205Home[1] = w[1]; npc205Home[2] = w[2];
         npc205Yaw = (float)(p->angle * 90) - 90.0f;
         npc205Ok = 1;
         break;
@@ -6472,9 +6474,36 @@ static void update205(void) {
                 audioPlay3D(snd205Horror, npc205Pos, camPos, camYaw, 2000.0f);
             }
         }
+        /* Fully risen, the shadow lunges - it closes on the player and
+         * grabs on contact (source teleports you into the demon). */
+        if (npc205Rise >= 1.0f && deathTimer == 0 && walkMode
+            && introPhase < 0) {
+            float dx = camPos[0] - npc205Pos[0];
+            float dz = camPos[2] - npc205Pos[2];
+            float dist = sqrtf(dx * dx + dz * dz);
+            if (dist > 1.0f) {
+                float speed = 7.0f + (float)npcAggressive * 3.0f;
+                npc205Pos[0] += dx / dist * speed;
+                npc205Pos[2] += dz / dist * speed;
+                npc205Yaw = atan2f(dx, dz) * 180.0f / 3.14159265f;
+            }
+            float o[3] = { npc205Pos[0], npc205Pos[1] + 250.0f, npc205Pos[2] };
+            float hy;
+            if (rayDownWorld(o, 600.0f, &hy)) npc205Pos[1] = hy;
+            if (dist < 200.0f) {
+                snprintf(deathCause, sizeof(deathCause), "SCP-205");
+                deathTimer = 180;
+            }
+        }
     } else if (npc205Rise > 0.0f) {
         npc205Rise -= 0.004f;
-        if (npc205Rise < 0.0f) npc205Rise = 0.0f;
+        if (npc205Rise < 0.0f) {
+            npc205Rise = 0.0f;
+            /* Sank back; return to its lair for next time. */
+            npc205Pos[0] = npc205Home[0];
+            npc205Pos[1] = npc205Home[1];
+            npc205Pos[2] = npc205Home[2];
+        }
     }
 }
 
