@@ -10401,24 +10401,29 @@ int main(void) {
     int haveData = templatesLoad(ROOMS_INI, &tplList) && tplList.count > 0;
     if (haveData) {
         tplRT = (TemplateRT *)calloc(tplList.count, sizeof(TemplateRT));
+        optionsLoad();
+        mkdir(SAVES_DIR, 0777);
+        int audioOk = audioInit();
+        if (audioOk) optionsApply();
+        srand((unsigned)sceKernelGetProcessTimeWide());
+        pendingSeed = (uint32_t)(sceKernelGetProcessTimeWide() & 0xFFFFFF) | 1u;
+        /* Play the boot videos now, before the door/NPC/texture/sound
+         * load fills the heap: sceAvPlayer needs a few MB of contiguous
+         * CPU RAM for its demux/decode buffers, and after loadSounds
+         * decodes every SFX to PCM there is none left (the device log
+         * showed its 1.5 MB init alloc returning NULL). */
+        playStartupVideos();
+        /* Heavy asset + audio load. */
         buildDoorAssets();
         buildNpcAssets();
         loadHudTextures();
         loadMenuTextures();
         texButtonRed = textureGet("keypad_locked.png");
         pdThroneTex = textureGet("scp_106_eyes.png");
-        optionsLoad();
-        mkdir(SAVES_DIR, 0777);
-        if (audioInit()) {
-            loadSounds();
-            optionsApply();
-        }
+        if (audioOk) loadSounds();
         decalsInit();
         /* Boot to the title menu; the world is generated when the
          * player starts or loads a game. */
-        srand((unsigned)sceKernelGetProcessTimeWide());
-        pendingSeed = (uint32_t)(sceKernelGetProcessTimeWide() & 0xFFFFFF) | 1u;
-        playStartupVideos();
         enterMenu();
     } else {
         snprintf(statusLine, sizeof(statusLine),

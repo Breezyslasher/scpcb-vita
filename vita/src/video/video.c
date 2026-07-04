@@ -265,47 +265,34 @@ int videoPlayFile(const char *path) {
     fclose(probe);
     vlog("  file present, %ld bytes", fsz);
 
-    vlog("  sizeof(SceAvPlayerInitData)=%u",
-         (unsigned)sizeof(SceAvPlayerInitData));
+    struct mallinfo mi = mallinfo();
+    vlog("  heap: arena=%d used=%d free=%d nfree=%d", mi.arena, mi.uordblks,
+         mi.fordblks, mi.ordblks);
 
-    /* Both path forms failed at param validation without touching the
-     * file, so the handle/init state is suspect. Try two init configs and
-     * keep the first whose AddSource succeeds:
-     *   cfg 0: our fileReplacement + 5 buffers
-     *   cfg 1: exact lpp-vita match - no fileReplacement, 2 buffers,
-     *          relying on the built-in loader. */
-    int addRc = -1;
-    for (int cfg = 0; cfg < 2; cfg++) {
-        SceAvPlayerInitData init;
-        memset(&init, 0, sizeof(init));
-        init.memoryReplacement.allocate = mem_alloc;
-        init.memoryReplacement.deallocate = mem_free;
-        init.memoryReplacement.allocateTexture = tex_alloc;
-        init.memoryReplacement.deallocateTexture = tex_free;
-        if (cfg == 0) {
-            init.fileReplacement.objectPointer = NULL;
-            init.fileReplacement.open = file_open;
-            init.fileReplacement.close = file_close;
-            init.fileReplacement.readOffset = file_readOffset;
-            init.fileReplacement.size = file_size;
-            init.numOutputVideoFrameBuffers = VIDEO_FRAME_BUFFERS;
-        } else {
-            init.numOutputVideoFrameBuffers = 2;
-        }
-        init.basePriority = 0xA0;
-        init.autoStart = 1;
+    SceAvPlayerInitData init;
+    memset(&init, 0, sizeof(init));
+    init.memoryReplacement.allocate = mem_alloc;
+    init.memoryReplacement.deallocate = mem_free;
+    init.memoryReplacement.allocateTexture = tex_alloc;
+    init.memoryReplacement.deallocateTexture = tex_free;
+    init.fileReplacement.objectPointer = NULL;
+    init.fileReplacement.open = file_open;
+    init.fileReplacement.close = file_close;
+    init.fileReplacement.readOffset = file_readOffset;
+    init.fileReplacement.size = file_size;
+    init.basePriority = 0xA0;
+    init.numOutputVideoFrameBuffers = VIDEO_FRAME_BUFFERS;
+    init.autoStart = 1;
 
-        vlog("  cfg%d: init...", cfg);
-        gPlayer = sceAvPlayerInit(&init);
-        vlog("  cfg%d: sceAvPlayerInit -> handle=%d", cfg, gPlayer);
-        if (gPlayer < 0) continue;
-        addRc = sceAvPlayerAddSource(gPlayer, path);
-        vlog("  cfg%d: AddSource -> 0x%08X", cfg, (unsigned)addRc);
-        if (addRc >= 0) break;
+    gPlayer = sceAvPlayerInit(&init);
+    vlog("  sceAvPlayerInit -> handle=%d", gPlayer);
+    if (gPlayer < 0) return 0;
+    int addRc = sceAvPlayerAddSource(gPlayer, path);
+    vlog("  AddSource -> 0x%08X", (unsigned)addRc);
+    if (addRc < 0) {
         sceAvPlayerClose(gPlayer);
-        gPlayer = -1;
+        return 0;
     }
-    if (addRc < 0) return 0;
 
     ensureRing();
     vlog("  ring ready, entering play loop");
