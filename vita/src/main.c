@@ -6577,23 +6577,118 @@ static const char *setting914Name(int s) {
  * out a Playing Card), and everything else is destroyed on Rough/Coarse
  * and passed through otherwise. Returns the output template, or -1 if the
  * item is consumed to nothing. */
+/* The Use914 transformation table, one row per input item, outputs in
+ * setting order { ROUGH, COARSE, 1:1, FINE, VERYFINE }. NULL = the item
+ * is destroyed. Multi-output / random / NPC / difficulty branches in the
+ * source are collapsed to their primary deterministic outcome. Any output
+ * whose template the port lacks falls back to passing the item through. */
+typedef struct {
+    const char *in;
+    const char *out[5];
+} Refine914Row;
+
+static const Refine914Row REFINE914[] = {
+    { "Gas Mask",            { NULL, NULL, "Gas Mask", "Fine Gas Mask", "Very Fine Gas Mask" } },
+    { "Fine Gas Mask",       { NULL, NULL, "Gas Mask", "Fine Gas Mask", "Very Fine Gas Mask" } },
+    { "Very Fine Gas Mask",  { NULL, NULL, "Gas Mask", "Fine Gas Mask", "Very Fine Gas Mask" } },
+    { "Heavy Gas Mask",      { NULL, NULL, "Gas Mask", "Fine Gas Mask", "Very Fine Gas Mask" } },
+    { "SCP-1499",            { NULL, NULL, "Gas Mask", "Fine SCP-1499", "Fine SCP-1499" } },
+    { "Fine SCP-1499",       { NULL, NULL, "Gas Mask", "Fine SCP-1499", "Fine SCP-1499" } },
+    { "Night Vision Goggles",{ NULL, "Electronical Components", "SCRAMBLE Gear", "Fine Night Vision Goggles", "Very Fine Night Vision Goggles" } },
+    { "Fine Night Vision Goggles",{ NULL, "Electronical Components", "SCRAMBLE Gear", "Fine Night Vision Goggles", "Very Fine Night Vision Goggles" } },
+    { "Very Fine Night Vision Goggles",{ NULL, "Electronical Components", "SCRAMBLE Gear", "Fine Night Vision Goggles", "Very Fine Night Vision Goggles" } },
+    { "SCRAMBLE Gear",       { NULL, "Electronical Components", "Night Vision Goggles", "Fine SCRAMBLE Gear", "Fine SCRAMBLE Gear" } },
+    { "Fine SCRAMBLE Gear",  { NULL, "Electronical Components", "Night Vision Goggles", "Fine SCRAMBLE Gear", "Fine SCRAMBLE Gear" } },
+    { "Ballistic Helmet",    { NULL, NULL, "Ballistic Vest", "Heavy Ballistic Vest", "Heavy Ballistic Vest" } },
+    { "Newsboy Cap",         { NULL, "Newsboy Cap", NULL, "Fine SCP-268", "Fine SCP-268" } },
+    { "SCP-268",             { NULL, "Newsboy Cap", NULL, "Fine SCP-268", "Fine SCP-268" } },
+    { "Fine SCP-268",        { NULL, "Newsboy Cap", NULL, "Fine SCP-268", "Fine SCP-268" } },
+    { "Ballistic Vest",      { NULL, "Corrosive Ballistic Vest", "Ballistic Helmet", "Heavy Ballistic Vest", "Bulky Ballistic Vest" } },
+    { "Heavy Ballistic Vest",{ NULL, "Corrosive Ballistic Vest", "Ballistic Helmet", "Heavy Ballistic Vest", "Bulky Ballistic Vest" } },
+    { "Hazmat Suit",         { NULL, NULL, "Hazmat Suit", "Fine Hazmat Suit", "Very Fine Hazmat Suit" } },
+    { "Fine Hazmat Suit",    { NULL, NULL, "Hazmat Suit", "Fine Hazmat Suit", "Very Fine Hazmat Suit" } },
+    { "Heavy Hazmat Suit",   { NULL, NULL, "Hazmat Suit", "Fine Hazmat Suit", "Very Fine Hazmat Suit" } },
+    { "Very Fine Hazmat Suit",{ NULL, NULL, "Hazmat Suit", "Infected Syringe", "Infected Syringe" } },
+    { "Electronical Components",{ NULL, NULL, NULL, "Night Vision Goggles", "Fine Night Vision Goggles" } },
+    { "E-Reader",            { NULL, "Clipboard", NULL, "E-Reader 20", "E-Reader 30" } },
+    { "E-Reader 20",         { NULL, "Clipboard", NULL, "E-Reader 20", "E-Reader 30" } },
+    { "E-Reader 30",         { NULL, "Clipboard", NULL, "E-Reader 20", "E-Reader 30" } },
+    { "Radio Transceiver",   { NULL, "Electronical Components", "18V Radio Transceiver", "Fine Radio Transceiver", "Very Fine Radio Transceiver" } },
+    { "18V Radio Transceiver",{ NULL, "Electronical Components", "18V Radio Transceiver", "Fine Radio Transceiver", "Very Fine Radio Transceiver" } },
+    { "Fine Radio Transceiver",{ NULL, "Electronical Components", "18V Radio Transceiver", "Fine Radio Transceiver", "Very Fine Radio Transceiver" } },
+    { "S-NAV Navigator",     { NULL, "Electronical Components", "S-NAV Navigator", "S-NAV 310 Navigator", "S-NAV 300 Navigator" } },
+    { "S-NAV 300 Navigator", { NULL, "Electronical Components", "S-NAV Navigator", "S-NAV 310 Navigator", "S-NAV 300 Navigator" } },
+    { "S-NAV 310 Navigator", { NULL, "Electronical Components", "S-NAV Navigator", "S-NAV 310 Navigator", "S-NAV 300 Navigator" } },
+    { "SCP-148 Ingot",       { "SCP-148 Ingot", "SCP-148 Ingot", NULL, NULL, NULL } },
+    { "White Severed Hand",  { NULL, NULL, "Black Severed Hand", NULL, NULL } },
+    { "Black Severed Hand",  { NULL, NULL, "Yellow Severed Hand", NULL, NULL } },
+    { "Yellow Severed Hand", { NULL, NULL, "White Severed Hand", NULL, NULL } },
+    { "First Aid Kit",       { NULL, NULL, "Blue First Aid Kit", "Compact First Aid Kit", "Strange Bottle" } },
+    { "Blue First Aid Kit",  { NULL, NULL, "First Aid Kit", "Compact First Aid Kit", "Strange Bottle" } },
+    { "Compact First Aid Kit",{ NULL, NULL, "First Aid Kit", "Compact First Aid Kit", "Strange Bottle" } },
+    { "Playing Card",        { NULL, NULL, "Level 1 key Card", "Level 1 key Card", "Level 2 key Card" } },
+    { "Coin",                { NULL, NULL, "Level 1 key Card", "Level 1 key Card", "Level 2 key Card" } },
+    { "Quarter",             { NULL, NULL, "Level 1 key Card", "Level 1 key Card", "Level 2 key Card" } },
+    { "Mastercard",          { NULL, "Quarter", "Level 1 key Card", "Level 1 key Card", "Level 2 key Card" } },
+    { "SCP-005",             { NULL, "Level 3 key Card", "Level 5 key Card", NULL, NULL } },
+    { "SCP-860",             { NULL, NULL, "SCP-860", "Fine SCP-860", "Fine SCP-860" } },
+    { "Fine SCP-860",        { NULL, NULL, "SCP-860", "Fine SCP-860", "Fine SCP-860" } },
+    { "SCP-513",             { NULL, NULL, "SCP-513", "SCP-513", "SCP-513" } },
+    { "Cigarette",           { NULL, NULL, "Cigarette", "Joint", "Smelly Joint" } },
+    { "Joint",               { NULL, NULL, "Cigarette", "Joint", "Smelly Joint" } },
+    { "SCP-714",             { NULL, "Coarse SCP-714", "SCP-714", "Fine SCP-714", "Fine SCP-714" } },
+    { "Coarse SCP-714",      { NULL, "Coarse SCP-714", "SCP-714", "Fine SCP-714", "Fine SCP-714" } },
+    { "Fine SCP-714",        { NULL, "Coarse SCP-714", "SCP-714", "Fine SCP-714", "Fine SCP-714" } },
+    { "4.5V Battery",        { NULL, NULL, NULL, "9V Battery", "18V Battery" } },
+    { "9V Battery",          { NULL, "4.5V Battery", NULL, "18V Battery", "999V Battery" } },
+    { "18V Battery",         { "4.5V Battery", "9V Battery", NULL, "18V Battery", "999V Battery" } },
+    { "999V Battery",        { "4.5V Battery", "9V Battery", "Strange Battery", "Strange Battery", "Strange Battery" } },
+    { "ReVision Eyedrops",   { NULL, NULL, "ReVision Eyedrops", "Fine Eyedrops", "Very Fine Eyedrops" } },
+    { "RedVision Eyedrops",  { NULL, NULL, "ReVision Eyedrops", "Fine Eyedrops", "Very Fine Eyedrops" } },
+    { "Fine Eyedrops",       { NULL, NULL, "ReVision Eyedrops", "Fine Eyedrops", "Very Fine Eyedrops" } },
+    { "Syringe",             { NULL, NULL, "Compact First Aid Kit", "Fine Syringe", "Very Fine Syringe" } },
+    { "Fine Syringe",        { NULL, "First Aid Kit", "Blue First Aid Kit", "Very Fine Syringe", "Very Fine Syringe" } },
+    { "Very Fine Syringe",   { "Electronical Components", "Electronical Components", "Electronical Components", "Infected Syringe", "Infected Syringe" } },
+    { "Infected Syringe",    { NULL, NULL, NULL, "Syringe", "Blue First Aid Kit" } },
+    { "Pill",                { NULL, NULL, "Pill", "Upgraded Pill", "Upgraded Pill" } },
+    { "SCP-500-01",          { NULL, NULL, "Pill", "Upgraded Pill", "Upgraded Pill" } },
+    { "Blank Paper",         { NULL, "Blank Paper", NULL, "Origami", "Origami" } },
+    { "Origami",             { NULL, "Blank Paper", NULL, "SCP-085", "SCP-085" } },
+    { "SCP-1025",            { NULL, "Blank Paper", "SCP-1025", "Fine SCP-1025", "Fine SCP-1025" } },
+    { "Book",                { NULL, "Blank Paper", "SCP-1025", "Fine SCP-1025", "Fine SCP-1025" } },
+};
+
 static int refine914(int tpl, int setting) {
     if (tpl < 0) return -1;
+    int si = setting + 2; /* -2..2 -> 0..4 */
+    if (si < 0) si = 0;
+    if (si > 4) si = 4;
+    const char *in = ITEM_TEMPLATES[tpl].name;
+    for (unsigned r = 0; r < sizeof(REFINE914) / sizeof(REFINE914[0]); r++) {
+        if (strcmp(REFINE914[r].in, in) != 0) continue;
+        const char *out = REFINE914[r].out[si];
+        if (!out) return -1;                  /* destroyed */
+        int t = itemTplFind(out);
+        return t >= 0 ? t : tpl;              /* missing template: pass through */
+    }
+    /* Keycards step by setting: Rough shreds, Coarse a level down, 1:1 the
+     * famous Playing Card, Fine up one, Very Fine up two, past L5 a
+     * Mastercard. */
     int lvl = itemKeycardLevel(tpl);
     if (lvl > 0) {
         int target = lvl;
         switch (setting) {
-            case -2: return -1;               /* ROUGH: shredded */
-            case -1: target = lvl - 1; break; /* COARSE: a level down */
-            case 0: {                         /* 1:1: a playing card */
+            case -2: return -1;
+            case -1: target = lvl - 1; break;
+            case 0: {
                 int pc = itemTplFind("Playing Card");
                 return pc >= 0 ? pc : tpl;
             }
-            case 1: target = lvl + 1; break;  /* FINE: a level up */
-            default: target = lvl + 2; break; /* VERY FINE: two up */
+            case 1: target = lvl + 1; break;
+            default: target = lvl + 2; break;
         }
         if (target < 1) return -1;
-        if (target > 5) {                     /* past L5: the Mastercard */
+        if (target > 5) {
             int mc = itemTplFind("Mastercard");
             if (mc >= 0) return mc;
             target = 5;
@@ -6603,8 +6698,8 @@ static int refine914(int tpl, int setting) {
         int t = itemTplFind(nm);
         return t >= 0 ? t : tpl;
     }
-    /* Non-keycards: Rough/Coarse ruin them, the rest pass through (the
-     * full item table is not yet ported). */
+    /* Default (source): Rough/Coarse ruin the item, the rest pass it
+     * through untouched. */
     if (setting <= -1) return -1;
     return tpl;
 }
@@ -6638,6 +6733,17 @@ static void spawn914(void) {
 /* Interaction near the machine: the knob cycles the setting, the input
  * booth runs the currently-selected inventory item through. Returns 1 if
  * it handled the press. */
+/* Shut (open=0) or reopen the two SCP_914_DOOR booth doors while the
+ * machine runs (they are type 7, near the machine). */
+static void set914Doors(int open) {
+    for (uint32_t di = 0; di < doors.count; di++) {
+        Door *d = &doors.items[di];
+        if (d->type != 7) continue;
+        float ddx = d->x - scp914Knob[0], ddz = d->z - scp914Knob[2];
+        if (ddx * ddx + ddz * ddz < 2400.0f * 2400.0f) d->open = open;
+    }
+}
+
 static int try914Interact(void) {
     if (!scp914Ok || scp914State != 0) return 0;
     float kdx = camPos[0] - scp914Knob[0], kdz = camPos[2] - scp914Knob[2];
@@ -6662,6 +6768,7 @@ static int try914Interact(void) {
         consumeSlot(invSel);
         scp914State = 1;
         scp914Timer = 0.0f;
+        set914Doors(0); /* the booths seal for the run */
         if (snd914 >= 0) audioPlay(snd914, 0.9f, 0.0f);
         snprintf(toastMsg, sizeof(toastMsg), "SCP-914 WHIRS TO LIFE...");
         toastTimer = 180;
@@ -6675,6 +6782,7 @@ static void update914(void) {
     scp914Timer += 1.0f;
     if (scp914Timer > 180.0f) {  /* the doors reopen after ~3 s */
         scp914State = 0;
+        set914Doors(1); /* the booths open on the finished output */
         int out = refine914(scp914RefineTpl, scp914Setting);
         scp914RefineTpl = -1;
         if (out >= 0) {
