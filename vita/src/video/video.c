@@ -53,9 +53,16 @@ static void vlog(const char *fmt, ...) {
 
 /* ---- memoryReplacement callbacks ---- */
 
+static int gMemLogN, gTexLogN;
+
 static void *mem_alloc(void *arg, uint32_t align, uint32_t size) {
     (void)arg;
-    return memalign(align, size);
+    void *p = memalign(align, size);
+    if (gMemLogN < 16 || !p) {
+        gMemLogN++;
+        vlog("    mem_alloc(align=%u size=%u) -> %p", align, size, p);
+    }
+    return p;
 }
 
 static void mem_free(void *arg, void *ptr) {
@@ -76,14 +83,24 @@ static void *tex_alloc(void *arg, uint32_t align, uint32_t size) {
     SceUID blk = sceKernelAllocMemBlock("scpcb_video",
                                         SCE_KERNEL_MEMBLOCK_TYPE_USER_CDRAM_RW,
                                         size, &opt);
-    if (blk < 0) return NULL;
+    if (blk < 0) {
+        vlog("    tex_alloc(size=%u) AllocMemBlock FAILED 0x%08X", size,
+             (unsigned)blk);
+        return NULL;
+    }
     void *base = NULL;
     if (sceKernelGetMemBlockBase(blk, &base) < 0) {
+        vlog("    tex_alloc GetMemBlockBase FAILED");
         sceKernelFreeMemBlock(blk);
         return NULL;
     }
-    sceGxmMapMemory(base, size,
+    int mr = sceGxmMapMemory(base, size,
                     SCE_GXM_MEMORY_ATTRIB_READ | SCE_GXM_MEMORY_ATTRIB_WRITE);
+    if (gTexLogN < 16 || mr < 0) {
+        gTexLogN++;
+        vlog("    tex_alloc(size=%u) -> %p map=0x%08X", size, base,
+             (unsigned)mr);
+    }
     return base;
 }
 
@@ -248,64 +265,47 @@ int videoPlayFile(const char *path) {
     fclose(probe);
     vlog("  file present, %ld bytes", fsz);
 
-    vlog("  sizeof(SceAvPlayerInitData)=%u", (unsigned)sizeof(SceAvPlayerInitData));
+    vlog("  sizeof(SceAvPlayerInitData)=%u",
+         (unsigned)sizeof(SceAvPlayerInitData));
 
-    SceAvPlayerInitData init;
-    memset(&init, 0, sizeof(init));
-    init.memoryReplacement.allocate = mem_alloc;
-    init.memoryReplacement.deallocate = mem_free;
-    init.memoryReplacement.allocateTexture = tex_alloc;
-    init.memoryReplacement.deallocateTexture = tex_free;
-    init.fileReplacement.objectPointer = NULL;
-    init.fileReplacement.open = file_open;
-    init.fileReplacement.close = file_close;
-    init.fileReplacement.readOffset = file_readOffset;
-    init.fileReplacement.size = file_size;
-    init.basePriority = 0xA0;
-    init.numOutputVideoFrameBuffers = VIDEO_FRAME_BUFFERS;
-    init.autoStart = 1;
-
-    gPlayer = sceAvPlayerInit(&init);
-    vlog("  sceAvPlayerInit -> handle=%d", gPlayer);
-    if (gPlayer < 0) return 0;
-
-    /* AddSource has been returning INVALID_PARAM before ever calling our
-     * file_open, so the built-in demux path parser (not the file I/O) is
-     * rejecting the string. Try a few path spellings and keep the first
-     * the player accepts. "ux0:/data/..." (slash after the colon) is the
-     * form the internal URL parser tends to want. */
-    char slashed[256];
-    const char *variants[2];
-    variants[0] = path;
-    slashed[0] = '\0';
-    const char *colon = strchr(path, ':');
-    if (colon && colon[1] != '/') {
-        size_t pre = (size_t)(colon - path) + 1; /* include the ':' */
-        if (pre < sizeof(slashed) - 1) {
-            memcpy(slashed, path, pre);
-            slashed[pre] = '/';
-            snprintf(slashed + pre + 1, sizeof(slashed) - pre - 1, "%s",
-                     colon + 1);
-            variants[1] = slashed;
-        } else {
-            variants[1] = path;
-        }
-    } else {
-        variants[1] = path;
-    }
-
+    /* Both path forms failed at param validation without touching the
+     * file, so the handle/init state is suspect. Try two init configs and
+     * keep the first whose AddSource succeeds:
+     *   cfg 0: our fileReplacement + 5 buffers
+     *   cfg 1: exact lpp-vita match - no fileReplacement, 2 buffers,
+     *          relying on the built-in loader. */
     int addRc = -1;
-    for (int v = 0; v < 2; v++) {
-        if (v == 1 && variants[1] == path) break; /* no distinct 2nd form */
-        addRc = sceAvPlayerAddSource(gPlayer, variants[v]);
-        vlog("  AddSource[%d] \"%s\" -> 0x%08X", v, variants[v],
-             (unsigned)addRc);
+    for (int cfg = 0; cfg < 2; cfg++) {
+        SceAvPlayerInitData init;
+        memset(&init, 0, sizeof(init));
+        init.memoryReplacement.allocate = mem_alloc;
+        init.memoryReplacement.deallocate = mem_free;
+        init.memoryReplacement.allocateTexture = tex_alloc;
+        init.memoryReplacement.deallocateTexture = tex_free;
+        if (cfg == 0) {
+            init.fileReplacement.objectPointer = NULL;
+            init.fileReplacement.open = file_open;
+            init.fileReplacement.close = file_close;
+            init.fileReplacement.readOffset = file_readOffset;
+            init.fileReplacement.size = file_size;
+            init.numOutputVideoFrameBuffers = VIDEO_FRAME_BUFFERS;
+        } else {
+            init.numOutputVideoFrameBuffers = 2;
+        }
+        init.basePriority = 0xA0;
+        init.autoStart = 1;
+
+        vlog("  cfg%d: init...", cfg);
+        gPlayer = sceAvPlayerInit(&init);
+        vlog("  cfg%d: sceAvPlayerInit -> handle=%d", cfg, gPlayer);
+        if (gPlayer < 0) continue;
+        addRc = sceAvPlayerAddSource(gPlayer, path);
+        vlog("  cfg%d: AddSource -> 0x%08X", cfg, (unsigned)addRc);
         if (addRc >= 0) break;
-    }
-    if (addRc < 0) {
         sceAvPlayerClose(gPlayer);
-        return 0;
+        gPlayer = -1;
     }
+    if (addRc < 0) return 0;
 
     ensureRing();
     vlog("  ring ready, entering play loop");
