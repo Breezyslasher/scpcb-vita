@@ -106,6 +106,7 @@ static SceUID gVidFd = -1;
 static int file_open(void *p, const char *filename) {
     (void)p;
     gVidFd = sceIoOpen(filename, SCE_O_RDONLY, 0);
+    vlog("  [cb] open %s -> fd=0x%08X", filename, (unsigned)gVidFd);
     return gVidFd < 0 ? -1 : 0;
 }
 
@@ -232,7 +233,7 @@ static int skipPressed(void) {
 /* ---- play one file ---- */
 
 int videoPlayFile(const char *path) {
-    vlog("---- videoPlayFile: %s", path);
+    vlog("---- videoPlayFile [build: fileReplacement+cbdiag]: %s", path);
     if (!videoInit()) { vlog("  videoInit failed"); return 0; }
 
     /* Confirm the file is actually on the device (the #1 failure is the
