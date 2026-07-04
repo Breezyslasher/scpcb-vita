@@ -285,8 +285,12 @@ int videoPlayFile(const char *path) {
     init.autoStart = 1;
 
     gPlayer = sceAvPlayerInit(&init);
-    vlog("  sceAvPlayerInit -> handle=%d", gPlayer);
-    if (gPlayer < 0) return 0;
+    vlog("  sceAvPlayerInit -> handle=0x%08X", (unsigned)gPlayer);
+    /* The handle is an opaque token: a valid one is a RAM pointer
+     * (0x8xxxxxxx), which is negative as a signed int - do NOT reject it
+     * for being < 0. Only a zero handle means init failed; AddSource is
+     * the real gate. */
+    if (gPlayer == 0) { vlog("  init returned 0 (failed)"); return 0; }
     int addRc = sceAvPlayerAddSource(gPlayer, path);
     vlog("  AddSource -> 0x%08X", (unsigned)addRc);
     if (addRc < 0) {
