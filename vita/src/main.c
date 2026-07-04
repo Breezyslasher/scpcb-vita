@@ -2498,7 +2498,7 @@ static float npc860Pos[3];
 static float npc860YawDeg;
 static float npc860Frame;
 static int npc860Cool;
-#define MAX_TREES 14
+#define MAX_TREES 96   /* a 10x10 forest grid minus the carved path */
 static float tree860Pos[MAX_TREES][3];
 static int tree860Count;
 
@@ -5639,26 +5639,71 @@ static void spawn860(void) {
     if (best < 0) return;
     float ox = map.rooms[best].gridX * ROOM_SPACING;
     float oz = map.rooms[best].gridY * ROOM_SPACING;
-    npc860Pos[0] = ox;
-    npc860Pos[2] = oz - 700.0f;
-    npc860Pos[1] = 0.0f;
     npc860YawDeg = 0.0f;
     reset860();
     npc860Active = 1;
-    /* Scatter trees through the room (deterministic from the seed so the
-     * copse is stable). */
+    /* Carve a winding path down a 10x10 forest grid (source ForestGrid:
+     * the path starts at a top column and walks down, deviating sideways
+     * within a couple of columns of centre, then a tree stands on every
+     * off-path cell). Deterministic from the seed so the maze is stable. */
+    enum { FGRID = 10 };
+    unsigned char pathGrid[FGRID][FGRID];
+    memset(pathGrid, 0, sizeof(pathGrid));
     uint32_t rng = mapSeed ^ 0x8601860Bu;
-    for (int t = 0; t < MAX_TREES; t++) {
+    int cen = FGRID / 2;
+    int px = cen, py = 0;
+    pathGrid[py][px] = 1;
+    int guard = 0;
+    while (py < FGRID - 1 && guard++ < 400) {
         rng = rng * 1664525u + 1013904223u;
-        float tx = ox + (float)((int)((rng >> 8) % 1600u) - 800);
-        rng = rng * 1664525u + 1013904223u;
-        float tz = oz + (float)((int)((rng >> 8) % 1600u) - 800);
-        /* Keep a clear path down the middle. */
-        if (tx > ox - 200.0f && tx < ox + 200.0f) continue;
-        tree860Pos[tree860Count][0] = tx;
-        tree860Pos[tree860Count][1] = 0.0f;
-        tree860Pos[tree860Count][2] = tz;
-        tree860Count++;
+        if (((rng >> 8) % 100u) < 35u) {          /* deviate sideways */
+            rng = rng * 1664525u + 1013904223u;
+            int nx = px + (((rng >> 8) & 1u) ? 1 : -1);
+            int off = nx - cen; if (off < 0) off = -off;
+            if (nx >= 1 && nx <= FGRID - 2 && off <= 2) {
+                px = nx;
+                pathGrid[py][px] = 1;
+                continue;
+            }
+        }
+        py++;                                      /* else step down */
+        pathGrid[py][px] = 1;
+    }
+    /* SCP-860-1 lurks at the far (top) end of the path. */
+    npc860Pos[0] = ox - 850.0f + ((float)px + 0.5f) * (1700.0f / FGRID);
+    npc860Pos[2] = oz - 850.0f + 0.5f * (1700.0f / FGRID);
+    npc860Pos[1] = 0.0f;
+    /* Stand a tree on every off-path cell. */
+    float cell = 1700.0f / FGRID;
+    for (int j = 0; j < FGRID && tree860Count < MAX_TREES; j++) {
+        for (int i = 0; i < FGRID && tree860Count < MAX_TREES; i++) {
+            if (pathGrid[j][i]) continue;
+            rng = rng * 1664525u + 1013904223u;
+            float jx = (float)((int)((rng >> 8) % 40u) - 20);
+            rng = rng * 1664525u + 1013904223u;
+            float jz = (float)((int)((rng >> 8) % 40u) - 20);
+            tree860Pos[tree860Count][0] = ox - 850.0f + (i + 0.5f) * cell + jx;
+            tree860Pos[tree860Count][1] = 0.0f;
+            tree860Pos[tree860Count][2] = oz - 850.0f + (j + 0.5f) * cell + jz;
+            tree860Count++;
+        }
+    }
+}
+
+/* Push the player out of any nearby SCP-860 tree trunk so the forest
+ * grid actually constrains movement to the carved path. */
+static void collide860Trees(float pos[3]) {
+    if (!npc860Active) return;
+    const float R = 68.0f; /* below half the ~170 cell so the path stays open */
+    for (int t = 0; t < tree860Count; t++) {
+        float dx = pos[0] - tree860Pos[t][0];
+        float dz = pos[2] - tree860Pos[t][2];
+        float d2 = dx * dx + dz * dz;
+        if (d2 >= R * R || d2 < 0.01f) continue;
+        float d = sqrtf(d2);
+        float push = (R - d) / d;
+        pos[0] += dx * push;
+        pos[2] += dz * push;
     }
 }
 
@@ -10754,6 +10799,7 @@ int main(void) {
             int pushedUp = 0;
             pushWorld(camPos, PLAYER_RADIUS, &pushedUp);
             doorsCollide(&doors, camPos, PLAYER_RADIUS);
+            collide860Trees(camPos);
 
             float hitY;
             if (rayDownWorld(camPos, eye + STEP_SLACK, &hitY)) {
