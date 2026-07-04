@@ -1684,6 +1684,7 @@ static void regenerateMap(uint32_t seed) {
     maskEntries = 0;
     elevState = ELEV_IDLE;
     npc1499Count = 0;
+    npc513Active = 0;
     pdLunging = 0;
     femurTimer = 0.0f;
     npc106Contained = 0;
@@ -2072,6 +2073,10 @@ static void loadSounds(void) {
     }
     snd205Horror = audioLoad(SFX_DIR "/SCP/205/Horror.ogg");
     snd914 = audioLoad(SFX_DIR "/SCP/513/914Refine.ogg");
+    for (int i = 0; i < 3; i++) {
+        snprintf(p, sizeof(p), SFX_DIR "/SCP/513_1/Bell%d.ogg", i);
+        snd513Bell[i] = audioLoad(p);
+    }
     sndAmbience = audioLoad(SFX_DIR "/Ambient/Room ambience/rumble.ogg");
     audioLoopAmbience(sndAmbience, 0.30f);
 }
@@ -2435,6 +2440,21 @@ static float rhYaw;
 static float rhFrame;
 static int refineHostilePending = -1; /* set by refine914 (-1 none) */
 
+/* ---- SCP-513-1: rung up by the SCP-513 bell, it haunts the player -
+ * flitting to the edge of sight and ringing bells (UpdateNPCType513_1).
+ * A persistent scare, never lethal. ---- */
+static SkinnedMesh *skin513;
+static float skin513Scale = 1.0f;
+static GLuint vbo513;
+static int posed513;
+static int npc513Active;
+static float npc513Pos[3];
+static float npc513Yaw;
+static float npc513Frame;
+static float npc513Timer;      /* reposition cadence */
+static float npc513Bell;       /* bell-ring cadence */
+static int snd513Bell[3] = { -1, -1, -1 };
+
 /* ---- SCP-1499-1: the hooded people of the mask dimension. They roam
  * and, once roused, converge and kill on contact (UpdateNPCType1499_1).
  * Shared walk phase, drawn per instance. ---- */
@@ -2556,6 +2576,12 @@ static void buildNpcAssets(void) {
         if (skin008) {
             skinnedBounds(skin008, mn, mx);
             if (mx[1] > mn[1]) skin008Scale = 300.0f / (mx[1] - mn[1]);
+        }
+        B3DModel *m513 = propModelGet("scp_513_1.b3d");
+        skin513 = m513 ? skinnedCreate(m513) : NULL;
+        if (skin513) {
+            skinnedBounds(skin513, mn, mx);
+            if (mx[1] > mn[1]) skin513Scale = 240.0f / (mx[1] - mn[1]);
         }
     }
     buildHumanRT(&introScientistRT, "class_d.b3d", "scientist.png");
@@ -6594,6 +6620,89 @@ static void drawRefineHostile(const float viewPos[3]) {
     drawSkinnedAt(sk, rhVbo, ibos, scale, rhPos, rhYaw);
 }
 
+/* ---- SCP-513-1: the bell-summoned haunt ---- */
+
+static void spawn513(void) {
+    if (!skin513) return;
+    npc513Active = 1;
+    npc513Timer = 0.0f;
+    npc513Bell = 0.0f;
+    npc513Frame = 0.0f;
+    float ang = camYaw + 1.2f;
+    npc513Pos[0] = camPos[0] + sinf(ang) * 450.0f;
+    npc513Pos[2] = camPos[2] - cosf(ang) * 450.0f;
+    npc513Pos[1] = camPos[1] - EYE_HEIGHT * 0.3f;
+    npc513Yaw = 0.0f;
+    if (snd513Bell[0] >= 0) audioPlay(snd513Bell[rand() % 3], 0.8f, 0.0f);
+}
+
+/* UpdateNPCType513_1: it lurks at the edge of sight; centring it makes it
+ * flit elsewhere, it tolls its bells now and then, and its presence eats
+ * at sanity - but it never touches you. */
+static void update513(void) {
+    if (!npc513Active || !skin513 || deathTimer > 0 || !walkMode
+        || introPhase >= 0 || inPocket || inMask) {
+        return;
+    }
+    npc513Frame += 0.3f;
+    if (npc513Frame > 200.0f) npc513Frame = 2.0f;
+    float dx = camPos[0] - npc513Pos[0], dz = camPos[2] - npc513Pos[2];
+    float len = sqrtf(dx * dx + dz * dz);
+    if (len < 1.0f) len = 1.0f;
+    float fx = sinf(camYaw), fz = -cosf(camYaw);
+    if ((-dx * fx - dz * fz) / len > 0.9f) {
+        npc513Timer = 999.0f; /* stared at: flit away now */
+    }
+    npc513Timer += 1.0f;
+    if (npc513Timer > 180.0f) {
+        npc513Timer = 0.0f;
+        float ang = camYaw + ((rand() % 2) ? 1.2f : -1.2f)
+                  + (float)((rand() % 40) - 20) * 0.01f;
+        float dist = 380.0f + (float)(rand() % 160);
+        npc513Pos[0] = camPos[0] + sinf(ang) * dist;
+        npc513Pos[2] = camPos[2] - cosf(ang) * dist;
+        npc513Pos[1] = camPos[1] - EYE_HEIGHT * 0.3f;
+        len = 1.0f;
+    }
+    npc513Yaw = atan2f(dx, dz) * 180.0f / 3.14159265f;
+    npc513Bell += 1.0f;
+    if (npc513Bell > 300.0f) {
+        npc513Bell = 0.0f;
+        if (snd513Bell[0] >= 0) {
+            audioPlay3D(snd513Bell[rand() % 3], npc513Pos, camPos, camYaw,
+                        1500.0f);
+        }
+    }
+    if (len < 700.0f) {
+        sanity -= 0.03f;
+        if (sanity < -1000.0f) sanity = -1000.0f;
+        if (blurAmount < 0.12f) blurAmount = 0.12f;
+    }
+}
+
+static void draw513(const float viewPos[3]) {
+    if (!npc513Active || !skin513) return;
+    float dx = npc513Pos[0] - viewPos[0], dz = npc513Pos[2] - viewPos[2];
+    if (dx * dx + dz * dz > VIEW_RANGE * VIEW_RANGE) return;
+    GLuint *ibos = skinIBOsFor(skin513);
+    if (!ibos) return;
+    if (!vbo513) glGenBuffers(1, &vbo513);
+    static int poseTick;
+    if (!posed513 || ((poseTick++) & 1) == 0) {
+        skinnedEval(skin513, npc513Frame);
+        uint32_t vc;
+        const SceneVertex *v = skinnedVertices(skin513, &vc);
+        glBindBuffer(GL_ARRAY_BUFFER, vbo513);
+        glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)(vc * sizeof(SceneVertex)),
+                     v, GL_DYNAMIC_DRAW);
+        glBindBuffer(GL_ARRAY_BUFFER, 0);
+        posed513 = 1;
+    }
+    float bob = sinf(gTick * 0.06f) * 10.0f;
+    float p[3] = { npc513Pos[0], npc513Pos[1] + 90.0f + bob, npc513Pos[2] };
+    drawSkinnedAt(skin513, vbo513, ibos, skin513Scale, p, npc513Yaw);
+}
+
 /* ---------------- items and inventory ---------------- */
 
 /* Templates and per-room spawns generated from the Blitz sources by
@@ -7237,6 +7346,12 @@ static const char *useInventoryItem(int slot) {
         wear268 = !wear268;
         return wear268 ? "YOU PUT ON THE CAP. YOU FEEL... UNNOTICEABLE"
                        : "YOU TAKE OFF THE CAP";
+    }
+    if (strcmp(name, "SCP-513") == 0) {
+        /* Ringing the bell summons SCP-513-1 (it keeps the bell). */
+        consumeSlot(slot);
+        spawn513();
+        return "YOU RING THE BELL. SOMETHING ANSWERS...";
     }
     if (strcmp(name, "Ballistic Vest") == 0) {
         wearVest = !wearVest;
@@ -10276,6 +10391,7 @@ int main(void) {
             update205();
             update914();
             updateRefineHostile();
+            update513();
             update173();
             update106();
             update096();
@@ -10577,6 +10693,7 @@ int main(void) {
             draw205(camPos);
             draw914(camPos);
             drawRefineHostile(camPos);
+            draw513(camPos);
             drawItems(camPos);
             draw173(camPos);
             draw106(camPos);
