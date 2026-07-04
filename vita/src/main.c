@@ -7872,11 +7872,51 @@ static const char *ZONE_MUSIC[4] = {
     DATA_ROOT "/SFX/Music/EntranceZone.ogg",
 };
 
+/* Per-SCP / per-room chamber music (Main_Core's ShouldPlay overrides).
+ * The base track is the room's zone music; entering a signature chamber
+ * or a monster starting its chase swaps in that encounter's track, and
+ * chase music outranks chamber music the way the source's ShouldPlay
+ * assignments do (a later, higher-priority event wins the frame).
+ * Returns a static path literal so callers can compare by pointer. */
+static const char *desiredMusicPath(void) {
+    if (!worldReady) return ZONE_MUSIC[1];
+    /* Chase music - highest priority, matches Music[10/12/19] and the
+     * 096 angered/chase streams. */
+    if (npc096Active && npc096State == S096_CHASE)
+        return DATA_ROOT "/SFX/Music/096Chase.ogg";
+    if (npc096Active && npc096State == S096_TRIGGERED)
+        return DATA_ROOT "/SFX/Music/096Angered.ogg";
+    if (npc106Active &&
+        (npc106State == N106_CHASING || npc106State == N106_GRABBING))
+        return DATA_ROOT "/SFX/Music/106Chase.ogg";
+    if (npc049Active &&
+        (npc049State == S049_PURSUE || npc049State == S049_KILL))
+        return DATA_ROOT "/SFX/Music/049Chase.ogg";
+    /* Signature chamber music while the player is in the room. */
+    const char *r = roomNameAt(camPos);
+    if (!strcmp(r, "cont1_079")) return DATA_ROOT "/SFX/Music/079Chamber.ogg";
+    if (!strcmp(r, "cont1_914")) return DATA_ROOT "/SFX/Music/914Chamber.ogg";
+    if (!strcmp(r, "cont2_012")) return DATA_ROOT "/SFX/Music/012Chamber.ogg";
+    if (!strcmp(r, "cont1_035")) return DATA_ROOT "/SFX/Music/035Chamber.ogg";
+    if (!strcmp(r, "cont2_049")) return DATA_ROOT "/SFX/Music/049Chamber.ogg";
+    if (!strcmp(r, "cont1_205")) return DATA_ROOT "/SFX/Music/205Chamber.ogg";
+    if (!strcmp(r, "cont1_106")) return DATA_ROOT "/SFX/Music/106Chamber.ogg";
+    if (!strcmp(r, "room3_storage"))
+        return DATA_ROOT "/SFX/Music/Room3_Storage.ogg";
+    if (!strcmp(r, "cont2_860_1"))
+        return DATA_ROOT "/SFX/Music/860_1_Blue.ogg";
+    /* Default: the room's zone track. */
+    return ZONE_MUSIC[zoneAt(camPos)];
+}
+
+static const char *currentMusicPath = NULL;
+
 static void gameMusicStart(void) {
     if (radioChannel >= 0) return; /* the radio owns the music path */
-    int z = worldReady ? zoneAt(camPos) : 1;
-    currentMusicZone = z;
-    audioStreamMusic(ZONE_MUSIC[z], 0.55f, 1);
+    const char *path = desiredMusicPath();
+    currentMusicPath = path;
+    currentMusicZone = worldReady ? zoneAt(camPos) : 1;
+    audioStreamMusic(path, 0.55f, 1);
 }
 
 /* Bleeding, healing and sanity, run each gameplay frame
@@ -7935,10 +7975,11 @@ static void updatePlayerCondition(void) {
 /* Called each gameplay frame: swap the track when the zone changes. */
 static void updateZoneMusic(void) {
     if (radioChannel >= 0 || !worldReady) return;
-    int z = zoneAt(camPos);
-    if (z != currentMusicZone) {
-        currentMusicZone = z;
-        audioStreamMusic(ZONE_MUSIC[z], 0.55f, 1);
+    const char *path = desiredMusicPath();
+    if (path != currentMusicPath) {
+        currentMusicPath = path;
+        currentMusicZone = zoneAt(camPos);
+        audioStreamMusic(path, 0.55f, 1);
     }
 }
 

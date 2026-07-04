@@ -107,6 +107,9 @@ Updated as features land. States: **done** / **partial** / **missing**.
 | Mixer (3D pan/attenuate, loops) | done | 48 kHz out, 64-bit positions |
 | Streamed music | done | Menu + LCZ track, radio stations |
 | Per-zone music switching | done | Track follows the room zone (LCZ/HCZ/EZ) |
+| Per-SCP / per-room chamber music | done | Source ShouldPlay overrides ported: entering a signature chamber swaps in that encounter's track (079/914/012/035/205/106/049 Chamber, Room3_Storage, 860_1_Blue), and a monster starting its hunt outranks it with chase music (096 Angered/Chase, 106 Chase, 049 Chase), falling back to the zone track otherwise. Polled each frame in `desiredMusicPath`; tracks stream on demand |
+| Chamber music not yet wired | partial | Gate_A/B, 008, 1123, 409, 1499Dimension/Chase and PD/PDTrench tracks exist but their trigger rooms/endings are not ported, so those specific cues never fire |
+| Intro / ending movies | not ported | PlayMovie / PlayStartupVideos (studio logos, intro cutscene, ending montages) have no player |
 | Footstep surface variants | done | Metal step/run set on grating/panel floors via down-ray texture test |
 | Door/interact/horror/intro voice sets | done | |
 | Ambient room emitters | done | Source AmbientSFX: every ~15-45 s a random distant one-shot from the current zone's set (SFX/Ambient/Zone1-3, or Forest in the SCP-860 room) drifts in - a scream, a groan, dripping - positioned off to one side of the player and attenuated with distance, so the facility never falls silent. Loaded on demand (the audio cache dedups by path; MAX_SOUNDS raised to fit). Suspended in the intro / pocket / mask dimensions |
