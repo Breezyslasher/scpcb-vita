@@ -7992,6 +7992,42 @@ static void updateRoomAmbience(void) {
     }
 }
 
+/* Ambient one-shots (source AmbientSFX): every so often a random distant
+ * sound from the current zone's set drifts in from the dark - a scream,
+ * a groan, dripping - positioned off to one side of the player. Loaded on
+ * demand (audioLoad caches by path). */
+static float ambSfxTimer = 300.0f;
+
+static void updateAmbientSfx(void) {
+    if (!worldReady || deathTimer > 0 || introPhase >= 0 || inPocket
+        || inMask) {
+        return;
+    }
+    if (ambSfxTimer > 0.0f) { ambSfxTimer -= 1.0f; return; }
+    const char *folder;
+    int count;
+    if (strcmp(roomNameAt(camPos), "cont2_860_1") == 0) {
+        folder = "Forest"; count = 10;      /* the SCP-860 forest */
+    } else {
+        int z = zoneAt(camPos);             /* 1 LCZ, 2 HCZ, 3 EZ */
+        if (z <= 1) { folder = "Zone1"; count = 11; }
+        else if (z == 2) { folder = "Zone2"; count = 11; }
+        else { folder = "Zone3"; count = 12; }
+    }
+    char path[256];
+    snprintf(path, sizeof(path), SFX_DIR "/Ambient/%s/Ambient%d.ogg",
+             folder, rand() % count);
+    int snd = audioLoad(path);
+    if (snd >= 0) {
+        float ang = (float)(rand() % 628) * 0.01f;
+        float dist = 500.0f + (float)(rand() % 1500);
+        float pos[3] = { camPos[0] + sinf(ang) * dist, camPos[1],
+                         camPos[2] - cosf(ang) * dist };
+        audioPlay3D(snd, pos, camPos, camYaw, dist * 2.2f);
+    }
+    ambSfxTimer = 900.0f + (float)(rand() % 1800); /* ~15-45 s at 60 fps */
+}
+
 /* Radio Transceiver: SCPRadio stations stream where the zone music
  * normally plays; switching it off restores the music. */
 static void radioSetChannel(int ch) {
@@ -10609,6 +10645,7 @@ int main(void) {
             if (introPhase < 0 && !inPocket) {
                 updateZoneMusic();
                 updateRoomAmbience();
+                updateAmbientSfx();
                 updateRoomEvents();
             }
             updatePocketDimension();

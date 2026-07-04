@@ -109,7 +109,7 @@ Updated as features land. States: **done** / **partial** / **missing**.
 | Per-zone music switching | done | Track follows the room zone (LCZ/HCZ/EZ) |
 | Footstep surface variants | done | Metal step/run set on grating/panel floors via down-ray texture test |
 | Door/interact/horror/intro voice sets | done | |
-| Ambient room emitters | missing | |
+| Ambient room emitters | done | Source AmbientSFX: every ~15-45 s a random distant one-shot from the current zone's set (SFX/Ambient/Zone1-3, or Forest in the SCP-860 room) drifts in - a scream, a groan, dripping - positioned off to one side of the player and attenuated with distance, so the facility never falls silent. Loaded on demand (the audio cache dedups by path; MAX_SOUNDS raised to fit). Suspended in the intro / pocket / mask dimensions |
 
 ## Known visual gaps
 
