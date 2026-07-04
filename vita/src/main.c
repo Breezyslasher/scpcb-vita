@@ -6658,7 +6658,10 @@ static const Refine914Row REFINE914[] = {
     { "Book",                { NULL, "Blank Paper", "SCP-1025", "Fine SCP-1025", "Fine SCP-1025" } },
 };
 
-static int refine914(int tpl, int setting) {
+/* The deterministic primary output for one (item, setting) - a single
+ * template, or -1 if the item is destroyed. The random / multi-output
+ * layers wrap this. */
+static int r914Base(int tpl, int setting) {
     if (tpl < 0) return -1;
     int si = setting + 2; /* -2..2 -> 0..4 */
     if (si < 0) si = 0;
@@ -6702,6 +6705,107 @@ static int refine914(int tpl, int setting) {
      * through untouched. */
     if (setting <= -1) return -1;
     return tpl;
+}
+
+/* Source Use914 has random "jackpot" rolls that replace the base output
+ * (e.g. a gas mask very rarely refines into SCP-1499). in/setting match;
+ * on a 1-in-oneIn roll the base is swapped for `item`. */
+typedef struct {
+    const char *in;
+    int setting;
+    const char *item;
+    int oneIn;
+} R914Rare;
+
+static const R914Rare R914_RARE[] = {
+    { "Gas Mask", 0, "Hazmat Suit", 4 },
+    { "Fine Gas Mask", 0, "Hazmat Suit", 4 },
+    { "Very Fine Gas Mask", 0, "Hazmat Suit", 4 },
+    { "Heavy Gas Mask", 0, "Hazmat Suit", 4 },
+    { "Gas Mask", 1, "SCP-1499", 50 },
+    { "Fine Gas Mask", 1, "SCP-1499", 50 },
+    { "Very Fine Gas Mask", 1, "SCP-1499", 50 },
+    { "Heavy Gas Mask", 1, "SCP-1499", 50 },
+    { "Gas Mask", 2, "SCP-1499", 100 },
+    { "Fine Gas Mask", 2, "SCP-1499", 100 },
+    { "Very Fine Gas Mask", 2, "SCP-1499", 100 },
+    { "Heavy Gas Mask", 2, "SCP-1499", 100 },
+    { "Night Vision Goggles", 1, "Fine SCRAMBLE Gear", 5 },
+    { "Fine Night Vision Goggles", 1, "Fine SCRAMBLE Gear", 5 },
+    { "Very Fine Night Vision Goggles", 1, "Fine SCRAMBLE Gear", 5 },
+};
+
+/* Source cases that spit out a SECOND item alongside the base. */
+typedef struct {
+    const char *in;
+    int setting;
+    const char *item;
+} R914Extra;
+
+static const R914Extra R914_EXTRA[] = {
+    { "Syringe", 2, "Infected Syringe" },
+    { "Fine Syringe", 2, "Infected Syringe" },
+    { "9V Battery", 2, "Strange Battery" },
+    { "18V Battery", 2, "Strange Battery" },
+    { "S-NAV Navigator", 2, "S-NAV Navigator Ultimate" },
+    { "S-NAV 300 Navigator", 2, "S-NAV Navigator Ultimate" },
+    { "S-NAV 310 Navigator", 2, "S-NAV Navigator Ultimate" },
+    { "E-Reader", 1, "Clipboard" },
+    { "E-Reader", 2, "Clipboard" },
+    { "E-Reader 20", 1, "Clipboard" },
+    { "E-Reader 30", 2, "Clipboard" },
+    { "Infected Syringe", 2, "Fine Syringe" },
+    { "SCP-005", 0, "White Severed Hand" },
+    { "SCP-005", 0, "Yellow Key" },
+    { "Mastercard", -1, "Quarter" },
+    { "Mastercard", -1, "Quarter" },
+    { "Mastercard", -1, "Quarter" },
+};
+
+static void r914Add(int out[6], int *n, const char *name) {
+    if (*n >= 6 || !name) return;
+    int t = itemTplFind(name);
+    if (t >= 0) out[(*n)++] = t;
+}
+
+/* Produce the SCP-914 output list for (item, setting): the primary output
+ * plus any deterministic second items, or a random jackpot replacement.
+ * Returns the number of items produced (0 = the item is destroyed). */
+static int refine914(int tpl, int setting, int out[6]) {
+    if (tpl < 0) return 0;
+    int n = 0;
+    const char *in = ITEM_TEMPLATES[tpl].name;
+    /* Random replacements first. */
+    for (unsigned r = 0; r < sizeof(R914_RARE) / sizeof(R914_RARE[0]); r++) {
+        if (R914_RARE[r].setting != setting
+            || strcmp(R914_RARE[r].in, in) != 0) {
+            continue;
+        }
+        if ((rand() % R914_RARE[r].oneIn) == 0) {
+            r914Add(out, &n, R914_RARE[r].item);
+            return n;
+        }
+        break;
+    }
+    /* Electronics Fine/Very Fine roll one of three tech outputs. */
+    if (strcmp(in, "Electronical Components") == 0 && setting >= 1) {
+        static const char *E_FINE[3] = { "Radio Transceiver",
+            "S-NAV 300 Navigator", "Night Vision Goggles" };
+        static const char *E_VF[3] = { "Fine Radio Transceiver",
+            "S-NAV 310 Navigator", "Very Fine Night Vision Goggles" };
+        r914Add(out, &n, (setting >= 2 ? E_VF : E_FINE)[rand() % 3]);
+        return n;
+    }
+    int base = r914Base(tpl, setting);
+    if (base >= 0) out[n++] = base;
+    /* Deterministic extra items. */
+    for (unsigned e = 0; e < sizeof(R914_EXTRA) / sizeof(R914_EXTRA[0]); e++) {
+        if (R914_EXTRA[e].setting == setting
+            && strcmp(R914_EXTRA[e].in, in) == 0) {
+            r914Add(out, &n, R914_EXTRA[e].item);
+        }
+    }
+    return n;
 }
 
 static void spawn914(void) {
@@ -6783,13 +6887,22 @@ static void update914(void) {
     if (scp914Timer > 180.0f) {  /* the doors reopen after ~3 s */
         scp914State = 0;
         set914Doors(1); /* the booths open on the finished output */
-        int out = refine914(scp914RefineTpl, scp914Setting);
+        int out[6];
+        int n = refine914(scp914RefineTpl, scp914Setting, out);
         scp914RefineTpl = -1;
-        if (out >= 0) {
-            worldItemAdd(out, scp914Out[0], scp914Out[1] + 20.0f,
-                         scp914Out[2]);
-            snprintf(toastMsg, sizeof(toastMsg), "SCP-914 OUTPUT: %s",
-                     ITEM_TEMPLATES[out].name);
+        if (n > 0) {
+            for (int i = 0; i < n; i++) {
+                worldItemAdd(out[i], scp914Out[0] + (float)(i * 60),
+                             scp914Out[1] + 20.0f, scp914Out[2]);
+            }
+            if (n > 1) {
+                snprintf(toastMsg, sizeof(toastMsg),
+                         "SCP-914 OUTPUT: %s (+%d more)",
+                         ITEM_TEMPLATES[out[0]].name, n - 1);
+            } else {
+                snprintf(toastMsg, sizeof(toastMsg), "SCP-914 OUTPUT: %s",
+                         ITEM_TEMPLATES[out[0]].name);
+            }
         } else {
             snprintf(toastMsg, sizeof(toastMsg), "SCP-914 DESTROYED IT");
         }
