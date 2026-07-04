@@ -1920,6 +1920,10 @@ typedef struct {
  * difficulty table itself lives with the menu code below). */
 static int invSlotCap = 10;
 static int npcAggressive = 0;
+/* Difficulty tier (source SelectedDifficulty\OtherFactors): 0 Easy .. 3
+ * Extreme. Set by applyDifficulty; used by SCP-914's keycard Mastercard
+ * odds. */
+static int gDiffFactor = 1;
 
 #define SFX_DIR DATA_ROOT "/SFX"
 
@@ -2417,6 +2421,19 @@ static float npc205Frame;
 static float npc205Rise;        /* 0..1 how far it has risen/loomed */
 static float npc205Horror;      /* horror-cue cadence */
 
+/* ---- Hostiles SCP-914 can produce: an SCP-008 zombie (from a refined
+ * severed hand) or a hostile SCP-1499 (from Very Fine SCP-1499). One at a
+ * time; it shambles to the player and kills on contact. ---- */
+static SkinnedMesh *skin008;
+static float skin008Scale = 1.0f;
+static GLuint rhVbo;             /* shared render buffer for the hostile */
+static int rhActive;
+static int rhType;               /* 0 = SCP-008, 1 = SCP-1499 */
+static float rhPos[3];
+static float rhYaw;
+static float rhFrame;
+static int refineHostilePending = -1; /* set by refine914 (-1 none) */
+
 /* ---- SCP-1499-1: the hooded people of the mask dimension. They roam
  * and, once roused, converge and kill on contact (UpdateNPCType1499_1).
  * Shared walk phase, drawn per instance. ---- */
@@ -2532,6 +2549,12 @@ static void buildNpcAssets(void) {
         if (skin205) {
             skinnedBounds(skin205, mn, mx);
             if (mx[1] > mn[1]) skin205Scale = 300.0f / (mx[1] - mn[1]);
+        }
+        B3DModel *m008 = propModelGet("scp_008_1.b3d");
+        skin008 = m008 ? skinnedCreate(m008) : NULL;
+        if (skin008) {
+            skinnedBounds(skin008, mn, mx);
+            if (mx[1] > mn[1]) skin008Scale = 300.0f / (mx[1] - mn[1]);
         }
     }
     buildHumanRT(&introScientistRT, "class_d.b3d", "scientist.png");
@@ -6479,6 +6502,69 @@ static void draw205(const float viewPos[3]) {
     drawSkinnedAt(skin205, vbo205, ibos, skin205Scale, p, npc205Yaw);
 }
 
+/* ---- SCP-914's hostile output (SCP-008 zombie / hostile SCP-1499) ---- */
+
+static void spawnRefineHostile(int type) {
+    if (type == 0 && !skin008) return;
+    if (type == 1 && !skin1499) return;
+    rhActive = 1;
+    rhType = type;
+    rhPos[0] = scp914Out[0];
+    rhPos[2] = scp914Out[2];
+    float o[3] = { rhPos[0], scp914Out[1] + 200.0f, rhPos[2] };
+    float hy;
+    rhPos[1] = rayDownWorld(o, 800.0f, &hy) ? hy : scp914Out[1];
+    rhFrame = 0.0f;
+    rhYaw = 0.0f;
+    if (type == 0 && snd939Horror >= 0) audioPlay(snd939Horror, 0.8f, 0.0f);
+    if (type == 1 && snd1499Trig >= 0) audioPlay(snd1499Trig, 0.9f, 0.0f);
+}
+
+static void updateRefineHostile(void) {
+    if (!rhActive || deathTimer > 0 || !walkMode || introPhase >= 0
+        || inPocket || inMask) {
+        return;
+    }
+    float dx = camPos[0] - rhPos[0], dz = camPos[2] - rhPos[2];
+    float dist = sqrtf(dx * dx + dz * dz);
+    rhFrame += 0.25f;
+    if (rhFrame > 200.0f) rhFrame = 2.0f;
+    float speed = 9.0f + (float)npcAggressive * 3.0f;
+    if (dist > 1.0f) {
+        rhPos[0] += dx / dist * speed;
+        rhPos[2] += dz / dist * speed;
+        rhYaw = atan2f(dx, dz) * 180.0f / 3.14159265f;
+    }
+    float o[3] = { rhPos[0], rhPos[1] + 250.0f, rhPos[2] };
+    float hy;
+    if (rayDownWorld(o, 600.0f, &hy)) rhPos[1] = hy;
+    if (dist < 190.0f) {
+        snprintf(deathCause, sizeof(deathCause),
+                 rhType == 0 ? "SCP-008" : "SCP-1499");
+        deathTimer = 180;
+    }
+}
+
+static void drawRefineHostile(const float viewPos[3]) {
+    if (!rhActive) return;
+    SkinnedMesh *sk = rhType == 0 ? skin008 : skin1499;
+    float scale = rhType == 0 ? skin008Scale : skin1499Scale;
+    if (!sk) return;
+    float dx = rhPos[0] - viewPos[0], dz = rhPos[2] - viewPos[2];
+    if (dx * dx + dz * dz > VIEW_RANGE * VIEW_RANGE) return;
+    GLuint *ibos = skinIBOsFor(sk);
+    if (!ibos) return;
+    if (!rhVbo) glGenBuffers(1, &rhVbo);
+    skinnedEval(sk, rhFrame);
+    uint32_t vc;
+    const SceneVertex *v = skinnedVertices(sk, &vc);
+    glBindBuffer(GL_ARRAY_BUFFER, rhVbo);
+    glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)(vc * sizeof(SceneVertex)),
+                 v, GL_DYNAMIC_DRAW);
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+    drawSkinnedAt(sk, rhVbo, ibos, scale, rhPos, rhYaw);
+}
+
 /* ---------------- items and inventory ---------------- */
 
 /* Templates and per-room spawns generated from the Blitz sources by
@@ -6772,9 +6858,38 @@ static void r914Add(int out[6], int *n, const char *name) {
  * plus any deterministic second items, or a random jackpot replacement.
  * Returns the number of items produced (0 = the item is destroyed). */
 static int refine914(int tpl, int setting, int out[6]) {
+    refineHostilePending = -1;
     if (tpl < 0) return 0;
     int n = 0;
     const char *in = ITEM_TEMPLATES[tpl].name;
+    /* The two NPC-producing outcomes (Use914): Very Fine SCP-1499 breeds a
+     * hostile SCP-1499, and a refined severed hand (Fine/Very Fine) breeds
+     * an SCP-008 zombie. They emit no item. */
+    if (setting >= 2 && (strcmp(in, "SCP-1499") == 0
+                         || strcmp(in, "Fine SCP-1499") == 0)) {
+        refineHostilePending = 1;
+        return 0;
+    }
+    if (setting >= 1 && (strcmp(in, "White Severed Hand") == 0
+                         || strcmp(in, "Black Severed Hand") == 0
+                         || strcmp(in, "Yellow Severed Hand") == 0)) {
+        refineHostilePending = 0;
+        return 0;
+    }
+    /* Keycard Fine/Very Fine can jackpot a Mastercard, with odds that
+     * climb with difficulty (source SelectedDifficulty\OtherFactors:
+     * Easy never, up to ~2/3 on Extreme Very Fine). */
+    if (setting >= 1 && itemKeycardLevel(tpl) > 0) {
+        static const int MC_FINE[4] = { 0, 17, 20, 25 };
+        static const int MC_VF[4]   = { 0, 33, 50, 67 };
+        int f = gDiffFactor;
+        if (f < 0 || f > 3) f = 1;
+        int pct = (setting >= 2 ? MC_VF : MC_FINE)[f];
+        if (pct > 0 && (rand() % 100) < pct) {
+            r914Add(out, &n, "Mastercard");
+            return n;
+        }
+    }
     /* Random replacements first. */
     for (unsigned r = 0; r < sizeof(R914_RARE) / sizeof(R914_RARE[0]); r++) {
         if (R914_RARE[r].setting != setting
@@ -6810,6 +6925,8 @@ static int refine914(int tpl, int setting, int out[6]) {
 
 static void spawn914(void) {
     scp914Ok = 0;
+    rhActive = 0;
+    refineHostilePending = -1;
     scp914State = 0;
     scp914Setting = 0;
     scp914Timer = 0.0f;
@@ -6890,7 +7007,15 @@ static void update914(void) {
         int out[6];
         int n = refine914(scp914RefineTpl, scp914Setting, out);
         scp914RefineTpl = -1;
-        if (n > 0) {
+        if (refineHostilePending >= 0) {
+            spawnRefineHostile(refineHostilePending);
+            snprintf(toastMsg, sizeof(toastMsg),
+                     refineHostilePending == 0
+                         ? "SCP-914 BIRTHED SOMETHING WRONG..."
+                         : "IT CAME THROUGH WITH YOU...");
+            toastTimer = 240;
+            refineHostilePending = -1;
+        } else if (n > 0) {
             for (int i = 0; i < n; i++) {
                 worldItemAdd(out[i], scp914Out[0] + (float)(i * 60),
                              scp914Out[1] + 20.0f, scp914Out[2]);
@@ -7230,6 +7355,7 @@ static void applyDifficulty(int d) {
     gameDiff = d;
     invSlotCap = DIFFICULTIES[d].slots;
     npcAggressive = DIFFICULTIES[d].aggressiveNPCs;
+    gDiffFactor = DIFFICULTIES[d].factors;
 }
 
 /* ---- new game form state ---- */
@@ -10120,6 +10246,7 @@ int main(void) {
             update372();
             update205();
             update914();
+            updateRefineHostile();
             update173();
             update106();
             update096();
@@ -10420,6 +10547,7 @@ int main(void) {
             draw372(camPos);
             draw205(camPos);
             draw914(camPos);
+            drawRefineHostile(camPos);
             drawItems(camPos);
             draw173(camPos);
             draw106(camPos);
