@@ -7709,6 +7709,7 @@ static void applyDifficulty(int d) {
 static char newName[16];
 static char newSeedStr[16];
 static int introEnabled = 1;
+static int startupVideosEnabled = 1; /* opt\PlayStartup: boot splash clips */
 static int newSel; /* focused row */
 
 static char curSaveName[16] = "untitled";
@@ -7797,8 +7798,9 @@ static void optionsApply(void) {
 static void optionsSave(void) {
     FILE *f = fopen(OPTIONS_PATH, "w");
     if (!f) return;
-    fprintf(f, "music=%f\nsfx=%f\nsens=%f\ninverty=%d\nintro=%d\n",
-            optMusicVol, optSfxVol, optLookSens, optInvertY, introEnabled);
+    fprintf(f, "music=%f\nsfx=%f\nsens=%f\ninverty=%d\nintro=%d\nstartup=%d\n",
+            optMusicVol, optSfxVol, optLookSens, optInvertY, introEnabled,
+            startupVideosEnabled);
     fclose(f);
 }
 
@@ -7817,6 +7819,8 @@ static void optionsLoad(void) {
             optInvertY = (int)strtol(line + 8, NULL, 10);
         } else if (strncmp(line, "intro=", 6) == 0) {
             introEnabled = (int)strtol(line + 6, NULL, 10);
+        } else if (strncmp(line, "startup=", 8) == 0) {
+            startupVideosEnabled = (int)strtol(line + 8, NULL, 10);
         }
     }
     fclose(f);
@@ -9993,7 +9997,7 @@ static void loadGameTab(void) {
 
 /* ---- OPTIONS tab ---- */
 
-#define OPT_ROWS 4
+#define OPT_ROWS 5
 
 static void optionsTab(void) {
     const float SX = MENU_SX, SY = MENU_SY;
@@ -10024,6 +10028,8 @@ static void optionsTab(void) {
                 optionsApply();
             } else if (i == 3) {
                 optInvertY = !optInvertY;
+            } else if (i == 4) {
+                startupVideosEnabled = !startupVideosEnabled;
             } else {
                 rgt = 1; /* sensitivity: tap steps forward */
             }
@@ -10052,10 +10058,14 @@ static void optionsTab(void) {
             case 3:
                 optInvertY = !optInvertY;
                 break;
+            case 4:
+                startupVideosEnabled = !startupVideosEnabled;
+                break;
         }
     }
     if (inputHit(ACTION_INTERACT)) {
         if (optSel == 3) optInvertY = !optInvertY;
+        if (optSel == 4) startupVideosEnabled = !startupVideosEnabled;
         if (optSel == backIdx) {
             optionsSave();
             menuTab = 0;
@@ -10069,10 +10079,11 @@ static void optionsTab(void) {
     }
 
     drawTabHeader("OPTIONS", optSel == backIdx);
-    drawFrame(x, y, 580.0f * SX, 260.0f * SY, 0);
+    drawFrame(x, y, 580.0f * SX, 310.0f * SY, 0);
 
     const char *labels[OPT_ROWS] = {
         "Music volume", "Sound volume", "Look sensitivity", "Invert Y axis",
+        "Startup videos",
     };
     for (int i = 0; i < OPT_ROWS; i++) {
         float ry = y + (30.0f + i * 55.0f) * SY;
@@ -10087,8 +10098,11 @@ static void optionsTab(void) {
                      (int)(optSfxVol * 100.0f + 0.5f));
         } else if (i == 2) {
             snprintf(val, sizeof(val), "< %.2fx >", optLookSens);
-        } else {
+        } else if (i == 3) {
             snprintf(val, sizeof(val), "< %s >", optInvertY ? "ON" : "OFF");
+        } else {
+            snprintf(val, sizeof(val), "< %s >",
+                     startupVideosEnabled ? "ON" : "OFF");
         }
         mtext(x + 330.0f * SX, ry, 1.5f, g, g, g, val);
         /* Volume sliders like the game's option bars. */
@@ -10100,7 +10114,7 @@ static void optionsTab(void) {
                      0.85f, 0.85f, 0.85f, 1.0f);
         }
     }
-    mtext(x + 24.0f * SX, y + 260.0f * SY + 10.0f, 1.5f, 0.5f, 0.5f, 0.5f,
+    mtext(x + 24.0f * SX, y + 310.0f * SY + 10.0f, 1.5f, 0.5f, 0.5f, 0.5f,
           "left/right: adjust   O: back");
 }
 
@@ -10189,6 +10203,72 @@ static void enterMenu(void) {
     invOpen = 0;
     docOpen = 0;
     menuMusicStart();
+}
+
+/* Startup splash videos (Graphics_Core PlayStartupVideos): the studio
+ * idents and the content warning play in order before the title menu.
+ * The Vita has no WMV/VC-1 decoder, so the motion frames can't be
+ * shown; the port stays faithful to the sequence - the paired .ogg
+ * audio plays in full, each clip's title card is held for the length of
+ * that audio, and any button or a touch skips the current clip. Gated
+ * by the "Startup videos" option (opt\PlayStartup); a fresh install has
+ * no options file, so it runs once and the player can turn it off. */
+static int startupSkipPressed(void) {
+    float tx, ty;
+    return inputHit(ACTION_INTERACT) || inputHit(ACTION_MENU)
+        || inputHit(ACTION_CROUCH) || inputHit(ACTION_INVENTORY)
+        || inputHit(ACTION_USE_ITEM) || inputHit(ACTION_SAVE)
+        || inputDpadDownHit() || inputTouchTap(&tx, &ty);
+}
+
+static void playStartupVideos(void) {
+    if (!startupVideosEnabled) return;
+    /* The clips are the studio idents and the content warning; the Vita
+     * can't decode the .wmv motion, so each is a title card over its
+     * original audio. */
+    static const struct {
+        const char *file, *title, *sub;
+    } CLIPS[4] = {
+        { "startup_Undertow", "UNDERTOW GAMES", "" },
+        { "startup_TSS", "SCP - CONTAINMENT BREACH", "Ultimate Edition" },
+        { "startup_UET", "ULTIMATE EDITION TEAM", "" },
+        { "startup_Warning", "WARNING",
+          "Contains flashing lights and disturbing imagery." },
+    };
+    for (int i = 0; i < 4; i++) {
+        char path[256];
+        snprintf(path, sizeof(path), MENU_DIR "/%s.ogg", CLIPS[i].file);
+        audioStreamMusic(path, optSfxVol, 0);
+        for (int frames = 0;; frames++) {
+            inputUpdate();
+            /* A few frames of grace so the mixer thread opens the stream
+             * before the "audio finished" test can fire, and so a button
+             * still held from the previous clip does not skip this one. */
+            if (frames > 8) {
+                if (!audioMusicPlaying()) break;
+                if (startupSkipPressed()) { audioStopMusic(); break; }
+            }
+            if (frames > 3600) { audioStopMusic(); break; } /* 60s safety */
+
+            glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+            glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+            beginHud2D();
+            drawQuad(0, 0, SCREEN_W, SCREEN_H, 0, 0.0f, 0.0f, 0.0f, 1.0f);
+            /* Fade the card in over the first ~0.5 s. */
+            float a = frames < 30 ? frames / 30.0f : 1.0f;
+            mtextC(SCREEN_W * 0.5f, SCREEN_H * 0.44f, 3.0f, a, a, a,
+                   CLIPS[i].title);
+            if (CLIPS[i].sub[0]) {
+                mtextC(SCREEN_W * 0.5f, SCREEN_H * 0.44f + 44.0f, 1.6f,
+                       a * 0.75f, a * 0.75f, a * 0.75f, CLIPS[i].sub);
+            }
+            mtextC(SCREEN_W * 0.5f, SCREEN_H - 34.0f, 1.3f, 0.4f, 0.4f, 0.4f,
+                   "Press any button to skip");
+            endHud2D();
+            vglSwapBuffers(GL_FALSE);
+        }
+    }
+    audioStopMusic();
 }
 
 /* Pause menu: the game's pause_menu.png panel with its button column
@@ -10312,6 +10392,7 @@ int main(void) {
          * player starts or loads a game. */
         srand((unsigned)sceKernelGetProcessTimeWide());
         pendingSeed = (uint32_t)(sceKernelGetProcessTimeWide() & 0xFFFFFF) | 1u;
+        playStartupVideos();
         enterMenu();
     } else {
         snprintf(statusLine, sizeof(statusLine),

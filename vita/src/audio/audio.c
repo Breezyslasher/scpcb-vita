@@ -424,3 +424,10 @@ void audioStreamMusic(const char *path, float vol, int loop) {
 void audioStopMusic(void) {
     musicReq = 2;
 }
+
+int audioMusicPlaying(void) {
+    /* A pending start counts as playing so a just-started clip is not
+     * reported finished before the mixer thread opens it; a non-looping
+     * stream clears musicV at EOF. */
+    return musicReq == 1 || musicV != NULL;
+}
