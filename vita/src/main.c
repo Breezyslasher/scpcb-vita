@@ -765,6 +765,10 @@ static int snd914 = -1;
 /* SCP-513-1's bells (declared early: loaded in loadSounds). */
 static int snd513Bell[3] = { -1, -1, -1 };
 static int npc513Active;   /* reset in regenerateMap, so declared early */
+/* SCP-035's get-up sound + victim texture (declared early: loaded in
+ * loadSounds / buildDoorAssets). */
+static int snd035GetUp = -1;
+static GLuint tex035;
 static GLuint teslaArcTex;
 static float teslaFlash;       /* white screen flash when it zaps nearby */
 
@@ -1677,6 +1681,7 @@ static void spawn012(void);
 static void spawn372(void);
 static void spawn205(void);
 static void spawn914(void);
+static void spawn035(void);
 
 static void regenerateMap(uint32_t seed) {
     memset(roomVisited, 0, sizeof(roomVisited));
@@ -1738,6 +1743,7 @@ static void regenerateMap(uint32_t seed) {
         spawn372();
         spawn205();
         spawn914();
+        spawn035();
         eventRng = mapSeed ^ 0xA5A5F00Du;
         spawnItems();
         spawnRoomDecals();
@@ -2080,6 +2086,7 @@ static void loadSounds(void) {
         snprintf(p, sizeof(p), SFX_DIR "/SCP/513_1/Bell%d.ogg", i);
         snd513Bell[i] = audioLoad(p);
     }
+    snd035GetUp = audioLoad(SFX_DIR "/SCP/035/GetUp.ogg");
     sndAmbience = audioLoad(SFX_DIR "/Ambient/Room ambience/rumble.ogg");
     audioLoopAmbience(sndAmbience, 0.30f);
 }
@@ -2282,6 +2289,7 @@ static void buildDoorAssets(void) {
     /* Monitor prop for the camera feed (source Scale = RoomScale*1.8). */
     buildModelRT(&monitorRT, "monitor2.b3d", 0, 0, 0, NULL);
     monitorRT.scale[0] = monitorRT.scale[1] = monitorRT.scale[2] = 1.8f;
+    tex035 = textureGet("scp_035_victim.png");
     /* SCP-914's knob and control key (source ScaleEntity RoomScale -> 1). */
     buildModelRT(&knob914RT, "scp_914_knob.b3d", 0, 0, 0, NULL);
     knob914RT.scale[0] = knob914RT.scale[1] = knob914RT.scale[2] = 1.0f;
@@ -2455,6 +2463,17 @@ static float npc513Yaw;
 static float npc513Frame;
 static float npc513Timer;      /* reposition cadence */
 static float npc513Bell;       /* bell-ring cadence */
+
+/* ---- SCP-035: the possessive mask (cont1_035). Its Class-D host sits
+ * slumped until you look at it up close, then it gets up and hunts.
+ * (tex035 declared with the early texture globals.) ---- */
+static GLuint vbo035;
+static int npc035Ok;
+static int npc035State;        /* 0 seated, 1 risen/hunting */
+static float npc035Pos[3];
+static float npc035Home[3];
+static float npc035Yaw;
+static float npc035Frame;
 
 /* ---- SCP-1499-1: the hooded people of the mask dimension. They roam
  * and, once roused, converge and kill on contact (UpdateNPCType1499_1).
@@ -6707,6 +6726,95 @@ static void draw513(const float viewPos[3]) {
     drawSkinnedAt(skin513, vbo513, ibos, skin513Scale, p, npc513Yaw);
 }
 
+/* ---- SCP-035: the possessed host (cont1_035) ---- */
+
+static void spawn035(void) {
+    npc035Ok = 0;
+    npc035State = 0;
+    npc035Frame = 0.0f;
+    if (!skinClassD) return;
+    for (uint32_t r = 0; r < map.roomCount; r++) {
+        const RoomPlacement *p = &map.rooms[r];
+        if (strcmp(tplList.items[p->templateIndex].name, "cont1_035") != 0) {
+            continue;
+        }
+        float local[3] = { -576.0f, 0.5f, 640.0f }, w[3];
+        localToWorld(p, local, w);
+        npc035Pos[0] = w[0]; npc035Pos[1] = w[1]; npc035Pos[2] = w[2];
+        npc035Home[0] = w[0]; npc035Home[1] = w[1]; npc035Home[2] = w[2];
+        npc035Yaw = (float)(p->angle * 90) + 270.0f;
+        npc035Ok = 1;
+        break;
+    }
+}
+
+/* e_cont1_035: the possessed Class-D slumps in the chamber until you look
+ * at it up close, then it gets up (GetUp.ogg) and hunts you down, killing
+ * on contact. The gas-lever containment puzzle and the corrosive
+ * tentacles are not reproduced. */
+static void update035(void) {
+    if (!npc035Ok || !skinClassD || deathTimer > 0 || !walkMode
+        || introPhase >= 0) {
+        return;
+    }
+    npc035Frame += npc035State ? 0.5f : 0.1f;
+    if (npc035Frame > 300.0f) npc035Frame = 2.0f;
+    float dx = camPos[0] - npc035Pos[0], dz = camPos[2] - npc035Pos[2];
+    float dist = sqrtf(dx * dx + dz * dz);
+    if (npc035State == 0) {
+        if (strcmp(roomNameAt(camPos), "cont1_035") != 0) return;
+        if (dist < 900.0f) {
+            float len = dist < 1.0f ? 1.0f : dist;
+            float fx = sinf(camYaw), fz = -cosf(camYaw);
+            if ((dx * fx + dz * fz) / len > 0.6f) { /* you look at it */
+                npc035State = 1;
+                if (snd035GetUp >= 0) audioPlay(snd035GetUp, 0.9f, 0.0f);
+                snprintf(toastMsg, sizeof(toastMsg),
+                         "IT WEARS A SMILING FACE...");
+                toastTimer = 200;
+            }
+        }
+    } else {
+        if (dist > 1.0f) {
+            float speed = 8.0f + (float)npcAggressive * 3.0f;
+            npc035Pos[0] += dx / dist * speed;
+            npc035Pos[2] += dz / dist * speed;
+            npc035Yaw = atan2f(dx, dz) * 180.0f / 3.14159265f;
+        }
+        float o[3] = { npc035Pos[0], npc035Pos[1] + 250.0f, npc035Pos[2] };
+        float hy;
+        if (rayDownWorld(o, 600.0f, &hy)) npc035Pos[1] = hy;
+        if (dist < 190.0f) {
+            snprintf(deathCause, sizeof(deathCause), "SCP-035");
+            deathTimer = 180;
+        }
+        if (dist > 3400.0f) { /* lost you: sit back down */
+            npc035State = 0;
+            npc035Pos[0] = npc035Home[0];
+            npc035Pos[1] = npc035Home[1];
+            npc035Pos[2] = npc035Home[2];
+        }
+    }
+}
+
+static void draw035(const float viewPos[3]) {
+    if (!npc035Ok || !skinClassD) return;
+    float dx = npc035Pos[0] - viewPos[0], dz = npc035Pos[2] - viewPos[2];
+    if (dx * dx + dz * dz > VIEW_RANGE * VIEW_RANGE) return;
+    GLuint *ibos = skinIBOsFor(skinClassD);
+    if (!ibos) return;
+    if (!vbo035) glGenBuffers(1, &vbo035);
+    skinnedEval(skinClassD, npc035Frame);
+    uint32_t vc;
+    const SceneVertex *v = skinnedVertices(skinClassD, &vc);
+    glBindBuffer(GL_ARRAY_BUFFER, vbo035);
+    glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)(vc * sizeof(SceneVertex)),
+                 v, GL_DYNAMIC_DRAW);
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+    drawSkinnedAtTex(skinClassD, vbo035, ibos, skinClassDScale, npc035Pos,
+                     npc035Yaw, tex035);
+}
+
 /* ---------------- items and inventory ---------------- */
 
 /* Templates and per-room spawns generated from the Blitz sources by
@@ -10394,6 +10502,7 @@ int main(void) {
             update372();
             update205();
             update914();
+            update035();
             updateRefineHostile();
             update513();
             update173();
@@ -10696,6 +10805,7 @@ int main(void) {
             draw372(camPos);
             draw205(camPos);
             draw914(camPos);
+            draw035(camPos);
             drawRefineHostile(camPos);
             draw513(camPos);
             drawItems(camPos);
