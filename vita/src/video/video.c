@@ -248,6 +248,8 @@ int videoPlayFile(const char *path) {
     fclose(probe);
     vlog("  file present, %ld bytes", fsz);
 
+    vlog("  sizeof(SceAvPlayerInitData)=%u", (unsigned)sizeof(SceAvPlayerInitData));
+
     SceAvPlayerInitData init;
     memset(&init, 0, sizeof(init));
     init.memoryReplacement.allocate = mem_alloc;
@@ -266,8 +268,40 @@ int videoPlayFile(const char *path) {
     gPlayer = sceAvPlayerInit(&init);
     vlog("  sceAvPlayerInit -> handle=%d", gPlayer);
     if (gPlayer < 0) return 0;
-    int addRc = sceAvPlayerAddSource(gPlayer, path);
-    vlog("  sceAvPlayerAddSource -> 0x%08X", (unsigned)addRc);
+
+    /* AddSource has been returning INVALID_PARAM before ever calling our
+     * file_open, so the built-in demux path parser (not the file I/O) is
+     * rejecting the string. Try a few path spellings and keep the first
+     * the player accepts. "ux0:/data/..." (slash after the colon) is the
+     * form the internal URL parser tends to want. */
+    char slashed[256];
+    const char *variants[2];
+    variants[0] = path;
+    slashed[0] = '\0';
+    const char *colon = strchr(path, ':');
+    if (colon && colon[1] != '/') {
+        size_t pre = (size_t)(colon - path) + 1; /* include the ':' */
+        if (pre < sizeof(slashed) - 1) {
+            memcpy(slashed, path, pre);
+            slashed[pre] = '/';
+            snprintf(slashed + pre + 1, sizeof(slashed) - pre - 1, "%s",
+                     colon + 1);
+            variants[1] = slashed;
+        } else {
+            variants[1] = path;
+        }
+    } else {
+        variants[1] = path;
+    }
+
+    int addRc = -1;
+    for (int v = 0; v < 2; v++) {
+        if (v == 1 && variants[1] == path) break; /* no distinct 2nd form */
+        addRc = sceAvPlayerAddSource(gPlayer, variants[v]);
+        vlog("  AddSource[%d] \"%s\" -> 0x%08X", v, variants[v],
+             (unsigned)addRc);
+        if (addRc >= 0) break;
+    }
     if (addRc < 0) {
         sceAvPlayerClose(gPlayer);
         return 0;
