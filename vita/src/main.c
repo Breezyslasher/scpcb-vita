@@ -21,6 +21,7 @@
 #include <vitaGL.h>
 
 #include "audio/audio.h"
+#include "video/video.h"
 #include "formats/b3d.h"
 #include "formats/rmesh.h"
 #include "formats/texture.h"
@@ -7710,6 +7711,7 @@ static char newName[16];
 static char newSeedStr[16];
 static int introEnabled = 1;
 static int startupVideosEnabled = 1; /* opt\PlayStartup: boot splash clips */
+static int pendingIntroVideo;        /* play startup_Intro on 1st game frame */
 static int newSel; /* focused row */
 
 static char curSaveName[16] = "untitled";
@@ -9680,6 +9682,10 @@ static int startNewGame(void) {
     gameState = 1;
     worldReady = 1;
     pauseOpen = 0;
+    /* The pre-rendered intro cutscene plays before the wake-up, gated
+     * by both the intro and the startup-videos options (like the
+     * source's PlayMovie, which honours opt\PlayStartup). */
+    pendingIntroVideo = introEnabled && startupVideosEnabled;
     if (introEnabled) {
         introStart();
         /* You wake with the orientation leaflet (the no-intro path
@@ -10271,6 +10277,20 @@ static void playStartupVideos(void) {
     audioStopMusic();
 }
 
+/* The startup_Intro cutscene (Menu_Core PlayMovie("startup_Intro")):
+ * played when a new game begins with the intro enabled. The source .wmv
+ * is undecodable on the Vita, but the same cutscene ships as H.264 MP4
+ * (three sequential fragments), which sceAvPlayer hardware-decodes.
+ * Deferred to the first game frame via this flag so it runs outside the
+ * menu's HUD 2D scope. */
+static void playIntroVideo(void) {
+    if (!videoInit()) return;
+    audioStopMusic();
+    videoPlayFile(MENU_DIR "/startup_Intro1.mp4");
+    videoPlayFile(MENU_DIR "/startup_Intro2.mp4");
+    videoPlayFile(MENU_DIR "/startup_Intro3.mp4");
+}
+
 /* Pause menu: the game's pause_menu.png panel with its button column
  * (PAUSED / RESUME / QUIT TO MENU labels from local.ini). */
 static void drawPauseMenu(void) {
@@ -10424,6 +10444,13 @@ int main(void) {
             endHud2D();
             vglSwapBuffers(GL_FALSE);
             continue;
+        }
+
+        /* First frame of a fresh game: play the intro cutscene (it takes
+         * over the screen with its own render loop) before gameplay. */
+        if (haveData && pendingIntroVideo) {
+            pendingIntroVideo = 0;
+            playIntroVideo();
         }
 
         if (haveData && inputHit(ACTION_MENU)) {
