@@ -705,6 +705,7 @@ static int npc1499Type[MAX_1499];      /* 0 citizen 1 king-guard 2 king
 static int npc1499Active[MAX_1499];
 static int npc1499Aggro[MAX_1499];     /* this member has turned hostile */
 static float npc1499Frame[MAX_1499];   /* per-member animation phase */
+static int npc1499Chat[MAX_1499];      /* citizen's conversation partner, -1 none */
 static int npc1499Count;
 static int pdRoomIdx = -1;
 static int inPocket;          /* player is in the pocket dimension */
@@ -2396,6 +2397,8 @@ static float npc939Pos[3];
 static float npc939YawDeg;
 static float npc939Frame;
 static float npc939Cool;        /* bite cadence */
+static float npc939Home[2];     /* room centre it patrols around */
+static float npc939Wander[2];   /* current patrol target */
 
 /* ---- SCP-966: a sleep-stalker invisible to the naked eye - only the
  * night-vision goggles reveal it. It creeps closer and saps the player's
@@ -5180,6 +5183,10 @@ static void spawn939(void) {
     npc939Pos[0] = map.rooms[best].gridX * ROOM_SPACING + 300.0f;
     npc939Pos[2] = map.rooms[best].gridY * ROOM_SPACING + 300.0f;
     npc939Pos[1] = 0.0f;
+    npc939Home[0] = (float)map.rooms[best].gridX * ROOM_SPACING;
+    npc939Home[1] = (float)map.rooms[best].gridY * ROOM_SPACING;
+    npc939Wander[0] = npc939Pos[0];
+    npc939Wander[1] = npc939Pos[2];
     npc939YawDeg = 0.0f;
     reset939();
     npc939Active = 1;
@@ -5216,6 +5223,23 @@ static void update939(void) {
         case S939_PATROL:
             npc939Frame += 0.15f;
             if (npc939Frame > 405.0f) npc939Frame = 290.0f;
+            /* Patrol: drift around the room toward a wander point, picking
+             * a fresh one on arrival or now and then (source waypoints). */
+            {
+                float wdx = npc939Wander[0] - npc939Pos[0];
+                float wdz = npc939Wander[1] - npc939Pos[2];
+                float wd = sqrtf(wdx * wdx + wdz * wdz);
+                if (wd < 140.0f || (rand() % 600) == 0) {
+                    npc939Wander[0] = npc939Home[0]
+                                    + (float)((rand() % 1600) - 800);
+                    npc939Wander[1] = npc939Home[1]
+                                    + (float)((rand() % 1600) - 800);
+                } else if (wd > 1.0f) {
+                    npc939Pos[0] += wdx / wd * 4.0f;
+                    npc939Pos[2] += wdz / wd * 4.0f;
+                    npc939YawDeg = atan2f(wdx, wdz) * 180.0f / 3.14159265f;
+                }
+            }
             /* It mimics human voices to draw the curious closer. */
             if (dist < 3500.0f && rand() % 900 == 0) {
                 audioPlay3D(snd939Lure[rand() % 3], npc939Pos, camPos,
@@ -5403,6 +5427,7 @@ static void mask1499Place(int k, float x, float z, int type, float yaw) {
     npc1499Type[k] = type;
     npc1499Yaw[k] = yaw;
     npc1499Aggro[k] = 0;
+    npc1499Chat[k] = -1;
     npc1499Frame[k] = type == 2 ? 509.0f : 296.0f;
     npc1499Active[k] = 1;
 }
@@ -5549,13 +5574,33 @@ static void update1499(void) {
             if (npc1499Frame[k] > 601.0f) npc1499Frame[k] = 509.0f;
             if (d > 1.0f) npc1499Yaw[k] = atan2f(dx, dz) * 180.0f / 3.14159265f;
         } else if (type == 0) {
-            /* Citizens shuffle-idle, drift near their spot and murmur. */
+            /* Citizens shuffle-idle and murmur; now and then a pair drifts
+             * together to converse, else each settles near its home post. */
             npc1499Frame[k] += 0.25f;
             if (npc1499Frame[k] > 320.0f) npc1499Frame[k] = 296.0f;
-            npc1499Pos[k][0] += sinf(gTick * 0.01f + (float)k) * 0.6f;
-            npc1499Pos[k][2] += cosf(gTick * 0.013f + (float)k) * 0.6f;
-            npc1499Pos[k][0] += (npc1499Home[k][0] - npc1499Pos[k][0]) * 0.01f;
-            npc1499Pos[k][2] += (npc1499Home[k][2] - npc1499Pos[k][2]) * 0.01f;
+            if (npc1499Chat[k] < 0 || (rand() % 700) == 0) {
+                npc1499Chat[k] = npc1499Count > 1
+                               ? (int)((unsigned)rand() % npc1499Count) : -1;
+            }
+            float tx = npc1499Home[k][0], tz = npc1499Home[k][2];
+            int c = npc1499Chat[k];
+            if (c >= 0 && c != k && npc1499Type[c] == 0 && !npc1499Aggro[c]) {
+                tx = (npc1499Home[k][0] + npc1499Pos[c][0]) * 0.5f;
+                tz = (npc1499Home[k][2] + npc1499Pos[c][2]) * 0.5f;
+                float cdx = npc1499Pos[c][0] - npc1499Pos[k][0];
+                float cdz = npc1499Pos[c][2] - npc1499Pos[k][2];
+                if (cdx * cdx + cdz * cdz < 320.0f * 320.0f) {
+                    npc1499Yaw[k] = atan2f(cdx, cdz) * 180.0f / 3.14159265f;
+                    if (rand() % 1200 == 0) {
+                        audioPlay3D(snd1499Idle[rand() % 4], npc1499Pos[k],
+                                    camPos, camYaw, 2500.0f);
+                    }
+                }
+            }
+            npc1499Pos[k][0] += sinf(gTick * 0.01f + (float)k) * 0.5f;
+            npc1499Pos[k][2] += cosf(gTick * 0.013f + (float)k) * 0.5f;
+            npc1499Pos[k][0] += (tx - npc1499Pos[k][0]) * 0.008f;
+            npc1499Pos[k][2] += (tz - npc1499Pos[k][2]) * 0.008f;
             if (rand() % 1500 == 0) {
                 audioPlay3D(snd1499Idle[rand() % 4], npc1499Pos[k], camPos,
                             camYaw, 3000.0f);
