@@ -10229,9 +10229,11 @@ static int startupSkipPressed(void) {
 
 static void playStartupVideos(void) {
     if (!startupVideosEnabled) return;
-    /* The clips are the studio idents and the content warning; the Vita
-     * can't decode the .wmv motion, so each is a title card over its
-     * original audio. */
+    /* The clips are the studio idents and the content warning. The source
+     * .wmv is undecodable on the Vita, but they ship re-encoded to H.264
+     * MP4 (startup_<name>.mp4) alongside it, so each plays as real video
+     * through sceAvPlayer; if that file is missing/unopenable the code
+     * falls back to a title card over the clip's original .ogg audio. */
     static const struct {
         const char *file, *title, *sub;
     } CLIPS[4] = {
@@ -10242,6 +10244,10 @@ static void playStartupVideos(void) {
           "Contains flashing lights and disturbing imagery." },
     };
     for (int i = 0; i < 4; i++) {
+        char vp[256];
+        snprintf(vp, sizeof(vp), MENU_DIR "/%s.mp4", CLIPS[i].file);
+        if (videoPlayFile(vp)) continue; /* real hardware-decoded video */
+        /* Fallback: title card over the original audio. */
         char path[256];
         snprintf(path, sizeof(path), MENU_DIR "/%s.ogg", CLIPS[i].file);
         audioStreamMusic(path, optSfxVol, 0);
