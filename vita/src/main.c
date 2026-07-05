@@ -10386,7 +10386,17 @@ static void drawNav(void) {
 }
 
 int main(void) {
-    vglInit(0x800000);
+    /* vglInit reserves the ENTIRE CDRAM and PHYCONT partitions for
+     * vitaGL, leaving nothing for sceAvPlayer's decoder frame buffers
+     * (the device log showed both partitions 100% full). Leave a slice
+     * of each unreserved so the startup/intro videos can decode; the
+     * game's 256px-capped textures still fit in what remains. Thresholds
+     * are the bytes vitaGL leaves FREE per pool. */
+    vglInitWithCustomThreshold(0x800000, SCREEN_W, SCREEN_H,
+                               0x1000000 /* RAM: 16 MB */,
+                               0x1000000 /* CDRAM: 16 MB */,
+                               0x800000 /* PHYCONT: 8 MB */,
+                               0 /* CDLG */, SCE_GXM_MULTISAMPLE_NONE);
 
     glViewport(0, 0, SCREEN_W, SCREEN_H);
     glClearColor(0.0f, 0.0f, 0.0f, 1.0f);

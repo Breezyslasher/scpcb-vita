@@ -33,7 +33,7 @@
 #define VID_W 960
 #define VID_H 544
 #define FB_ALIGN 0x40000 /* CDRAM allocations round up to 256 KB */
-#define VIDEO_FRAME_BUFFERS 3
+#define VIDEO_FRAME_BUFFERS 2
 
 #define ALIGN_UP(x, a) (((x) + ((a) - 1)) & ~((a) - 1))
 
