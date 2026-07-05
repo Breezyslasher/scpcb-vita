@@ -10213,74 +10213,89 @@ static void enterMenu(void) {
 
 /* Startup splash videos (Graphics_Core PlayStartupVideos): the studio
  * idents and the content warning play in order before the title menu.
- * The Vita has no WMV/VC-1 decoder, so the motion frames can't be
- * shown; the port stays faithful to the sequence - the paired .ogg
- * audio plays in full, each clip's title card is held for the length of
- * that audio, and any button or a touch skips the current clip. Gated
- * by the "Startup videos" option (opt\PlayStartup); a fresh install has
- * no options file, so it runs once and the player can turn it off. */
-static int startupSkipPressed(void) {
-    float tx, ty;
-    return inputHit(ACTION_INTERACT) || inputHit(ACTION_MENU)
-        || inputHit(ACTION_CROUCH) || inputHit(ACTION_INVENTORY)
-        || inputHit(ACTION_USE_ITEM) || inputHit(ACTION_SAVE)
-        || inputDpadDownHit() || inputTouchTap(&tx, &ty);
-}
-
+ * Each source .wmv (WMV3, undecodable on the Vita) ships re-encoded to
+ * H.264 MP4 (startup_<name>.mp4) and plays as real video through
+ * sceAvPlayer. Gated by the "Startup videos" option (opt\PlayStartup);
+ * like the source's PlayMovie, a clip that will not open is simply
+ * skipped - there is no title-card substitute. */
 static void playStartupVideos(void) {
     if (!startupVideosEnabled) return;
-    /* The clips are the studio idents and the content warning. The source
-     * .wmv is undecodable on the Vita, but they ship re-encoded to H.264
-     * MP4 (startup_<name>.mp4) alongside it, so each plays as real video
-     * through sceAvPlayer; if that file is missing/unopenable the code
-     * falls back to a title card over the clip's original .ogg audio. */
-    static const struct {
-        const char *file, *title, *sub;
-    } CLIPS[4] = {
-        { "startup_Undertow", "UNDERTOW GAMES", "" },
-        { "startup_TSS", "SCP - CONTAINMENT BREACH", "Ultimate Edition" },
-        { "startup_UET", "ULTIMATE EDITION TEAM", "" },
-        { "startup_Warning", "WARNING",
-          "Contains flashing lights and disturbing imagery." },
+    static const char *CLIPS[4] = {
+        "startup_Undertow", "startup_TSS", "startup_UET", "startup_Warning",
     };
     for (int i = 0; i < 4; i++) {
         char vp[256];
-        snprintf(vp, sizeof(vp), MENU_DIR "/%s.mp4", CLIPS[i].file);
-        if (videoPlayFile(vp)) continue; /* real hardware-decoded video */
-        /* Fallback: title card over the original audio. */
-        char path[256];
-        snprintf(path, sizeof(path), MENU_DIR "/%s.ogg", CLIPS[i].file);
-        audioStreamMusic(path, optSfxVol, 0);
-        for (int frames = 0;; frames++) {
-            inputUpdate();
-            /* A few frames of grace so the mixer thread opens the stream
-             * before the "audio finished" test can fire, and so a button
-             * still held from the previous clip does not skip this one. */
-            if (frames > 8) {
-                if (!audioMusicPlaying()) break;
-                if (startupSkipPressed()) { audioStopMusic(); break; }
-            }
-            if (frames > 3600) { audioStopMusic(); break; } /* 60s safety */
-
-            glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
-            glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
-            beginHud2D();
-            drawQuad(0, 0, SCREEN_W, SCREEN_H, 0, 0.0f, 0.0f, 0.0f, 1.0f);
-            /* Fade the card in over the first ~0.5 s. */
-            float a = frames < 30 ? frames / 30.0f : 1.0f;
-            mtextC(SCREEN_W * 0.5f, SCREEN_H * 0.44f, 3.0f, a, a, a,
-                   CLIPS[i].title);
-            if (CLIPS[i].sub[0]) {
-                mtextC(SCREEN_W * 0.5f, SCREEN_H * 0.44f + 44.0f, 1.6f,
-                       a * 0.75f, a * 0.75f, a * 0.75f, CLIPS[i].sub);
-            }
-            mtextC(SCREEN_W * 0.5f, SCREEN_H - 34.0f, 1.3f, 0.4f, 0.4f, 0.4f,
-                   "Press any button to skip");
-            endHud2D();
-            vglSwapBuffers(GL_FALSE);
-        }
+        snprintf(vp, sizeof(vp), MENU_DIR "/%s.mp4", CLIPS[i]);
+        videoPlayFile(vp);
     }
-    audioStopMusic();
+}
+
+/* ---- loading screen (Menu_Core RenderLoading) ----
+ * A random SCP render over loading_back.png with its SCP title and the
+ * current load step + percent at the bottom, shown while the heavy
+ * asset/sound load runs (otherwise the player just sees black). */
+#define LOADING_DIR DATA_ROOT "/GFX/LoadingScreens"
+
+static GLuint loadImageTex(const char *dir, const char *name) {
+    const char *dirs[1] = { dir };
+    char path[1024];
+    if (!textureResolve(name, dirs, 1, path, sizeof(path))) return 0;
+    char err[128];
+    TextureImage *img = textureLoadFile(path, 1024, err, sizeof(err));
+    if (!img) return 0;
+    GLuint h = 0;
+    glGenTextures(1, &h);
+    glBindTexture(GL_TEXTURE_2D, h);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, (GLsizei)img->width,
+                 (GLsizei)img->height, 0, GL_RGBA, GL_UNSIGNED_BYTE,
+                 img->pixels);
+    textureFree(img);
+    return h;
+}
+
+static GLuint loadBackTex, loadImgTex;
+static char loadTitle[24];
+
+static void loadingScreenInit(void) {
+    /* Renders in GFX/LoadingScreens named by SCP number. */
+    static const char *IMGS[] = {
+        "173", "106", "096", "049", "079", "205", "895", "914", "012",
+        "035", "372", "939", "966", "513", "682", "008", "1123", "1499",
+        "409", "427", "714", "005", "268", "294",
+    };
+    loadBackTex = loadImageTex(LOADING_DIR, "loading_back.png");
+    const char *pick = IMGS[(unsigned)rand() % (sizeof(IMGS) / sizeof(IMGS[0]))];
+    char fn[32];
+    snprintf(fn, sizeof(fn), "%s.png", pick);
+    loadImgTex = loadImageTex(LOADING_DIR, fn);
+    snprintf(loadTitle, sizeof(loadTitle), "SCP-%s", pick);
+}
+
+static void renderLoadingScreen(const char *step, int percent) {
+    glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+    beginHud2D();
+    if (loadBackTex) {
+        drawQuad(0, 0, SCREEN_W, SCREEN_H, loadBackTex, 1, 1, 1, 1);
+    } else {
+        drawQuad(0, 0, SCREEN_W, SCREEN_H, 0, 0.02f, 0.02f, 0.03f, 1);
+    }
+    if (loadImgTex) {
+        float s = 300.0f;
+        drawQuad((SCREEN_W - s) * 0.5f, (SCREEN_H - s) * 0.5f - 24.0f, s, s,
+                 loadImgTex, 1, 1, 1, 1);
+        mtextC(SCREEN_W * 0.5f, SCREEN_H * 0.5f - 190.0f, 2.5f, 1, 1, 1,
+               loadTitle);
+    }
+    char line[96];
+    snprintf(line, sizeof(line), "%s   %d%%", step, percent);
+    mtextC(SCREEN_W * 0.5f, SCREEN_H - 40.0f, 1.6f, 0.85f, 0.85f, 0.85f, line);
+    endHud2D();
+    vglSwapBuffers(GL_FALSE);
 }
 
 /* The startup_Intro cutscene (Menu_Core PlayMovie("startup_Intro")):
@@ -10423,15 +10438,22 @@ int main(void) {
          * decodes every SFX to PCM there is none left (the device log
          * showed its 1.5 MB init alloc returning NULL). */
         playStartupVideos();
-        /* Heavy asset + audio load. */
+        /* Heavy asset + audio load, behind the loading screen so the
+         * player sees progress instead of a black screen. */
+        loadingScreenInit();
+        renderLoadingScreen("LOADING MODELS", 15);
         buildDoorAssets();
         buildNpcAssets();
+        renderLoadingScreen("LOADING TEXTURES", 45);
         loadHudTextures();
         loadMenuTextures();
         texButtonRed = textureGet("keypad_locked.png");
         pdThroneTex = textureGet("scp_106_eyes.png");
+        renderLoadingScreen("LOADING SOUNDS", 70);
         if (audioOk) loadSounds();
+        renderLoadingScreen("LOADING DECALS", 90);
         decalsInit();
+        renderLoadingScreen("DONE", 100);
         /* Boot to the title menu; the world is generated when the
          * player starts or loads a game. */
         enterMenu();
