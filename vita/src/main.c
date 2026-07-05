@@ -3106,6 +3106,11 @@ static void update173(void) {
             npc173EnemyZ = camPos[2];
             npc173HeadYawDeg = 0.0f; /* body faces the player */
             if (dist < 166.0f) {
+                /* During the intro the breach is scripted (the source
+                 * sets the player non-playable and 173 only snaps the
+                 * scripted NPCs, then leaves through the vent) - it must
+                 * never kill the player here. */
+                if (introPhase >= 0) return;
                 /* Kill: neck snap, camera wrenched around. */
                 snprintf(deathCause, sizeof(deathCause), "SCP-173");
                 audioPlay(sndNeckSnap[rand() % 3], 1.0f, 0.0f);
@@ -3491,6 +3496,43 @@ static void introUpdate(void) {
         }
     }
 
+    /* Ulgrin's partner (the source's NPC[4]) trails behind the player
+     * instead of standing at the cell: he walks to keep within a short
+     * distance once the player is out and moving through the block. */
+    IntroHuman *rear = introHumanCount > 1
+                           && INTRO_HUMANS[1].rt == &introGuardRT
+                       ? &INTRO_HUMANS[1]
+                       : NULL;
+    if (rear && introPhase >= 1 && introPhase <= 2) {
+        float wx = INTRO_GX * ROOM_SPACING + rear->x;
+        float wz = INTRO_GY * ROOM_SPACING + rear->z;
+        float dx = camPos[0] - wx, dz = camPos[2] - wz;
+        float d = sqrtf(dx * dx + dz * dz);
+        int walking = 0;
+        if (d > 360.0f) {
+            float sp = 4.4f;
+            rear->x += dx / d * sp;
+            rear->z += dz / d * sp;
+            rear->yawDeg = -atan2f(dx, dz) * 180.0f / 3.14159265f;
+            float o[3] = { INTRO_GX * ROOM_SPACING + rear->x, 200.0f,
+                           INTRO_GY * ROOM_SPACING + rear->z };
+            float hy;
+            if (rayDownWorld(o, 600.0f, &hy)) rear->y = hy;
+            walking = 1;
+        }
+        if (walking && rear->animStart != 1.0f) {
+            rear->animStart = 1.0f;
+            rear->animEnd = 38.0f;
+            rear->animSpeed = 0.66f;
+            rear->frame = 1.0f;
+        } else if (!walking && rear->animStart != 77.0f) {
+            rear->animStart = 77.0f;
+            rear->animEnd = 201.0f;
+            rear->animSpeed = 0.4f;
+            rear->frame = 77.0f;
+        }
+    }
+
     /* Doors along the escort route slide open as the player or the
      * escort nears (they are locked, so buttons cannot derail the
      * sequence). */
@@ -3627,10 +3669,12 @@ static void introUpdate(void) {
                         d->frame = 39.0f;
                     }
                 } else if (d->animStart == 39.0f) {
-                    d->animStart = 357.0f;
-                    d->animEnd = 381.0f;
-                    d->animSpeed = 0.12f;
-                    d->frame = 357.0f;
+                    /* Arrived: settle into a standing idle (not the
+                     * cowering pose, which read as dead). */
+                    d->animStart = 210.0f;
+                    d->animEnd = 235.0f;
+                    d->animSpeed = 0.1f;
+                    d->frame = 210.0f;
                 }
             }
             if (l[0] > 1100.0f) {
@@ -3716,9 +3760,9 @@ static void introPlaceHumans(void) {
         { &introScientistRT, -3073.0f, -315.0f, -2165.0f, 225.0f,
           NULL, 1, "scientist.png", 182, 182, 0.0f, 182 },
         { &introClassDRT, 208.0f, 0.0f, 480.0f, 270.0f,
-          NULL, 1, NULL, 357, 381, 0.12f, 360 },   /* chamber D #1 */
+          NULL, 1, NULL, 210, 235, 0.1f, 210 },    /* chamber D #1 */
         { &introClassDRT, 160.0f, 0.0f, 320.0f, 270.0f,
-          NULL, 1, "class_d(2).png", 357, 381, 0.12f, 372 }, /* D #2 */
+          NULL, 1, "class_d(2).png", 210, 235, 0.1f, 220 }, /* D #2 */
         { &introGuardRT, -3800.0f, 250.0f, -4088.0f, 0.0f,
           NULL, 1, NULL, 77, 201, 0.4f, 90 },      /* south balcony */
         { &introGuardRT, -4200.0f, 250.0f, -4088.0f, 0.0f,
