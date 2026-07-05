@@ -33,7 +33,7 @@
 #define VID_W 960
 #define VID_H 544
 #define FB_ALIGN 0x40000 /* CDRAM allocations round up to 256 KB */
-#define VIDEO_FRAME_BUFFERS 5
+#define VIDEO_FRAME_BUFFERS 3
 
 #define ALIGN_UP(x, a) (((x) + ((a) - 1)) & ~((a) - 1))
 
@@ -80,25 +80,37 @@ static void *tex_alloc(void *arg, uint32_t align, uint32_t size) {
     opt.size = sizeof(opt);
     opt.attr = SCE_KERNEL_ALLOC_MEMBLOCK_ATTR_HAS_ALIGNMENT;
     opt.alignment = align;
+    /* The decoder needs physically-contiguous, GPU-mappable RAM. vitaGL
+     * holds most of CDRAM, so if the CDRAM block fails fall back to the
+     * PHYCONT partition (1 MB granularity, allocated without the align
+     * opt) - exactly what lpp-vita does. */
+    uint32_t csize = ALIGN_UP(size, align);
     SceUID blk = sceKernelAllocMemBlock("scpcb_video",
                                         SCE_KERNEL_MEMBLOCK_TYPE_USER_CDRAM_RW,
-                                        size, &opt);
+                                        csize, &opt);
+    uint32_t mapped = csize;
     if (blk < 0) {
-        vlog("    tex_alloc(size=%u) AllocMemBlock FAILED 0x%08X", size,
-             (unsigned)blk);
-        return NULL;
+        uint32_t psize = ALIGN_UP(size, 0x100000u);
+        SceUID pblk = sceKernelAllocMemBlock(
+            "scpcb_video_pc",
+            SCE_KERNEL_MEMBLOCK_TYPE_USER_MAIN_PHYCONT_NC_RW, psize, NULL);
+        vlog("    tex_alloc cdram FAILED 0x%08X -> phycont(%u)=0x%08X",
+             (unsigned)blk, psize, (unsigned)pblk);
+        blk = pblk;
+        mapped = psize;
     }
+    if (blk < 0) return NULL;
     void *base = NULL;
     if (sceKernelGetMemBlockBase(blk, &base) < 0) {
         vlog("    tex_alloc GetMemBlockBase FAILED");
         sceKernelFreeMemBlock(blk);
         return NULL;
     }
-    int mr = sceGxmMapMemory(base, size,
+    int mr = sceGxmMapMemory(base, mapped,
                     SCE_GXM_MEMORY_ATTRIB_READ | SCE_GXM_MEMORY_ATTRIB_WRITE);
     if (gTexLogN < 16 || mr < 0) {
         gTexLogN++;
-        vlog("    tex_alloc(size=%u) -> %p map=0x%08X", size, base,
+        vlog("    tex_alloc(size=%u) -> %p map=0x%08X", mapped, base,
              (unsigned)mr);
     }
     return base;
