@@ -21,6 +21,7 @@
 #include <vitaGL.h>
 
 #include "audio/audio.h"
+#include "video/video.h"
 #include "formats/b3d.h"
 #include "formats/rmesh.h"
 #include "formats/texture.h"
@@ -29,6 +30,8 @@
 #include "game/item_spawns.h"
 #include "game/room_doors.h"
 #include "game/room_fixtures.h"
+#include "game/room_decals.h"
+#include "game/room_cameras.h"
 #include "game/mapgen.h"
 #include "input.h"
 #include "render/scene.h"
@@ -404,6 +407,8 @@ static void generateAccessCodes(uint32_t seed) {
 /* FillRoom's room-internal doors (containment chambers, elevator
  * covers, locked service doors) from room_doors.h, placed with the
  * same transform as item spawns. */
+static void spawnRoomDecals(void); /* defined with the decal system */
+
 static void spawnRoomDoors(void) {
     const int N = (int)(sizeof(ROOM_DOORS) / sizeof(ROOM_DOORS[0]));
     for (uint32_t r = 0; r < map.roomCount; r++) {
@@ -460,6 +465,75 @@ static WorldLever worldLevers[MAX_FIXTURES];
 static int worldLeverCount;
 static WorldButton worldButtons[MAX_FIXTURES];
 static int worldButtonCount;
+
+/* A security camera (CreateSecurityCam): a fixed base with a head that
+ * sweeps within +-turn or tracks the player, red light blinking. */
+typedef struct {
+    float x, y, z;      /* base world position (raw) */
+    float roomYaw;      /* base mount yaw (room angle) */
+    float yawBase;      /* head yaw centre (room angle + sc\Angle) */
+    float pitch;        /* head down-tilt (Pitch1) */
+    float turn;         /* sweep amplitude, 0 = static */
+    int follow;         /* track the player */
+    float currAngle;    /* animated sweep offset */
+    int dir;            /* sweep direction */
+    float headYaw, headPitch; /* animated head orientation (world) */
+    int screen;         /* feeds a monitor */
+    float mx, my, mz;   /* monitor world position */
+    float myaw, mpitch; /* monitor facing (world) */
+} WorldCamera;
+
+#define MAX_CAMERAS 48
+static WorldCamera worldCameras[MAX_CAMERAS];
+static int worldCameraCount;
+static float camCheckTimer;   /* MTF camera sweep: >0 while one runs */
+static int camCheckSpotted;   /* a camera caught the player this sweep */
+/* SCP-895 CoffinEffect / SCP-079 broadcast: once the player leaves the
+ * first zone, SCP-079 broadcasts SCP-895's coffin feed onto the monitors
+ * (source CoffinEffect 2/3), scrambling them red. */
+static int leftFirstZone;
+
+static void spawnRoomCameras(void) {
+    worldCameraCount = 0;
+    camCheckTimer = 0.0f;
+    camCheckSpotted = 0;
+    leftFirstZone = 0;
+    const int NC = (int)(sizeof(ROOM_CAMERAS) / sizeof(ROOM_CAMERAS[0]));
+    for (uint32_t r = 0;
+         r < map.roomCount && worldCameraCount < MAX_CAMERAS; r++) {
+        const RoomPlacement *p = &map.rooms[r];
+        const char *nm = tplList.items[p->templateIndex].name;
+        float roomYaw = (float)(p->angle * 90);
+        for (int i = 0; i < NC && worldCameraCount < MAX_CAMERAS; i++) {
+            const RoomCameraDef *cd = &ROOM_CAMERAS[i];
+            if (strcmp(cd->room, nm) != 0) continue;
+            float local[3] = { cd->x, cd->y, cd->z }, w[3];
+            localToWorld(p, local, w);
+            WorldCamera *c = &worldCameras[worldCameraCount++];
+            c->x = w[0]; c->y = w[1]; c->z = w[2];
+            c->roomYaw = roomYaw;
+            c->yawBase = roomYaw + cd->angle;
+            c->pitch = cd->pitch;
+            c->turn = cd->turn;
+            c->follow = cd->follow;
+            c->currAngle = 0.0f;
+            c->dir = 0;
+            c->headYaw = c->yawBase;
+            c->headPitch = cd->pitch;
+            c->screen = cd->screen;
+            if (cd->screen) {
+                float ml[3] = { cd->mx, cd->my, cd->mz }, mw[3];
+                localToWorld(p, ml, mw);
+                c->mx = mw[0]; c->my = mw[1]; c->mz = mw[2];
+                c->myaw = roomYaw + cd->myaw;
+                c->mpitch = cd->mpitch;
+            } else {
+                c->mx = c->my = c->mz = 0.0f;
+                c->myaw = c->mpitch = 0.0f;
+            }
+        }
+    }
+}
 
 static void spawnRoomFixtures(void) {
     worldLeverCount = 0;
@@ -606,6 +680,9 @@ enum { ELEV_IDLE = 0, ELEV_CLOSE, ELEV_TRAVEL, ELEV_ARRIVE };
 static int elevState;
 static float elevTimer;
 static float elevDest[3];     /* arrival position */
+static float elevRayFromY = 1500.0f; /* height to drop the arrival floor
+                                        ray from (raised for the vertical
+                                        cont1_079 car to a lower level) */
 static int elevDoorA = -1, elevDoorB = -1; /* doors to open on arrival */
 /* The gate surfaces are real elevator destinations: gate_a_entrance /
  * gate_b_entrance (in the facility) ride to the appended gate_a / gate_b
@@ -629,6 +706,7 @@ static int npc1499Type[MAX_1499];      /* 0 citizen 1 king-guard 2 king
 static int npc1499Active[MAX_1499];
 static int npc1499Aggro[MAX_1499];     /* this member has turned hostile */
 static float npc1499Frame[MAX_1499];   /* per-member animation phase */
+static int npc1499Chat[MAX_1499];      /* citizen's conversation partner, -1 none */
 static int npc1499Count;
 static int pdRoomIdx = -1;
 static int inPocket;          /* player is in the pocket dimension */
@@ -675,6 +753,24 @@ static TeslaGate teslaGates[MAX_TESLA];
 static int teslaCount;
 static int sndTeslaIdle = -1, sndTeslaWind = -1, sndTeslaShock = -1,
            sndTeslaPower = -1;
+/* MTF camera-check announcements (UpdateCameraCheck). */
+static int sndCamCheck = -1, sndCamFound[2] = { -1, -1 }, sndCamNoFound = -1;
+/* SCP-079 speech (cont1_079 event). */
+static int snd079Speech = -1, snd079Refuse = -1;
+/* SCP-895 camera coffin (cont1_895): the slumped guard's idle murmur and
+ * scream. */
+static int snd895Idle[3] = { -1, -1, -1 }, snd895Scream[3] = { -1, -1, -1 };
+/* SCP-205 (cont1_205): the shadow demon's horror cue. */
+static int snd205Horror = -1;
+/* SCP-914 (cont1_914): the refinement whir. */
+static int snd914 = -1;
+/* SCP-513-1's bells (declared early: loaded in loadSounds). */
+static int snd513Bell[3] = { -1, -1, -1 };
+static int npc513Active;   /* reset in regenerateMap, so declared early */
+/* SCP-035's get-up sound + victim texture (declared early: loaded in
+ * loadSounds / buildDoorAssets). */
+static int snd035GetUp = -1;
+static GLuint tex035;
 static GLuint teslaArcTex;
 static float teslaFlash;       /* white screen flash when it zaps nearby */
 
@@ -1580,6 +1676,14 @@ static void spawn966(void);
 static void spawn860(void);
 static void reset860(void);
 static void removeInventoryByName(const char *name);
+static void consumeSlot(int slot);
+static void spawn079(void);
+static void spawn895(void);
+static void spawn012(void);
+static void spawn372(void);
+static void spawn205(void);
+static void spawn914(void);
+static void spawn035(void);
 
 static void regenerateMap(uint32_t seed) {
     memset(roomVisited, 0, sizeof(roomVisited));
@@ -1590,6 +1694,7 @@ static void regenerateMap(uint32_t seed) {
     maskEntries = 0;
     elevState = ELEV_IDLE;
     npc1499Count = 0;
+    npc513Active = 0;
     pdLunging = 0;
     femurTimer = 0.0f;
     npc106Contained = 0;
@@ -1626,6 +1731,7 @@ static void regenerateMap(uint32_t seed) {
         appendGateRooms();
         setupMaintenanceTunnel();
         spawnRoomFixtures();
+        spawnRoomCameras();
         spawnRoomEvents();
         teslaSpawn();
         spawn096();
@@ -1633,8 +1739,16 @@ static void regenerateMap(uint32_t seed) {
         spawn939();
         spawn966();
         spawn860();
+        spawn079();
+        spawn895();
+        spawn012();
+        spawn372();
+        spawn205();
+        spawn914();
+        spawn035();
         eventRng = mapSeed ^ 0xA5A5F00Du;
         spawnItems();
+        spawnRoomDecals();
         reset173();
         reset106();
         snprintf(statusLine, sizeof(statusLine), "map seed %u: %u rooms %u doors",
@@ -1729,7 +1843,15 @@ static void drawBatchSet(const Scene *scene, const BatchGL *gl, int alphaPass) {
             glBindTexture(GL_TEXTURE_2D, lightmap);
             glTexCoordPointer(2, GL_FLOAT, sizeof(SceneVertex), VTX_OFF(lu));
             glEnable(GL_BLEND);
-            glBlendFunc(GL_ONE, GL_ONE);
+            /* The lightmap modulates the diffuse, it does not add to it.
+             * Source composites 2 * diffuse * (ambient + lightmap): the
+             * diffuse layer is TextureBlend 5 (multiply x2), so this
+             * second pass is a modulate2x - result = 2 * dst * src -
+             * darkening shadowed areas instead of washing them out the
+             * way a plain additive (GL_ONE, GL_ONE) pass did. The
+             * per-room AmbientLightRoomTex term the port lacks is dropped
+             * (a dim uniform add), leaving 2 * diffuse * lightmap. */
+            glBlendFunc(GL_DST_COLOR, GL_SRC_COLOR);
             glDrawElements(GL_TRIANGLES, (GLsizei)b->indexCount,
                            GL_UNSIGNED_SHORT, NULL);
             glDisable(GL_BLEND);
@@ -1810,6 +1932,10 @@ typedef struct {
  * difficulty table itself lives with the menu code below). */
 static int invSlotCap = 10;
 static int npcAggressive = 0;
+/* Difficulty tier (source SelectedDifficulty\OtherFactors): 0 Easy .. 3
+ * Extreme. Set by applyDifficulty; used by SCP-914's keycard Mastercard
+ * odds. */
+static int gDiffFactor = 1;
 
 #define SFX_DIR DATA_ROOT "/SFX"
 
@@ -1944,6 +2070,25 @@ static void loadSounds(void) {
     sndHorrorClose[3] = audioLoad(SFX_DIR "/Horror/Horror10.ogg");
     sndHorrorClose[4] = audioLoad(SFX_DIR "/Horror/Horror12.ogg");
     sndDoor173 = audioLoad(SFX_DIR "/Door/DoorOpen173.ogg");
+    sndCamCheck = audioLoad(SFX_DIR "/Character/MTF/AnnouncCameraCheck.ogg");
+    sndCamFound[0] = audioLoad(SFX_DIR "/Character/MTF/AnnouncCameraFound1.ogg");
+    sndCamFound[1] = audioLoad(SFX_DIR "/Character/MTF/AnnouncCameraFound2.ogg");
+    sndCamNoFound = audioLoad(SFX_DIR "/Character/MTF/AnnouncCameraNoFound.ogg");
+    snd079Speech = audioLoad(SFX_DIR "/SCP/079/Speech.ogg");
+    snd079Refuse = audioLoad(SFX_DIR "/SCP/079/Refuse.ogg");
+    for (int i = 0; i < 3; i++) {
+        snprintf(p, sizeof(p), SFX_DIR "/Room/895Chamber/GuardIdle%d.ogg", i);
+        snd895Idle[i] = audioLoad(p);
+        snprintf(p, sizeof(p), SFX_DIR "/Room/895Chamber/GuardScream%d.ogg", i);
+        snd895Scream[i] = audioLoad(p);
+    }
+    snd205Horror = audioLoad(SFX_DIR "/SCP/205/Horror.ogg");
+    snd914 = audioLoad(SFX_DIR "/SCP/513/914Refine.ogg");
+    for (int i = 0; i < 3; i++) {
+        snprintf(p, sizeof(p), SFX_DIR "/SCP/513_1/Bell%d.ogg", i);
+        snd513Bell[i] = audioLoad(p);
+    }
+    snd035GetUp = audioLoad(SFX_DIR "/SCP/035/GetUp.ogg");
     sndAmbience = audioLoad(SFX_DIR "/Ambient/Room ambience/rumble.ogg");
     audioLoopAmbience(sndAmbience, 0.30f);
 }
@@ -1955,6 +2100,19 @@ static ModelRT oneSidedRT, door914RT;
 static ModelRT buttonRT, buttonKeycardRT;
 static ModelRT buttonKeypadRT, buttonScannerRT, buttonElevatorRT;
 static ModelRT leverBaseRT, leverHandleRT;
+/* Security cameras (CreateSecurityCam): a static base + a head that
+ * sweeps or tracks the player, its red light blinking. */
+static ModelRT camBaseRT, camHeadRT;
+static GLuint camHeadRedTex;
+/* Live monitor feed: the nearest Screen camera renders the scene to a
+ * texture (glCopyTexImage2D from a viewport corner, no FBO - matching the
+ * blur post-process) that its monitor displays. */
+static ModelRT monitorRT;
+#define MON_FEED_SIZE 256
+static GLuint monFeedTex;
+static int monFeedCam = -1;   /* worldCameras index the feed shows */
+static float monFeedTick;
+static int monFeedActive;     /* a feed was captured this frame */
 /* SCP-106 rots the doors it passes (UpdateNPCType106 swaps the panel /
  * frame texture): Door01_Corrosive for sliding doors, containment for
  * heavy. Loaded with the door assets. */
@@ -1973,6 +2131,46 @@ static int arm682Active;
 static float arm682Roll;      /* swing angle, 180 -> 360 */
 static float arm682Pos[3];
 static float arm682Yaw;
+/* SCP-079 (cont1_079): the sentient computer in the lower chamber. Its
+ * screen flickers overlay frames as it speaks; approaching the terminal
+ * plays its speech and drops the SCP-079 document. */
+static ModelRT scp079RT;
+static GLuint scp079Ov[7];
+static int scp079Ok;          /* placed in this map */
+static float scp079Pos[3];    /* computer world position (raw) */
+static float scp079Yaw;       /* world yaw */
+static int scp079State;       /* 0 idle, 1 speaking, 2 spoken/cooldown */
+static float scp079Timer;     /* state timer (frames) */
+static int scp079OvFrame;     /* current flicker overlay 0..6 */
+static float scp079FlickT;    /* flicker cadence */
+static int scp079DocDone;     /* the document has been dropped */
+/* SCP-895 (cont1_895): the camera coffin. A dread aura fills the chamber
+ * and a slumped guard corpse is revealed on a close approach. */
+static int scp895Ok;
+static float scp895Coffin[3]; /* coffin trigger world position */
+static float scp895GuardYaw;  /* corpse yaw (room-facing) */
+static int scp895State;       /* 0 dread, 1 guard revealed/screaming */
+static float scp895Timer;
+static float scp895IdleT;     /* idle-murmur cadence */
+/* SCP-012 (cont2_012): "A Bad Composition". Standing at the score forces
+ * the eyes open and floods the screen with a bloody compulsion overlay. */
+static int scp012Ok;
+static float scp012Pos[3];    /* the score's world position */
+static GLuint scp012OvTex;    /* scp_012_overlay.png */
+static float scp012Comp;      /* 0..1 compulsion strength (drives overlay) */
+/* SCP-914 (cont1_914): the refinement machine. A knob (5 settings) + two
+ * booths; feeding it the selected item and running it transforms the item
+ * per the setting (Use914). */
+static ModelRT knob914RT, key914RT;
+static int scp914Ok;
+static float scp914In[3];     /* input booth (Objects[2]) */
+static float scp914Out[3];    /* output booth (Objects[3]) */
+static float scp914Knob[3];   /* the setting knob (Objects[1]) */
+static float scp914Yaw;       /* room yaw */
+static int scp914Setting;     /* -2 ROUGH .. 2 VERYFINE */
+static int scp914State;       /* 0 idle, 1 running */
+static float scp914Timer;
+static int scp914RefineTpl = -1; /* item being refined */
 static char toastMsg[128];
 static int toastTimer;
 
@@ -2082,6 +2280,33 @@ static void buildDoorAssets(void) {
     doorCorrTex = textureGet("Door01_Corrosive.png");
     doorCorrHeavyTex = textureGet("containment_doors_Corrosive.png");
     teslaArcTex = textureGet("tesla_overlay.png");
+    /* Security cameras: base ScaleEntity 0.0015, head 0.01 (world), so
+     * *256 in raw. camera(1) is the default head texture, camera(2) the
+     * red-light one. */
+    buildModelRT(&camBaseRT, "CamBase.b3d", 0, 0, 0, NULL);
+    camBaseRT.scale[0] = camBaseRT.scale[1] = camBaseRT.scale[2] = 0.384f;
+    buildModelRT(&camHeadRT, "CamHead.b3d", 0, 0, 0, "camera(1).png");
+    camHeadRT.scale[0] = camHeadRT.scale[1] = camHeadRT.scale[2] = 2.56f;
+    camHeadRedTex = textureGet("camera(2).png");
+    /* Monitor prop for the camera feed (source Scale = RoomScale*1.8). */
+    buildModelRT(&monitorRT, "monitor2.b3d", 0, 0, 0, NULL);
+    monitorRT.scale[0] = monitorRT.scale[1] = monitorRT.scale[2] = 1.8f;
+    tex035 = textureGet("scp_035_victim.png");
+    /* SCP-914's knob and control key (source ScaleEntity RoomScale -> 1). */
+    buildModelRT(&knob914RT, "scp_914_knob.b3d", 0, 0, 0, NULL);
+    knob914RT.scale[0] = knob914RT.scale[1] = knob914RT.scale[2] = 1.0f;
+    buildModelRT(&key914RT, "scp_914_key.b3d", 0, 0, 0, NULL);
+    key914RT.scale[0] = key914RT.scale[1] = key914RT.scale[2] = 1.0f;
+    /* SCP-079's computer (ScaleEntity 1.3 world -> *256 raw) and its
+     * seven screen-overlay frames. */
+    buildModelRT(&scp079RT, "scp_079.b3d", 0, 0, 0, NULL);
+    scp079RT.scale[0] = scp079RT.scale[1] = scp079RT.scale[2] = 332.8f;
+    for (int i = 0; i < 7; i++) {
+        char nm[48];
+        snprintf(nm, sizeof(nm), "scp_079_overlay(%d).png", i + 1);
+        scp079Ov[i] = textureGet(nm);
+    }
+    scp012OvTex = textureGet("scp_012_overlay.png");
 }
 
 static void drawModelRT(const ModelRT *rt);
@@ -2173,6 +2398,8 @@ static float npc939Pos[3];
 static float npc939YawDeg;
 static float npc939Frame;
 static float npc939Cool;        /* bite cadence */
+static float npc939Home[2];     /* room centre it patrols around */
+static float npc939Wander[2];   /* current patrol target */
 
 /* ---- SCP-966: a sleep-stalker invisible to the naked eye - only the
  * night-vision goggles reveal it. It creeps closer and saps the player's
@@ -2186,6 +2413,71 @@ static float npc966Pos[3];
 static float npc966YawDeg;
 static float npc966Frame;
 static float npc966Drowsy;      /* insomnia buildup / aggression */
+
+/* ---- SCP-372: the peripheral jumper (cont3_372). Invisible until it
+ * flits into view; centring it in your gaze makes it dart back to the
+ * edge of sight (UpdateNPCType372). ---- */
+static SkinnedMesh *skin372;
+static float skin372Scale = 1.0f;
+static GLuint vbo372;
+static int posed372;
+static int npc372Ok;            /* present in this map */
+static int npc372Idle;          /* 1 = hidden, 0 = flitting nearby */
+static float npc372Pos[3];
+static float npc372Frame;
+static float npc372State;       /* remaining active duration */
+
+/* ---- SCP-205: the shadow demon of the lamps (cont1_205). It rises and
+ * looms in the chamber while the player is there, seen chiefly on the
+ * observation monitor the camera feeds. ---- */
+static SkinnedMesh *skin205;
+static float skin205Scale = 1.0f;
+static GLuint vbo205;
+static int posed205;
+static int npc205Ok;
+static float npc205Pos[3];      /* demon current position (world) */
+static float npc205Home[3];     /* its spawn, returned to when you leave */
+static float npc205Yaw;
+static float npc205Frame;
+static float npc205Rise;        /* 0..1 how far it has risen/loomed */
+static float npc205Horror;      /* horror-cue cadence */
+
+/* ---- Hostiles SCP-914 can produce: an SCP-008 zombie (from a refined
+ * severed hand) or a hostile SCP-1499 (from Very Fine SCP-1499). One at a
+ * time; it shambles to the player and kills on contact. ---- */
+static SkinnedMesh *skin008;
+static float skin008Scale = 1.0f;
+static GLuint rhVbo;             /* shared render buffer for the hostile */
+static int rhActive;
+static int rhType;               /* 0 = SCP-008, 1 = SCP-1499 */
+static float rhPos[3];
+static float rhYaw;
+static float rhFrame;
+static int refineHostilePending = -1; /* set by refine914 (-1 none) */
+
+/* ---- SCP-513-1: rung up by the SCP-513 bell, it haunts the player -
+ * flitting to the edge of sight and ringing bells (UpdateNPCType513_1).
+ * A persistent scare, never lethal. ---- */
+static SkinnedMesh *skin513;
+static float skin513Scale = 1.0f;
+static GLuint vbo513;
+static int posed513;
+static float npc513Pos[3];
+static float npc513Yaw;
+static float npc513Frame;
+static float npc513Timer;      /* reposition cadence */
+static float npc513Bell;       /* bell-ring cadence */
+
+/* ---- SCP-035: the possessive mask (cont1_035). Its Class-D host sits
+ * slumped until you look at it up close, then it gets up and hunts.
+ * (tex035 declared with the early texture globals.) ---- */
+static GLuint vbo035;
+static int npc035Ok;
+static int npc035State;        /* 0 seated, 1 risen/hunting */
+static float npc035Pos[3];
+static float npc035Home[3];
+static float npc035Yaw;
+static float npc035Frame;
 
 /* ---- SCP-1499-1: the hooded people of the mask dimension. They roam
  * and, once roused, converge and kill on contact (UpdateNPCType1499_1).
@@ -2207,7 +2499,7 @@ static float npc860Pos[3];
 static float npc860YawDeg;
 static float npc860Frame;
 static int npc860Cool;
-#define MAX_TREES 14
+#define MAX_TREES 96   /* a 10x10 forest grid minus the carved path */
 static float tree860Pos[MAX_TREES][3];
 static int tree860Count;
 
@@ -2290,6 +2582,30 @@ static void buildNpcAssets(void) {
         if (skin860) {
             skinnedBounds(skin860, mn, mx);
             if (mx[1] > mn[1]) skin860Scale = 320.0f / (mx[1] - mn[1]);
+        }
+        B3DModel *m372 = propModelGet("scp_372.b3d");
+        skin372 = m372 ? skinnedCreate(m372) : NULL;
+        if (skin372) {
+            skinnedBounds(skin372, mn, mx);
+            if (mx[1] > mn[1]) skin372Scale = 200.0f / (mx[1] - mn[1]);
+        }
+        B3DModel *m205 = propModelGet("scp_205_demon.b3d");
+        skin205 = m205 ? skinnedCreate(m205) : NULL;
+        if (skin205) {
+            skinnedBounds(skin205, mn, mx);
+            if (mx[1] > mn[1]) skin205Scale = 300.0f / (mx[1] - mn[1]);
+        }
+        B3DModel *m008 = propModelGet("scp_008_1.b3d");
+        skin008 = m008 ? skinnedCreate(m008) : NULL;
+        if (skin008) {
+            skinnedBounds(skin008, mn, mx);
+            if (mx[1] > mn[1]) skin008Scale = 300.0f / (mx[1] - mn[1]);
+        }
+        B3DModel *m513 = propModelGet("scp_513_1.b3d");
+        skin513 = m513 ? skinnedCreate(m513) : NULL;
+        if (skin513) {
+            skinnedBounds(skin513, mn, mx);
+            if (mx[1] > mn[1]) skin513Scale = 240.0f / (mx[1] - mn[1]);
         }
     }
     buildHumanRT(&introScientistRT, "class_d.b3d", "scientist.png");
@@ -3537,8 +3853,14 @@ enum {
     DECAL_CORROSIVE_1 = 0, DECAL_CORROSIVE_2 = 1,
     DECAL_BLOOD_1 = 2, DECAL_BLOOD_6 = 7,
     DECAL_PD_1 = 8, DECAL_PD_6 = 13,
+    DECAL_BULLET_HOLE_1 = 14, DECAL_BULLET_HOLE_2 = 15,
     DECAL_BLOOD_DROP_1 = 16, DECAL_BLOOD_DROP_2 = 17,
-    DECAL_ID_MAX = 18
+    DECAL_427 = 18, DECAL_409 = 19, DECAL_WATER = 20,
+    /* KETER/APOLLYON are achievement-gated: slots exist so IDs line up
+     * with the source, but their textures are never loaded (decalSpawn
+     * skips an id with no texture). */
+    DECAL_KETER = 21, DECAL_APOLLYON = 22,
+    DECAL_ID_MAX = 23
 };
 
 typedef struct {
@@ -3559,6 +3881,12 @@ static int decalHead;
 static GLuint decalTex[DECAL_ID_MAX];
 static int decalsLoaded;
 
+/* FillRoom's static splats live apart from the transient ring so the
+ * corrosion/blood effects can never recycle the room scatter. */
+#define MAX_ROOM_DECALS 256
+static Decal roomDecals[MAX_ROOM_DECALS];
+static int roomDecalCount;
+
 static void decalsInit(void) {
     if (decalsLoaded) return;
     decalsLoaded = 1;
@@ -3576,9 +3904,17 @@ static void decalsInit(void) {
         decalTex[DECAL_PD_1 + i] = textureGet(name);
     }
     for (int i = 0; i < 2; i++) {
+        snprintf(name, sizeof(name), "bullet_hole_decal(%d).png", i);
+        decalTex[DECAL_BULLET_HOLE_1 + i] = textureGet(name);
+    }
+    for (int i = 0; i < 2; i++) {
         snprintf(name, sizeof(name), "blood_drop_decal(%d).png", i);
         decalTex[DECAL_BLOOD_DROP_1 + i] = textureGet(name);
     }
+    decalTex[DECAL_427] = textureGet("scp_427_decal.png");
+    decalTex[DECAL_409] = textureGet("scp_409_decal.png");
+    decalTex[DECAL_WATER] = textureGet("water_decal.png");
+    /* DECAL_KETER / DECAL_APOLLYON: achievement-gated, left unloaded. */
 }
 
 /* Full form; call sites tune sizeChange/life afterward. */
@@ -3598,6 +3934,40 @@ static Decal *decalSpawn(int id, float x, float y, float z, float pitch,
     d->timer = 0.0f;
     d->life = -1.0f;
     return d;
+}
+
+/* Lay FillRoom's static splats (room_decals.h) into every placed room,
+ * rotated with the room, in the persistent room-decal array. Runs once
+ * per map, after the map is generated and decal textures are loaded. */
+static void spawnRoomDecals(void) {
+    roomDecalCount = 0;
+    const int N = (int)(sizeof(ROOM_DECALS) / sizeof(ROOM_DECALS[0]));
+    for (uint32_t r = 0;
+         r < map.roomCount && roomDecalCount < MAX_ROOM_DECALS; r++) {
+        const RoomPlacement *p = &map.rooms[r];
+        const char *nm = tplList.items[p->templateIndex].name;
+        for (int i = 0; i < N && roomDecalCount < MAX_ROOM_DECALS; i++) {
+            const RoomDecalDef *rd = &ROOM_DECALS[i];
+            if (strcmp(rd->room, nm) != 0) continue;
+            float local[3] = { rd->x, rd->y, rd->z };
+            float w[3];
+            localToWorld(p, local, w);
+            Decal *d = &roomDecals[roomDecalCount++];
+            memset(d, 0, sizeof(*d));
+            d->used = 1;
+            d->id = rd->id;
+            d->pos[0] = w[0]; d->pos[1] = w[1]; d->pos[2] = w[2];
+            d->pitch = rd->pitch;
+            /* Yaw follows the room's quarter-turn placement. */
+            d->yaw = rd->yaw + (float)(p->angle * 90);
+            d->roll = rd->roll;
+            d->size = rd->size;
+            d->maxSize = rd->size;
+            d->alpha = rd->alpha;
+            d->blend = rd->blend;
+            d->life = -1.0f;
+        }
+    }
 }
 
 /* A flat corrosion splat on the floor at (x,z), random spin. */
@@ -3637,9 +4007,39 @@ static void decalsUpdate(void) {
     }
 }
 
+/* Emit one decal quad (blend/rotation/size); the GL passes are set up by
+ * decalsDraw. Distance-culled and skipped if its texture never loaded. */
+static void decalEmit(const Decal *d) {
+    if (!d->used) return;
+    float ddx = d->pos[0] - camPos[0], ddz = d->pos[2] - camPos[2];
+    if (ddx * ddx + ddz * ddz > VIEW_RANGE * VIEW_RANGE) return;
+    GLuint tex = decalTex[d->id];
+    if (!tex) return;
+    switch (d->blend) {
+        case 2: glBlendFunc(GL_DST_COLOR, GL_ZERO); break;      /* mul */
+        case 3: glBlendFunc(GL_SRC_ALPHA, GL_ONE); break;       /* add */
+        default: glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    }
+    glBindTexture(GL_TEXTURE_2D, tex);
+    glColor4f(1.0f, 1.0f, 1.0f, d->alpha);
+    float h = d->size * 256.0f;
+    GLfloat v[18] = {
+        -h,  h, 0.0f,   h,  h, 0.0f,   h, -h, 0.0f,
+        -h,  h, 0.0f,   h, -h, 0.0f,  -h, -h, 0.0f,
+    };
+    glPushMatrix();
+    glTranslatef(d->pos[0], d->pos[1], d->pos[2]);
+    glRotatef(-d->yaw, 0.0f, 1.0f, 0.0f);
+    glRotatef(d->pitch, 1.0f, 0.0f, 0.0f);
+    glRotatef(d->roll, 0.0f, 0.0f, 1.0f);
+    glVertexPointer(3, GL_FLOAT, 0, v);
+    glDrawArrays(GL_TRIANGLES, 0, 6);
+    glPopMatrix();
+}
+
 static void decalsDraw(void) {
-    int any = 0;
-    for (int i = 0; i < MAX_DECALS; i++) if (decals[i].used) { any = 1; break; }
+    int any = roomDecalCount > 0;
+    for (int i = 0; !any && i < MAX_DECALS; i++) if (decals[i].used) any = 1;
     if (!any) return;
     glBindBuffer(GL_ARRAY_BUFFER, 0);
     glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
@@ -3652,34 +4052,8 @@ static void decalsDraw(void) {
     glDepthMask(GL_FALSE);
     static const GLfloat uvs[12] = { 0, 0, 1, 0, 1, 1, 0, 0, 1, 1, 0, 1 };
     glTexCoordPointer(2, GL_FLOAT, 0, uvs);
-    for (int i = 0; i < MAX_DECALS; i++) {
-        Decal *d = &decals[i];
-        if (!d->used) continue;
-        float ddx = d->pos[0] - camPos[0], ddz = d->pos[2] - camPos[2];
-        if (ddx * ddx + ddz * ddz > VIEW_RANGE * VIEW_RANGE) continue;
-        GLuint tex = decalTex[d->id];
-        if (!tex) continue;
-        switch (d->blend) {
-            case 2: glBlendFunc(GL_DST_COLOR, GL_ZERO); break;      /* mul */
-            case 3: glBlendFunc(GL_SRC_ALPHA, GL_ONE); break;       /* add */
-            default: glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-        }
-        glBindTexture(GL_TEXTURE_2D, tex);
-        glColor4f(1.0f, 1.0f, 1.0f, d->alpha);
-        float h = d->size * 256.0f;
-        GLfloat v[18] = {
-            -h,  h, 0.0f,   h,  h, 0.0f,   h, -h, 0.0f,
-            -h,  h, 0.0f,   h, -h, 0.0f,  -h, -h, 0.0f,
-        };
-        glPushMatrix();
-        glTranslatef(d->pos[0], d->pos[1], d->pos[2]);
-        glRotatef(-d->yaw, 0.0f, 1.0f, 0.0f);
-        glRotatef(d->pitch, 1.0f, 0.0f, 0.0f);
-        glRotatef(d->roll, 0.0f, 0.0f, 1.0f);
-        glVertexPointer(3, GL_FLOAT, 0, v);
-        glDrawArrays(GL_TRIANGLES, 0, 6);
-        glPopMatrix();
-    }
+    for (int i = 0; i < roomDecalCount; i++) decalEmit(&roomDecals[i]);
+    for (int i = 0; i < MAX_DECALS; i++) decalEmit(&decals[i]);
     glColor4f(1, 1, 1, 1);
     glDepthMask(GL_TRUE);
     glDisable(GL_ALPHA_TEST);
@@ -4279,6 +4653,15 @@ static void update106(void) {
                     float ez = dr->z - npc106Pos[2];
                     if (ex * ex + ez * ez < 256.0f * 256.0f) {
                         dr->corroded = 1;
+                        /* Beyond the texture swap, 106's rot pools at the
+                         * door's foot and eats into the panel face - the
+                         * door-surface corrosion. */
+                        decalCorrosion(dr->x, dr->y, dr->z, 0.7f, 0.7f);
+                        Decal *fd = decalSpawn(DECAL_CORROSIVE_2,
+                                               dr->x, dr->y + 150.0f, dr->z,
+                                               0.0f, (float)dr->angle, 0.0f,
+                                               0.6f, 0.75f, 1);
+                        if (fd) fd->life = 3600.0f;
                         audioPlay3D(snd106Corr[rand() % 3], npc106Pos,
                                     camPos, camYaw, 1500.0f);
                         break;
@@ -4801,6 +5184,10 @@ static void spawn939(void) {
     npc939Pos[0] = map.rooms[best].gridX * ROOM_SPACING + 300.0f;
     npc939Pos[2] = map.rooms[best].gridY * ROOM_SPACING + 300.0f;
     npc939Pos[1] = 0.0f;
+    npc939Home[0] = (float)map.rooms[best].gridX * ROOM_SPACING;
+    npc939Home[1] = (float)map.rooms[best].gridY * ROOM_SPACING;
+    npc939Wander[0] = npc939Pos[0];
+    npc939Wander[1] = npc939Pos[2];
     npc939YawDeg = 0.0f;
     reset939();
     npc939Active = 1;
@@ -4837,6 +5224,23 @@ static void update939(void) {
         case S939_PATROL:
             npc939Frame += 0.15f;
             if (npc939Frame > 405.0f) npc939Frame = 290.0f;
+            /* Patrol: drift around the room toward a wander point, picking
+             * a fresh one on arrival or now and then (source waypoints). */
+            {
+                float wdx = npc939Wander[0] - npc939Pos[0];
+                float wdz = npc939Wander[1] - npc939Pos[2];
+                float wd = sqrtf(wdx * wdx + wdz * wdz);
+                if (wd < 140.0f || (rand() % 600) == 0) {
+                    npc939Wander[0] = npc939Home[0]
+                                    + (float)((rand() % 1600) - 800);
+                    npc939Wander[1] = npc939Home[1]
+                                    + (float)((rand() % 1600) - 800);
+                } else if (wd > 1.0f) {
+                    npc939Pos[0] += wdx / wd * 4.0f;
+                    npc939Pos[2] += wdz / wd * 4.0f;
+                    npc939YawDeg = atan2f(wdx, wdz) * 180.0f / 3.14159265f;
+                }
+            }
             /* It mimics human voices to draw the curious closer. */
             if (dist < 3500.0f && rand() % 900 == 0) {
                 audioPlay3D(snd939Lure[rand() % 3], npc939Pos, camPos,
@@ -5024,6 +5428,7 @@ static void mask1499Place(int k, float x, float z, int type, float yaw) {
     npc1499Type[k] = type;
     npc1499Yaw[k] = yaw;
     npc1499Aggro[k] = 0;
+    npc1499Chat[k] = -1;
     npc1499Frame[k] = type == 2 ? 509.0f : 296.0f;
     npc1499Active[k] = 1;
 }
@@ -5170,13 +5575,33 @@ static void update1499(void) {
             if (npc1499Frame[k] > 601.0f) npc1499Frame[k] = 509.0f;
             if (d > 1.0f) npc1499Yaw[k] = atan2f(dx, dz) * 180.0f / 3.14159265f;
         } else if (type == 0) {
-            /* Citizens shuffle-idle, drift near their spot and murmur. */
+            /* Citizens shuffle-idle and murmur; now and then a pair drifts
+             * together to converse, else each settles near its home post. */
             npc1499Frame[k] += 0.25f;
             if (npc1499Frame[k] > 320.0f) npc1499Frame[k] = 296.0f;
-            npc1499Pos[k][0] += sinf(gTick * 0.01f + (float)k) * 0.6f;
-            npc1499Pos[k][2] += cosf(gTick * 0.013f + (float)k) * 0.6f;
-            npc1499Pos[k][0] += (npc1499Home[k][0] - npc1499Pos[k][0]) * 0.01f;
-            npc1499Pos[k][2] += (npc1499Home[k][2] - npc1499Pos[k][2]) * 0.01f;
+            if (npc1499Chat[k] < 0 || (rand() % 700) == 0) {
+                npc1499Chat[k] = npc1499Count > 1
+                               ? (int)((unsigned)rand() % npc1499Count) : -1;
+            }
+            float tx = npc1499Home[k][0], tz = npc1499Home[k][2];
+            int c = npc1499Chat[k];
+            if (c >= 0 && c != k && npc1499Type[c] == 0 && !npc1499Aggro[c]) {
+                tx = (npc1499Home[k][0] + npc1499Pos[c][0]) * 0.5f;
+                tz = (npc1499Home[k][2] + npc1499Pos[c][2]) * 0.5f;
+                float cdx = npc1499Pos[c][0] - npc1499Pos[k][0];
+                float cdz = npc1499Pos[c][2] - npc1499Pos[k][2];
+                if (cdx * cdx + cdz * cdz < 320.0f * 320.0f) {
+                    npc1499Yaw[k] = atan2f(cdx, cdz) * 180.0f / 3.14159265f;
+                    if (rand() % 1200 == 0) {
+                        audioPlay3D(snd1499Idle[rand() % 4], npc1499Pos[k],
+                                    camPos, camYaw, 2500.0f);
+                    }
+                }
+            }
+            npc1499Pos[k][0] += sinf(gTick * 0.01f + (float)k) * 0.5f;
+            npc1499Pos[k][2] += cosf(gTick * 0.013f + (float)k) * 0.5f;
+            npc1499Pos[k][0] += (tx - npc1499Pos[k][0]) * 0.008f;
+            npc1499Pos[k][2] += (tz - npc1499Pos[k][2]) * 0.008f;
             if (rand() % 1500 == 0) {
                 audioPlay3D(snd1499Idle[rand() % 4], npc1499Pos[k], camPos,
                             camYaw, 3000.0f);
@@ -5215,26 +5640,71 @@ static void spawn860(void) {
     if (best < 0) return;
     float ox = map.rooms[best].gridX * ROOM_SPACING;
     float oz = map.rooms[best].gridY * ROOM_SPACING;
-    npc860Pos[0] = ox;
-    npc860Pos[2] = oz - 700.0f;
-    npc860Pos[1] = 0.0f;
     npc860YawDeg = 0.0f;
     reset860();
     npc860Active = 1;
-    /* Scatter trees through the room (deterministic from the seed so the
-     * copse is stable). */
+    /* Carve a winding path down a 10x10 forest grid (source ForestGrid:
+     * the path starts at a top column and walks down, deviating sideways
+     * within a couple of columns of centre, then a tree stands on every
+     * off-path cell). Deterministic from the seed so the maze is stable. */
+    enum { FGRID = 10 };
+    unsigned char pathGrid[FGRID][FGRID];
+    memset(pathGrid, 0, sizeof(pathGrid));
     uint32_t rng = mapSeed ^ 0x8601860Bu;
-    for (int t = 0; t < MAX_TREES; t++) {
+    int cen = FGRID / 2;
+    int px = cen, py = 0;
+    pathGrid[py][px] = 1;
+    int guard = 0;
+    while (py < FGRID - 1 && guard++ < 400) {
         rng = rng * 1664525u + 1013904223u;
-        float tx = ox + (float)((int)((rng >> 8) % 1600u) - 800);
-        rng = rng * 1664525u + 1013904223u;
-        float tz = oz + (float)((int)((rng >> 8) % 1600u) - 800);
-        /* Keep a clear path down the middle. */
-        if (tx > ox - 200.0f && tx < ox + 200.0f) continue;
-        tree860Pos[tree860Count][0] = tx;
-        tree860Pos[tree860Count][1] = 0.0f;
-        tree860Pos[tree860Count][2] = tz;
-        tree860Count++;
+        if (((rng >> 8) % 100u) < 35u) {          /* deviate sideways */
+            rng = rng * 1664525u + 1013904223u;
+            int nx = px + (((rng >> 8) & 1u) ? 1 : -1);
+            int off = nx - cen; if (off < 0) off = -off;
+            if (nx >= 1 && nx <= FGRID - 2 && off <= 2) {
+                px = nx;
+                pathGrid[py][px] = 1;
+                continue;
+            }
+        }
+        py++;                                      /* else step down */
+        pathGrid[py][px] = 1;
+    }
+    /* SCP-860-1 lurks at the far (top) end of the path. */
+    npc860Pos[0] = ox - 850.0f + ((float)px + 0.5f) * (1700.0f / FGRID);
+    npc860Pos[2] = oz - 850.0f + 0.5f * (1700.0f / FGRID);
+    npc860Pos[1] = 0.0f;
+    /* Stand a tree on every off-path cell. */
+    float cell = 1700.0f / FGRID;
+    for (int j = 0; j < FGRID && tree860Count < MAX_TREES; j++) {
+        for (int i = 0; i < FGRID && tree860Count < MAX_TREES; i++) {
+            if (pathGrid[j][i]) continue;
+            rng = rng * 1664525u + 1013904223u;
+            float jx = (float)((int)((rng >> 8) % 40u) - 20);
+            rng = rng * 1664525u + 1013904223u;
+            float jz = (float)((int)((rng >> 8) % 40u) - 20);
+            tree860Pos[tree860Count][0] = ox - 850.0f + (i + 0.5f) * cell + jx;
+            tree860Pos[tree860Count][1] = 0.0f;
+            tree860Pos[tree860Count][2] = oz - 850.0f + (j + 0.5f) * cell + jz;
+            tree860Count++;
+        }
+    }
+}
+
+/* Push the player out of any nearby SCP-860 tree trunk so the forest
+ * grid actually constrains movement to the carved path. */
+static void collide860Trees(float pos[3]) {
+    if (!npc860Active) return;
+    const float R = 68.0f; /* below half the ~170 cell so the path stays open */
+    for (int t = 0; t < tree860Count; t++) {
+        float dx = pos[0] - tree860Pos[t][0];
+        float dz = pos[2] - tree860Pos[t][2];
+        float d2 = dx * dx + dz * dz;
+        if (d2 >= R * R || d2 < 0.01f) continue;
+        float d = sqrtf(d2);
+        float push = (R - d) / d;
+        pos[0] += dx * push;
+        pos[2] += dz * push;
     }
 }
 
@@ -5317,9 +5787,29 @@ static void elevatorStart(const Door *d) {
     if (elevState != ELEV_IDLE || d->type != 1) return;
     int di = (int)(d - doors.items);
     const char *here = roomNameAt(camPos);
+    elevRayFromY = 1500.0f;
+    /* A vertical car (cont1_079's descent to SCP-079's chamber): its
+     * paired elevator door sits at the same X/Z but a very different Y.
+     * Ride to that level, dropping the arrival floor ray from just above
+     * the destination door so it lands in the lower chamber. */
+    int vpair = -1;
+    for (uint32_t j = 0; j < doors.count; j++) {
+        if ((int)j == di || doors.items[j].type != 1) continue;
+        float vx = doors.items[j].x - d->x, vz = doors.items[j].z - d->z;
+        if (vx * vx + vz * vz < 64.0f * 64.0f
+            && fabsf(doors.items[j].y - d->y) > 2000.0f) {
+            vpair = (int)j;
+            break;
+        }
+    }
     /* The gate elevators travel to the real surfaces (and back); every
      * other car fast-travels to the next elevator in the map. */
-    if (strcmp(here, "gate_a_entrance") == 0 && gateARoomIdx >= 0) {
+    if (vpair >= 0) {
+        elevDest[0] = doors.items[vpair].x;
+        elevDest[2] = doors.items[vpair].z;
+        elevRayFromY = doors.items[vpair].y + 400.0f;
+        elevDoorB = vpair;
+    } else if (strcmp(here, "gate_a_entrance") == 0 && gateARoomIdx >= 0) {
         elevDest[0] = GATEA_GX * ROOM_SPACING;
         elevDest[2] = GATEA_GY * ROOM_SPACING;
         elevDoorB = gateADoor;
@@ -5385,7 +5875,7 @@ static void updateElevator(void) {
             if (elevTimer > 150.0f) {
                 camPos[0] = elevDest[0];
                 camPos[2] = elevDest[2];
-                float o[3] = { camPos[0], 1500.0f, camPos[2] };
+                float o[3] = { camPos[0], elevRayFromY, camPos[2] };
                 float hy;
                 camPos[1] = (rayDownWorld(o, 3000.0f, &hy) ? hy : 0.0f)
                           + EYE_HEIGHT;
@@ -5982,6 +6472,440 @@ static void draw860(const float viewPos[3]) {
                   npc860YawDeg);
 }
 
+/* ---- SCP-372: the peripheral jumper (cont3_372) ---- */
+
+static void spawn372(void) {
+    npc372Ok = 0;
+    npc372Idle = 1;
+    npc372State = 0.0f;
+    npc372Frame = 0.0f;
+    if (!skin372) return;
+    for (uint32_t r = 0; r < map.roomCount; r++) {
+        if (strcmp(tplList.items[map.rooms[r].templateIndex].name,
+                   "cont3_372") == 0) {
+            npc372Ok = 1;
+            break;
+        }
+    }
+    npc372Pos[0] = npc372Pos[1] = npc372Pos[2] = 0.0f;
+}
+
+/* UpdateNPCType372: idle and hidden, it now and then flits to a spot
+ * ~450 raw off to the player's side and lingers; while active it bobs and
+ * spins, but the instant you centre it in your gaze it darts back toward
+ * the edge of sight. Purely a startle - it never touches you. */
+static void update372(void) {
+    if (!npc372Ok || !skin372) return;
+    if (strcmp(roomNameAt(camPos), "cont3_372") != 0) {
+        npc372Idle = 1;
+        return;
+    }
+    if (npc372Idle) {
+        /* Source reveals it during a blink (BlinkTimer window): you blink
+         * and it is suddenly there at the edge of sight. A rare timer
+         * fallback keeps it appearing even if you barely blink. */
+        if ((blinkFrames > 0 && (rand() % 4) == 0) || (rand() % 240) == 0) {
+            float ang = camYaw + (float)((rand() % 180) - 90) * 0.0174533f;
+            float dist = 400.0f + (float)(rand() % 130);
+            npc372Pos[0] = camPos[0] + sinf(ang) * dist;
+            npc372Pos[2] = camPos[2] - cosf(ang) * dist;
+            npc372Pos[1] = camPos[1] - EYE_HEIGHT * 0.4f;
+            npc372Idle = 0;
+            npc372State = 60.0f + (float)(rand() % 120);
+            if ((rand() % 4) == 0) {
+                audioPlay3D(sndRattle[rand() % 3], npc372Pos, camPos, camYaw,
+                            900.0f);
+            }
+        }
+        return;
+    }
+    /* Active: bob and advance the anim. */
+    npc372Frame += 3.0f;
+    if (npc372Frame > 300.0f) npc372Frame = 1.0f;
+    /* If the player centres it in view it darts to the periphery: cos of
+     * the angle between the view forward and the direction to it - beyond
+     * ~22 deg off-centre it stops fleeing and lingers at the edge of
+     * sight. */
+    float dx = npc372Pos[0] - camPos[0], dz = npc372Pos[2] - camPos[2];
+    float len = sqrtf(dx * dx + dz * dz);
+    if (len < 1.0f) len = 1.0f;
+    float fx = sinf(camYaw), fz = -cosf(camYaw);   /* view forward */
+    float cosang = (dx * fx + dz * fz) / len;
+    if (cosang > 0.927f) {
+        float rx = -fz, rz = fx;                    /* view right */
+        float s = (dx * rx + dz * rz >= 0.0f) ? 1.0f : -1.0f;
+        npc372Pos[0] += rx * s * 16.0f;             /* dart to that side */
+        npc372Pos[2] += rz * s * 16.0f;
+        if ((rand() % 30) == 0) {
+            audioPlay3D(sndRattle[rand() % 3], npc372Pos, camPos, camYaw,
+                        900.0f);
+        }
+    }
+    npc372State -= 0.8f;
+    if (npc372State <= 0.0f) npc372Idle = 1; /* vanishes */
+}
+
+static void draw372(const float viewPos[3]) {
+    if (!npc372Ok || npc372Idle || !skin372) return;
+    float dx = npc372Pos[0] - viewPos[0], dz = npc372Pos[2] - viewPos[2];
+    if (dx * dx + dz * dz > VIEW_RANGE * VIEW_RANGE) return;
+    GLuint *ibos = skinIBOsFor(skin372);
+    if (!ibos) return;
+    if (!vbo372) glGenBuffers(1, &vbo372);
+    static int poseTick;
+    if (!posed372 || ((poseTick++) & 1) == 0) {
+        skinnedEval(skin372, npc372Frame);
+        uint32_t vc;
+        const SceneVertex *v = skinnedVertices(skin372, &vc);
+        glBindBuffer(GL_ARRAY_BUFFER, vbo372);
+        glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)(vc * sizeof(SceneVertex)),
+                     v, GL_DYNAMIC_DRAW);
+        glBindBuffer(GL_ARRAY_BUFFER, 0);
+        posed372 = 1;
+    }
+    /* A slow spin, source-style (RotateEntity roll = MilliSec/5). */
+    float bob = sinf(gTick * 0.08f) * 12.0f;
+    float p[3] = { npc372Pos[0], npc372Pos[1] + 76.0f + bob, npc372Pos[2] };
+    drawSkinnedAt(skin372, vbo372, ibos, skin372Scale, p,
+                  (float)((gTick * 2) % 360));
+}
+
+/* ---- SCP-205: the shadow demon (cont1_205) ---- */
+
+static void spawn205(void) {
+    npc205Ok = 0;
+    npc205Rise = 0.0f;
+    npc205Frame = 0.0f;
+    npc205Horror = 0.0f;
+    if (!skin205) return;
+    for (uint32_t r = 0; r < map.roomCount; r++) {
+        const RoomPlacement *p = &map.rooms[r];
+        if (strcmp(tplList.items[p->templateIndex].name, "cont1_205") != 0) {
+            continue;
+        }
+        /* Demons' spawnpoint (source local -1536,730,192). */
+        float local[3] = { -1536.0f, 730.0f, 192.0f }, w[3];
+        localToWorld(p, local, w);
+        npc205Pos[0] = w[0]; npc205Pos[1] = w[1]; npc205Pos[2] = w[2];
+        npc205Home[0] = w[0]; npc205Home[1] = w[1]; npc205Home[2] = w[2];
+        npc205Yaw = (float)(p->angle * 90) - 90.0f;
+        npc205Ok = 1;
+        break;
+    }
+}
+
+/* e_cont1_205: while the player is in the chamber the shadow demon rises
+ * and looms, moaning (Horror.ogg) and gnawing at sanity. Seen mainly on
+ * the observation monitor the camera feeds. The rising-woman set-piece
+ * and the lethal grab are approximated as a dread swell. */
+static void update205(void) {
+    if (!npc205Ok || !skin205) return;
+    int inChamber = strcmp(roomNameAt(camPos), "cont1_205") == 0;
+    npc205Frame += 1.5f;
+    if (npc205Frame > 300.0f) npc205Frame = 1.0f;
+    if (inChamber) {
+        if (npc205Rise < 1.0f) npc205Rise += 0.0015f;
+        sanity -= 0.03f;
+        if (sanity < -1000.0f) sanity = -1000.0f;
+        npc205Horror += 1.0f;
+        if (npc205Horror > 360.0f) {
+            npc205Horror = 0.0f;
+            if (snd205Horror >= 0) {
+                audioPlay3D(snd205Horror, npc205Pos, camPos, camYaw, 2000.0f);
+            }
+        }
+        /* Fully risen, the shadow lunges - it closes on the player and
+         * grabs on contact (source teleports you into the demon). */
+        if (npc205Rise >= 1.0f && deathTimer == 0 && walkMode
+            && introPhase < 0) {
+            float dx = camPos[0] - npc205Pos[0];
+            float dz = camPos[2] - npc205Pos[2];
+            float dist = sqrtf(dx * dx + dz * dz);
+            if (dist > 1.0f) {
+                float speed = 7.0f + (float)npcAggressive * 3.0f;
+                npc205Pos[0] += dx / dist * speed;
+                npc205Pos[2] += dz / dist * speed;
+                npc205Yaw = atan2f(dx, dz) * 180.0f / 3.14159265f;
+            }
+            float o[3] = { npc205Pos[0], npc205Pos[1] + 250.0f, npc205Pos[2] };
+            float hy;
+            if (rayDownWorld(o, 600.0f, &hy)) npc205Pos[1] = hy;
+            if (dist < 200.0f) {
+                snprintf(deathCause, sizeof(deathCause), "SCP-205");
+                deathTimer = 180;
+            }
+        }
+    } else if (npc205Rise > 0.0f) {
+        npc205Rise -= 0.004f;
+        if (npc205Rise < 0.0f) {
+            npc205Rise = 0.0f;
+            /* Sank back; return to its lair for next time. */
+            npc205Pos[0] = npc205Home[0];
+            npc205Pos[1] = npc205Home[1];
+            npc205Pos[2] = npc205Home[2];
+        }
+    }
+}
+
+static void draw205(const float viewPos[3]) {
+    if (!npc205Ok || npc205Rise <= 0.01f || !skin205) return;
+    float dx = npc205Pos[0] - viewPos[0], dz = npc205Pos[2] - viewPos[2];
+    if (dx * dx + dz * dz > VIEW_RANGE * VIEW_RANGE) return;
+    GLuint *ibos = skinIBOsFor(skin205);
+    if (!ibos) return;
+    if (!vbo205) glGenBuffers(1, &vbo205);
+    static int poseTick;
+    if (!posed205 || ((poseTick++) & 1) == 0) {
+        skinnedEval(skin205, npc205Frame);
+        uint32_t vc;
+        const SceneVertex *v = skinnedVertices(skin205, &vc);
+        glBindBuffer(GL_ARRAY_BUFFER, vbo205);
+        glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)(vc * sizeof(SceneVertex)),
+                     v, GL_DYNAMIC_DRAW);
+        glBindBuffer(GL_ARRAY_BUFFER, 0);
+        posed205 = 1;
+    }
+    /* Rises up out of the floor as npc205Rise grows. */
+    float p[3] = { npc205Pos[0], npc205Pos[1] - 260.0f + npc205Rise * 260.0f,
+                   npc205Pos[2] };
+    drawSkinnedAt(skin205, vbo205, ibos, skin205Scale, p, npc205Yaw);
+}
+
+/* ---- SCP-914's hostile output (SCP-008 zombie / hostile SCP-1499) ---- */
+
+static void spawnRefineHostile(int type) {
+    if (type == 0 && !skin008) return;
+    if (type == 1 && !skin1499) return;
+    rhActive = 1;
+    rhType = type;
+    rhPos[0] = scp914Out[0];
+    rhPos[2] = scp914Out[2];
+    float o[3] = { rhPos[0], scp914Out[1] + 200.0f, rhPos[2] };
+    float hy;
+    rhPos[1] = rayDownWorld(o, 800.0f, &hy) ? hy : scp914Out[1];
+    rhFrame = 0.0f;
+    rhYaw = 0.0f;
+    if (type == 0 && snd939Horror >= 0) audioPlay(snd939Horror, 0.8f, 0.0f);
+    if (type == 1 && snd1499Trig >= 0) audioPlay(snd1499Trig, 0.9f, 0.0f);
+}
+
+static void updateRefineHostile(void) {
+    if (!rhActive || deathTimer > 0 || !walkMode || introPhase >= 0
+        || inPocket || inMask) {
+        return;
+    }
+    float dx = camPos[0] - rhPos[0], dz = camPos[2] - rhPos[2];
+    float dist = sqrtf(dx * dx + dz * dz);
+    rhFrame += 0.25f;
+    if (rhFrame > 200.0f) rhFrame = 2.0f;
+    float speed = 9.0f + (float)npcAggressive * 3.0f;
+    if (dist > 1.0f) {
+        rhPos[0] += dx / dist * speed;
+        rhPos[2] += dz / dist * speed;
+        rhYaw = atan2f(dx, dz) * 180.0f / 3.14159265f;
+    }
+    float o[3] = { rhPos[0], rhPos[1] + 250.0f, rhPos[2] };
+    float hy;
+    if (rayDownWorld(o, 600.0f, &hy)) rhPos[1] = hy;
+    if (dist < 190.0f) {
+        snprintf(deathCause, sizeof(deathCause),
+                 rhType == 0 ? "SCP-008" : "SCP-1499");
+        deathTimer = 180;
+    }
+}
+
+static void drawRefineHostile(const float viewPos[3]) {
+    if (!rhActive) return;
+    SkinnedMesh *sk = rhType == 0 ? skin008 : skin1499;
+    float scale = rhType == 0 ? skin008Scale : skin1499Scale;
+    if (!sk) return;
+    float dx = rhPos[0] - viewPos[0], dz = rhPos[2] - viewPos[2];
+    if (dx * dx + dz * dz > VIEW_RANGE * VIEW_RANGE) return;
+    GLuint *ibos = skinIBOsFor(sk);
+    if (!ibos) return;
+    if (!rhVbo) glGenBuffers(1, &rhVbo);
+    skinnedEval(sk, rhFrame);
+    uint32_t vc;
+    const SceneVertex *v = skinnedVertices(sk, &vc);
+    glBindBuffer(GL_ARRAY_BUFFER, rhVbo);
+    glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)(vc * sizeof(SceneVertex)),
+                 v, GL_DYNAMIC_DRAW);
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+    drawSkinnedAt(sk, rhVbo, ibos, scale, rhPos, rhYaw);
+}
+
+/* ---- SCP-513-1: the bell-summoned haunt ---- */
+
+static void spawn513(void) {
+    if (!skin513) return;
+    npc513Active = 1;
+    npc513Timer = 0.0f;
+    npc513Bell = 0.0f;
+    npc513Frame = 0.0f;
+    float ang = camYaw + 1.2f;
+    npc513Pos[0] = camPos[0] + sinf(ang) * 450.0f;
+    npc513Pos[2] = camPos[2] - cosf(ang) * 450.0f;
+    npc513Pos[1] = camPos[1] - EYE_HEIGHT * 0.3f;
+    npc513Yaw = 0.0f;
+    if (snd513Bell[0] >= 0) audioPlay(snd513Bell[rand() % 3], 0.8f, 0.0f);
+}
+
+/* UpdateNPCType513_1: it lurks at the edge of sight; centring it makes it
+ * flit elsewhere, it tolls its bells now and then, and its presence eats
+ * at sanity - but it never touches you. */
+static void update513(void) {
+    if (!npc513Active || !skin513 || deathTimer > 0 || !walkMode
+        || introPhase >= 0 || inPocket || inMask) {
+        return;
+    }
+    npc513Frame += 0.3f;
+    if (npc513Frame > 200.0f) npc513Frame = 2.0f;
+    float dx = camPos[0] - npc513Pos[0], dz = camPos[2] - npc513Pos[2];
+    float len = sqrtf(dx * dx + dz * dz);
+    if (len < 1.0f) len = 1.0f;
+    float fx = sinf(camYaw), fz = -cosf(camYaw);
+    if ((-dx * fx - dz * fz) / len > 0.9f) {
+        npc513Timer = 999.0f; /* stared at: flit away now */
+    }
+    npc513Timer += 1.0f;
+    if (npc513Timer > 180.0f) {
+        npc513Timer = 0.0f;
+        float ang = camYaw + ((rand() % 2) ? 1.2f : -1.2f)
+                  + (float)((rand() % 40) - 20) * 0.01f;
+        float dist = 380.0f + (float)(rand() % 160);
+        npc513Pos[0] = camPos[0] + sinf(ang) * dist;
+        npc513Pos[2] = camPos[2] - cosf(ang) * dist;
+        npc513Pos[1] = camPos[1] - EYE_HEIGHT * 0.3f;
+        len = 1.0f;
+    }
+    npc513Yaw = atan2f(dx, dz) * 180.0f / 3.14159265f;
+    npc513Bell += 1.0f;
+    if (npc513Bell > 300.0f) {
+        npc513Bell = 0.0f;
+        if (snd513Bell[0] >= 0) {
+            audioPlay3D(snd513Bell[rand() % 3], npc513Pos, camPos, camYaw,
+                        1500.0f);
+        }
+    }
+    if (len < 700.0f) {
+        sanity -= 0.03f;
+        if (sanity < -1000.0f) sanity = -1000.0f;
+        if (blurAmount < 0.12f) blurAmount = 0.12f;
+    }
+}
+
+static void draw513(const float viewPos[3]) {
+    if (!npc513Active || !skin513) return;
+    float dx = npc513Pos[0] - viewPos[0], dz = npc513Pos[2] - viewPos[2];
+    if (dx * dx + dz * dz > VIEW_RANGE * VIEW_RANGE) return;
+    GLuint *ibos = skinIBOsFor(skin513);
+    if (!ibos) return;
+    if (!vbo513) glGenBuffers(1, &vbo513);
+    static int poseTick;
+    if (!posed513 || ((poseTick++) & 1) == 0) {
+        skinnedEval(skin513, npc513Frame);
+        uint32_t vc;
+        const SceneVertex *v = skinnedVertices(skin513, &vc);
+        glBindBuffer(GL_ARRAY_BUFFER, vbo513);
+        glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)(vc * sizeof(SceneVertex)),
+                     v, GL_DYNAMIC_DRAW);
+        glBindBuffer(GL_ARRAY_BUFFER, 0);
+        posed513 = 1;
+    }
+    float bob = sinf(gTick * 0.06f) * 10.0f;
+    float p[3] = { npc513Pos[0], npc513Pos[1] + 90.0f + bob, npc513Pos[2] };
+    drawSkinnedAt(skin513, vbo513, ibos, skin513Scale, p, npc513Yaw);
+}
+
+/* ---- SCP-035: the possessed host (cont1_035) ---- */
+
+static void spawn035(void) {
+    npc035Ok = 0;
+    npc035State = 0;
+    npc035Frame = 0.0f;
+    if (!skinClassD) return;
+    for (uint32_t r = 0; r < map.roomCount; r++) {
+        const RoomPlacement *p = &map.rooms[r];
+        if (strcmp(tplList.items[p->templateIndex].name, "cont1_035") != 0) {
+            continue;
+        }
+        float local[3] = { -576.0f, 0.5f, 640.0f }, w[3];
+        localToWorld(p, local, w);
+        npc035Pos[0] = w[0]; npc035Pos[1] = w[1]; npc035Pos[2] = w[2];
+        npc035Home[0] = w[0]; npc035Home[1] = w[1]; npc035Home[2] = w[2];
+        npc035Yaw = (float)(p->angle * 90) + 270.0f;
+        npc035Ok = 1;
+        break;
+    }
+}
+
+/* e_cont1_035: the possessed Class-D slumps in the chamber until you look
+ * at it up close, then it gets up (GetUp.ogg) and hunts you down, killing
+ * on contact. The gas-lever containment puzzle and the corrosive
+ * tentacles are not reproduced. */
+static void update035(void) {
+    if (!npc035Ok || !skinClassD || deathTimer > 0 || !walkMode
+        || introPhase >= 0) {
+        return;
+    }
+    npc035Frame += npc035State ? 0.5f : 0.1f;
+    if (npc035Frame > 300.0f) npc035Frame = 2.0f;
+    float dx = camPos[0] - npc035Pos[0], dz = camPos[2] - npc035Pos[2];
+    float dist = sqrtf(dx * dx + dz * dz);
+    if (npc035State == 0) {
+        if (strcmp(roomNameAt(camPos), "cont1_035") != 0) return;
+        if (dist < 900.0f) {
+            float len = dist < 1.0f ? 1.0f : dist;
+            float fx = sinf(camYaw), fz = -cosf(camYaw);
+            if ((dx * fx + dz * fz) / len > 0.6f) { /* you look at it */
+                npc035State = 1;
+                if (snd035GetUp >= 0) audioPlay(snd035GetUp, 0.9f, 0.0f);
+                snprintf(toastMsg, sizeof(toastMsg),
+                         "IT WEARS A SMILING FACE...");
+                toastTimer = 200;
+            }
+        }
+    } else {
+        if (dist > 1.0f) {
+            float speed = 8.0f + (float)npcAggressive * 3.0f;
+            npc035Pos[0] += dx / dist * speed;
+            npc035Pos[2] += dz / dist * speed;
+            npc035Yaw = atan2f(dx, dz) * 180.0f / 3.14159265f;
+        }
+        float o[3] = { npc035Pos[0], npc035Pos[1] + 250.0f, npc035Pos[2] };
+        float hy;
+        if (rayDownWorld(o, 600.0f, &hy)) npc035Pos[1] = hy;
+        if (dist < 190.0f) {
+            snprintf(deathCause, sizeof(deathCause), "SCP-035");
+            deathTimer = 180;
+        }
+        if (dist > 3400.0f) { /* lost you: sit back down */
+            npc035State = 0;
+            npc035Pos[0] = npc035Home[0];
+            npc035Pos[1] = npc035Home[1];
+            npc035Pos[2] = npc035Home[2];
+        }
+    }
+}
+
+static void draw035(const float viewPos[3]) {
+    if (!npc035Ok || !skinClassD) return;
+    float dx = npc035Pos[0] - viewPos[0], dz = npc035Pos[2] - viewPos[2];
+    if (dx * dx + dz * dz > VIEW_RANGE * VIEW_RANGE) return;
+    GLuint *ibos = skinIBOsFor(skinClassD);
+    if (!ibos) return;
+    if (!vbo035) glGenBuffers(1, &vbo035);
+    skinnedEval(skinClassD, npc035Frame);
+    uint32_t vc;
+    const SceneVertex *v = skinnedVertices(skinClassD, &vc);
+    glBindBuffer(GL_ARRAY_BUFFER, vbo035);
+    glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)(vc * sizeof(SceneVertex)),
+                 v, GL_DYNAMIC_DRAW);
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+    drawSkinnedAtTex(skinClassD, vbo035, ibos, skinClassDScale, npc035Pos,
+                     npc035Yaw, tex035);
+}
+
 /* ---------------- items and inventory ---------------- */
 
 /* Templates and per-room spawns generated from the Blitz sources by
@@ -6062,6 +6986,413 @@ static void worldItemAdd(int tpl, float x, float y, float z) {
     w->y = y;
     w->z = z;
     w->taken = 0;
+}
+
+/* ---- SCP-914: the refinement machine (cont1_914) ---- */
+
+static const char *setting914Name(int s) {
+    switch (s) {
+        case -2: return "ROUGH";
+        case -1: return "COARSE";
+        case 0:  return "1:1";
+        case 1:  return "FINE";
+        default: return "VERY FINE";
+    }
+}
+
+/* A slice of Use914: keycards step up/down by setting (1:1 famously spits
+ * out a Playing Card), and everything else is destroyed on Rough/Coarse
+ * and passed through otherwise. Returns the output template, or -1 if the
+ * item is consumed to nothing. */
+/* The Use914 transformation table, one row per input item, outputs in
+ * setting order { ROUGH, COARSE, 1:1, FINE, VERYFINE }. NULL = the item
+ * is destroyed. Multi-output / random / NPC / difficulty branches in the
+ * source are collapsed to their primary deterministic outcome. Any output
+ * whose template the port lacks falls back to passing the item through. */
+typedef struct {
+    const char *in;
+    const char *out[5];
+} Refine914Row;
+
+static const Refine914Row REFINE914[] = {
+    { "Gas Mask",            { NULL, NULL, "Gas Mask", "Fine Gas Mask", "Very Fine Gas Mask" } },
+    { "Fine Gas Mask",       { NULL, NULL, "Gas Mask", "Fine Gas Mask", "Very Fine Gas Mask" } },
+    { "Very Fine Gas Mask",  { NULL, NULL, "Gas Mask", "Fine Gas Mask", "Very Fine Gas Mask" } },
+    { "Heavy Gas Mask",      { NULL, NULL, "Gas Mask", "Fine Gas Mask", "Very Fine Gas Mask" } },
+    { "SCP-1499",            { NULL, NULL, "Gas Mask", "Fine SCP-1499", "Fine SCP-1499" } },
+    { "Fine SCP-1499",       { NULL, NULL, "Gas Mask", "Fine SCP-1499", "Fine SCP-1499" } },
+    { "Night Vision Goggles",{ NULL, "Electronical Components", "SCRAMBLE Gear", "Fine Night Vision Goggles", "Very Fine Night Vision Goggles" } },
+    { "Fine Night Vision Goggles",{ NULL, "Electronical Components", "SCRAMBLE Gear", "Fine Night Vision Goggles", "Very Fine Night Vision Goggles" } },
+    { "Very Fine Night Vision Goggles",{ NULL, "Electronical Components", "SCRAMBLE Gear", "Fine Night Vision Goggles", "Very Fine Night Vision Goggles" } },
+    { "SCRAMBLE Gear",       { NULL, "Electronical Components", "Night Vision Goggles", "Fine SCRAMBLE Gear", "Fine SCRAMBLE Gear" } },
+    { "Fine SCRAMBLE Gear",  { NULL, "Electronical Components", "Night Vision Goggles", "Fine SCRAMBLE Gear", "Fine SCRAMBLE Gear" } },
+    { "Ballistic Helmet",    { NULL, NULL, "Ballistic Vest", "Heavy Ballistic Vest", "Heavy Ballistic Vest" } },
+    { "Newsboy Cap",         { NULL, "Newsboy Cap", NULL, "Fine SCP-268", "Fine SCP-268" } },
+    { "SCP-268",             { NULL, "Newsboy Cap", NULL, "Fine SCP-268", "Fine SCP-268" } },
+    { "Fine SCP-268",        { NULL, "Newsboy Cap", NULL, "Fine SCP-268", "Fine SCP-268" } },
+    { "Ballistic Vest",      { NULL, "Corrosive Ballistic Vest", "Ballistic Helmet", "Heavy Ballistic Vest", "Bulky Ballistic Vest" } },
+    { "Heavy Ballistic Vest",{ NULL, "Corrosive Ballistic Vest", "Ballistic Helmet", "Heavy Ballistic Vest", "Bulky Ballistic Vest" } },
+    { "Hazmat Suit",         { NULL, NULL, "Hazmat Suit", "Fine Hazmat Suit", "Very Fine Hazmat Suit" } },
+    { "Fine Hazmat Suit",    { NULL, NULL, "Hazmat Suit", "Fine Hazmat Suit", "Very Fine Hazmat Suit" } },
+    { "Heavy Hazmat Suit",   { NULL, NULL, "Hazmat Suit", "Fine Hazmat Suit", "Very Fine Hazmat Suit" } },
+    { "Very Fine Hazmat Suit",{ NULL, NULL, "Hazmat Suit", "Infected Syringe", "Infected Syringe" } },
+    { "Electronical Components",{ NULL, NULL, NULL, "Night Vision Goggles", "Fine Night Vision Goggles" } },
+    { "E-Reader",            { NULL, "Clipboard", NULL, "E-Reader 20", "E-Reader 30" } },
+    { "E-Reader 20",         { NULL, "Clipboard", NULL, "E-Reader 20", "E-Reader 30" } },
+    { "E-Reader 30",         { NULL, "Clipboard", NULL, "E-Reader 20", "E-Reader 30" } },
+    { "Radio Transceiver",   { NULL, "Electronical Components", "18V Radio Transceiver", "Fine Radio Transceiver", "Very Fine Radio Transceiver" } },
+    { "18V Radio Transceiver",{ NULL, "Electronical Components", "18V Radio Transceiver", "Fine Radio Transceiver", "Very Fine Radio Transceiver" } },
+    { "Fine Radio Transceiver",{ NULL, "Electronical Components", "18V Radio Transceiver", "Fine Radio Transceiver", "Very Fine Radio Transceiver" } },
+    { "S-NAV Navigator",     { NULL, "Electronical Components", "S-NAV Navigator", "S-NAV 310 Navigator", "S-NAV 300 Navigator" } },
+    { "S-NAV 300 Navigator", { NULL, "Electronical Components", "S-NAV Navigator", "S-NAV 310 Navigator", "S-NAV 300 Navigator" } },
+    { "S-NAV 310 Navigator", { NULL, "Electronical Components", "S-NAV Navigator", "S-NAV 310 Navigator", "S-NAV 300 Navigator" } },
+    { "SCP-148 Ingot",       { "SCP-148 Ingot", "SCP-148 Ingot", NULL, NULL, NULL } },
+    { "White Severed Hand",  { NULL, NULL, "Black Severed Hand", NULL, NULL } },
+    { "Black Severed Hand",  { NULL, NULL, "Yellow Severed Hand", NULL, NULL } },
+    { "Yellow Severed Hand", { NULL, NULL, "White Severed Hand", NULL, NULL } },
+    { "First Aid Kit",       { NULL, NULL, "Blue First Aid Kit", "Compact First Aid Kit", "Strange Bottle" } },
+    { "Blue First Aid Kit",  { NULL, NULL, "First Aid Kit", "Compact First Aid Kit", "Strange Bottle" } },
+    { "Compact First Aid Kit",{ NULL, NULL, "First Aid Kit", "Compact First Aid Kit", "Strange Bottle" } },
+    { "Playing Card",        { NULL, NULL, "Level 1 key Card", "Level 1 key Card", "Level 2 key Card" } },
+    { "Coin",                { NULL, NULL, "Level 1 key Card", "Level 1 key Card", "Level 2 key Card" } },
+    { "Quarter",             { NULL, NULL, "Level 1 key Card", "Level 1 key Card", "Level 2 key Card" } },
+    { "Mastercard",          { NULL, "Quarter", "Level 1 key Card", "Level 1 key Card", "Level 2 key Card" } },
+    { "SCP-005",             { NULL, "Level 3 key Card", "Level 5 key Card", NULL, NULL } },
+    { "SCP-860",             { NULL, NULL, "SCP-860", "Fine SCP-860", "Fine SCP-860" } },
+    { "Fine SCP-860",        { NULL, NULL, "SCP-860", "Fine SCP-860", "Fine SCP-860" } },
+    { "SCP-513",             { NULL, NULL, "SCP-513", "SCP-513", "SCP-513" } },
+    { "Cigarette",           { NULL, NULL, "Cigarette", "Joint", "Smelly Joint" } },
+    { "Joint",               { NULL, NULL, "Cigarette", "Joint", "Smelly Joint" } },
+    { "SCP-714",             { NULL, "Coarse SCP-714", "SCP-714", "Fine SCP-714", "Fine SCP-714" } },
+    { "Coarse SCP-714",      { NULL, "Coarse SCP-714", "SCP-714", "Fine SCP-714", "Fine SCP-714" } },
+    { "Fine SCP-714",        { NULL, "Coarse SCP-714", "SCP-714", "Fine SCP-714", "Fine SCP-714" } },
+    { "4.5V Battery",        { NULL, NULL, NULL, "9V Battery", "18V Battery" } },
+    { "9V Battery",          { NULL, "4.5V Battery", NULL, "18V Battery", "999V Battery" } },
+    { "18V Battery",         { "4.5V Battery", "9V Battery", NULL, "18V Battery", "999V Battery" } },
+    { "999V Battery",        { "4.5V Battery", "9V Battery", "Strange Battery", "Strange Battery", "Strange Battery" } },
+    { "ReVision Eyedrops",   { NULL, NULL, "ReVision Eyedrops", "Fine Eyedrops", "Very Fine Eyedrops" } },
+    { "RedVision Eyedrops",  { NULL, NULL, "ReVision Eyedrops", "Fine Eyedrops", "Very Fine Eyedrops" } },
+    { "Fine Eyedrops",       { NULL, NULL, "ReVision Eyedrops", "Fine Eyedrops", "Very Fine Eyedrops" } },
+    { "Syringe",             { NULL, NULL, "Compact First Aid Kit", "Fine Syringe", "Very Fine Syringe" } },
+    { "Fine Syringe",        { NULL, "First Aid Kit", "Blue First Aid Kit", "Very Fine Syringe", "Very Fine Syringe" } },
+    { "Very Fine Syringe",   { "Electronical Components", "Electronical Components", "Electronical Components", "Infected Syringe", "Infected Syringe" } },
+    { "Infected Syringe",    { NULL, NULL, NULL, "Syringe", "Blue First Aid Kit" } },
+    { "Pill",                { NULL, NULL, "Pill", "Upgraded Pill", "Upgraded Pill" } },
+    { "SCP-500-01",          { NULL, NULL, "Pill", "Upgraded Pill", "Upgraded Pill" } },
+    { "Blank Paper",         { NULL, "Blank Paper", NULL, "Origami", "Origami" } },
+    { "Origami",             { NULL, "Blank Paper", NULL, "SCP-085", "SCP-085" } },
+    { "SCP-1025",            { NULL, "Blank Paper", "SCP-1025", "Fine SCP-1025", "Fine SCP-1025" } },
+    { "Book",                { NULL, "Blank Paper", "SCP-1025", "Fine SCP-1025", "Fine SCP-1025" } },
+};
+
+/* The deterministic primary output for one (item, setting) - a single
+ * template, or -1 if the item is destroyed. The random / multi-output
+ * layers wrap this. */
+static int r914Base(int tpl, int setting) {
+    if (tpl < 0) return -1;
+    int si = setting + 2; /* -2..2 -> 0..4 */
+    if (si < 0) si = 0;
+    if (si > 4) si = 4;
+    const char *in = ITEM_TEMPLATES[tpl].name;
+    for (unsigned r = 0; r < sizeof(REFINE914) / sizeof(REFINE914[0]); r++) {
+        if (strcmp(REFINE914[r].in, in) != 0) continue;
+        const char *out = REFINE914[r].out[si];
+        if (!out) return -1;                  /* destroyed */
+        int t = itemTplFind(out);
+        return t >= 0 ? t : tpl;              /* missing template: pass through */
+    }
+    /* Keycards step by setting: Rough shreds, Coarse a level down, 1:1 the
+     * famous Playing Card, Fine up one, Very Fine up two, past L5 a
+     * Mastercard. */
+    int lvl = itemKeycardLevel(tpl);
+    if (lvl > 0) {
+        int target = lvl;
+        switch (setting) {
+            case -2: return -1;
+            case -1: target = lvl - 1; break;
+            case 0: {
+                int pc = itemTplFind("Playing Card");
+                return pc >= 0 ? pc : tpl;
+            }
+            case 1: target = lvl + 1; break;
+            default: target = lvl + 2; break;
+        }
+        if (target < 1) return -1;
+        if (target > 5) {
+            int mc = itemTplFind("Mastercard");
+            if (mc >= 0) return mc;
+            target = 5;
+        }
+        char nm[32];
+        snprintf(nm, sizeof(nm), "Level %d key Card", target);
+        int t = itemTplFind(nm);
+        return t >= 0 ? t : tpl;
+    }
+    /* Default (source): Rough/Coarse ruin the item, the rest pass it
+     * through untouched. */
+    if (setting <= -1) return -1;
+    return tpl;
+}
+
+/* Source Use914 has random "jackpot" rolls that replace the base output
+ * (e.g. a gas mask very rarely refines into SCP-1499). in/setting match;
+ * on a 1-in-oneIn roll the base is swapped for `item`. */
+typedef struct {
+    const char *in;
+    int setting;
+    const char *item;
+    int oneIn;
+} R914Rare;
+
+static const R914Rare R914_RARE[] = {
+    { "Gas Mask", 0, "Hazmat Suit", 4 },
+    { "Fine Gas Mask", 0, "Hazmat Suit", 4 },
+    { "Very Fine Gas Mask", 0, "Hazmat Suit", 4 },
+    { "Heavy Gas Mask", 0, "Hazmat Suit", 4 },
+    { "Gas Mask", 1, "SCP-1499", 50 },
+    { "Fine Gas Mask", 1, "SCP-1499", 50 },
+    { "Very Fine Gas Mask", 1, "SCP-1499", 50 },
+    { "Heavy Gas Mask", 1, "SCP-1499", 50 },
+    { "Gas Mask", 2, "SCP-1499", 100 },
+    { "Fine Gas Mask", 2, "SCP-1499", 100 },
+    { "Very Fine Gas Mask", 2, "SCP-1499", 100 },
+    { "Heavy Gas Mask", 2, "SCP-1499", 100 },
+    { "Night Vision Goggles", 1, "Fine SCRAMBLE Gear", 5 },
+    { "Fine Night Vision Goggles", 1, "Fine SCRAMBLE Gear", 5 },
+    { "Very Fine Night Vision Goggles", 1, "Fine SCRAMBLE Gear", 5 },
+};
+
+/* Source cases that spit out a SECOND item alongside the base. */
+typedef struct {
+    const char *in;
+    int setting;
+    const char *item;
+} R914Extra;
+
+static const R914Extra R914_EXTRA[] = {
+    { "Syringe", 2, "Infected Syringe" },
+    { "Fine Syringe", 2, "Infected Syringe" },
+    { "9V Battery", 2, "Strange Battery" },
+    { "18V Battery", 2, "Strange Battery" },
+    { "S-NAV Navigator", 2, "S-NAV Navigator Ultimate" },
+    { "S-NAV 300 Navigator", 2, "S-NAV Navigator Ultimate" },
+    { "S-NAV 310 Navigator", 2, "S-NAV Navigator Ultimate" },
+    { "E-Reader", 1, "Clipboard" },
+    { "E-Reader", 2, "Clipboard" },
+    { "E-Reader 20", 1, "Clipboard" },
+    { "E-Reader 30", 2, "Clipboard" },
+    { "Infected Syringe", 2, "Fine Syringe" },
+    { "SCP-005", 0, "White Severed Hand" },
+    { "SCP-005", 0, "Yellow Key" },
+    { "Mastercard", -1, "Quarter" },
+    { "Mastercard", -1, "Quarter" },
+    { "Mastercard", -1, "Quarter" },
+};
+
+static void r914Add(int out[6], int *n, const char *name) {
+    if (*n >= 6 || !name) return;
+    int t = itemTplFind(name);
+    if (t >= 0) out[(*n)++] = t;
+}
+
+/* Produce the SCP-914 output list for (item, setting): the primary output
+ * plus any deterministic second items, or a random jackpot replacement.
+ * Returns the number of items produced (0 = the item is destroyed). */
+static int refine914(int tpl, int setting, int out[6]) {
+    refineHostilePending = -1;
+    if (tpl < 0) return 0;
+    int n = 0;
+    const char *in = ITEM_TEMPLATES[tpl].name;
+    /* The two NPC-producing outcomes (Use914): Very Fine SCP-1499 breeds a
+     * hostile SCP-1499, and a refined severed hand (Fine/Very Fine) breeds
+     * an SCP-008 zombie. They emit no item. */
+    if (setting >= 2 && (strcmp(in, "SCP-1499") == 0
+                         || strcmp(in, "Fine SCP-1499") == 0)) {
+        refineHostilePending = 1;
+        return 0;
+    }
+    if (setting >= 1 && (strcmp(in, "White Severed Hand") == 0
+                         || strcmp(in, "Black Severed Hand") == 0
+                         || strcmp(in, "Yellow Severed Hand") == 0)) {
+        refineHostilePending = 0;
+        return 0;
+    }
+    /* Keycard Fine/Very Fine can jackpot a Mastercard, with odds that
+     * climb with difficulty (source SelectedDifficulty\OtherFactors:
+     * Easy never, up to ~2/3 on Extreme Very Fine). */
+    if (setting >= 1 && itemKeycardLevel(tpl) > 0) {
+        static const int MC_FINE[4] = { 0, 17, 20, 25 };
+        static const int MC_VF[4]   = { 0, 33, 50, 67 };
+        int f = gDiffFactor;
+        if (f < 0 || f > 3) f = 1;
+        int pct = (setting >= 2 ? MC_VF : MC_FINE)[f];
+        if (pct > 0 && (rand() % 100) < pct) {
+            r914Add(out, &n, "Mastercard");
+            return n;
+        }
+    }
+    /* Random replacements first. */
+    for (unsigned r = 0; r < sizeof(R914_RARE) / sizeof(R914_RARE[0]); r++) {
+        if (R914_RARE[r].setting != setting
+            || strcmp(R914_RARE[r].in, in) != 0) {
+            continue;
+        }
+        if ((rand() % R914_RARE[r].oneIn) == 0) {
+            r914Add(out, &n, R914_RARE[r].item);
+            return n;
+        }
+        break;
+    }
+    /* Electronics Fine/Very Fine roll one of three tech outputs. */
+    if (strcmp(in, "Electronical Components") == 0 && setting >= 1) {
+        static const char *E_FINE[3] = { "Radio Transceiver",
+            "S-NAV 300 Navigator", "Night Vision Goggles" };
+        static const char *E_VF[3] = { "Fine Radio Transceiver",
+            "S-NAV 310 Navigator", "Very Fine Night Vision Goggles" };
+        r914Add(out, &n, (setting >= 2 ? E_VF : E_FINE)[rand() % 3]);
+        return n;
+    }
+    int base = r914Base(tpl, setting);
+    if (base >= 0) out[n++] = base;
+    /* Deterministic extra items. */
+    for (unsigned e = 0; e < sizeof(R914_EXTRA) / sizeof(R914_EXTRA[0]); e++) {
+        if (R914_EXTRA[e].setting == setting
+            && strcmp(R914_EXTRA[e].in, in) == 0) {
+            r914Add(out, &n, R914_EXTRA[e].item);
+        }
+    }
+    return n;
+}
+
+static void spawn914(void) {
+    scp914Ok = 0;
+    rhActive = 0;
+    refineHostilePending = -1;
+    scp914State = 0;
+    scp914Setting = 0;
+    scp914Timer = 0.0f;
+    scp914RefineTpl = -1;
+    for (uint32_t r = 0; r < map.roomCount; r++) {
+        const RoomPlacement *p = &map.rooms[r];
+        if (strcmp(tplList.items[p->templateIndex].name, "cont1_914") != 0) {
+            continue;
+        }
+        float in[3] = { -1128.0f, 0.5f, 640.0f }, w[3];
+        localToWorld(p, in, w);
+        scp914In[0] = w[0]; scp914In[1] = w[1]; scp914In[2] = w[2];
+        float out[3] = { 308.0f, 0.5f, 640.0f };
+        localToWorld(p, out, w);
+        scp914Out[0] = w[0]; scp914Out[1] = w[1]; scp914Out[2] = w[2];
+        float kn[3] = { -416.0f, 230.0f, 374.0f };
+        localToWorld(p, kn, w);
+        scp914Knob[0] = w[0]; scp914Knob[1] = w[1]; scp914Knob[2] = w[2];
+        scp914Yaw = (float)(p->angle * 90);
+        scp914Ok = 1;
+        break;
+    }
+}
+
+/* Interaction near the machine: the knob cycles the setting, the input
+ * booth runs the currently-selected inventory item through. Returns 1 if
+ * it handled the press. */
+/* Shut (open=0) or reopen the two SCP_914_DOOR booth doors while the
+ * machine runs (they are type 7, near the machine). */
+static void set914Doors(int open) {
+    for (uint32_t di = 0; di < doors.count; di++) {
+        Door *d = &doors.items[di];
+        if (d->type != 7) continue;
+        float ddx = d->x - scp914Knob[0], ddz = d->z - scp914Knob[2];
+        if (ddx * ddx + ddz * ddz < 2400.0f * 2400.0f) d->open = open;
+    }
+}
+
+static int try914Interact(void) {
+    if (!scp914Ok || scp914State != 0) return 0;
+    float kdx = camPos[0] - scp914Knob[0], kdz = camPos[2] - scp914Knob[2];
+    if (kdx * kdx + kdz * kdz < 280.0f * 280.0f) {
+        scp914Setting++;
+        if (scp914Setting > 2) scp914Setting = -2;
+        snprintf(toastMsg, sizeof(toastMsg), "SCP-914: %s",
+                 setting914Name(scp914Setting));
+        toastTimer = 160;
+        audioPlay(sndButton[rand() % 2], 0.8f, 0.0f);
+        return 1;
+    }
+    float idx = camPos[0] - scp914In[0], idz = camPos[2] - scp914In[2];
+    if (idx * idx + idz * idz < 420.0f * 420.0f) {
+        if (invSel < 0 || invSel >= (int)inventoryCount) {
+            snprintf(toastMsg, sizeof(toastMsg),
+                     "SELECT AN ITEM TO REFINE");
+            toastTimer = 160;
+            return 1;
+        }
+        scp914RefineTpl = inventory[invSel];
+        consumeSlot(invSel);
+        scp914State = 1;
+        scp914Timer = 0.0f;
+        set914Doors(0); /* the booths seal for the run */
+        if (snd914 >= 0) audioPlay(snd914, 0.9f, 0.0f);
+        snprintf(toastMsg, sizeof(toastMsg), "SCP-914 WHIRS TO LIFE...");
+        toastTimer = 180;
+        return 1;
+    }
+    return 0;
+}
+
+static void update914(void) {
+    if (!scp914Ok || scp914State != 1) return;
+    scp914Timer += 1.0f;
+    if (scp914Timer > 180.0f) {  /* the doors reopen after ~3 s */
+        scp914State = 0;
+        set914Doors(1); /* the booths open on the finished output */
+        int out[6];
+        int n = refine914(scp914RefineTpl, scp914Setting, out);
+        scp914RefineTpl = -1;
+        if (refineHostilePending >= 0) {
+            spawnRefineHostile(refineHostilePending);
+            snprintf(toastMsg, sizeof(toastMsg),
+                     refineHostilePending == 0
+                         ? "SCP-914 BIRTHED SOMETHING WRONG..."
+                         : "IT CAME THROUGH WITH YOU...");
+            toastTimer = 240;
+            refineHostilePending = -1;
+        } else if (n > 0) {
+            for (int i = 0; i < n; i++) {
+                worldItemAdd(out[i], scp914Out[0] + (float)(i * 60),
+                             scp914Out[1] + 20.0f, scp914Out[2]);
+            }
+            if (n > 1) {
+                snprintf(toastMsg, sizeof(toastMsg),
+                         "SCP-914 OUTPUT: %s (+%d more)",
+                         ITEM_TEMPLATES[out[0]].name, n - 1);
+            } else {
+                snprintf(toastMsg, sizeof(toastMsg), "SCP-914 OUTPUT: %s",
+                         ITEM_TEMPLATES[out[0]].name);
+            }
+        } else {
+            snprintf(toastMsg, sizeof(toastMsg), "SCP-914 DESTROYED IT");
+        }
+        toastTimer = 220;
+    }
+}
+
+static void draw914(const float viewPos[3]) {
+    if (!scp914Ok) return;
+    float dx = scp914Knob[0] - viewPos[0], dz = scp914Knob[2] - viewPos[2];
+    if (dx * dx + dz * dz > VIEW_RANGE * VIEW_RANGE) return;
+    /* The knob, rotated to its setting (-2..2 -> +-90 deg). */
+    glPushMatrix();
+    glTranslatef(scp914Knob[0], scp914Knob[1], scp914Knob[2]);
+    glRotatef(-scp914Yaw, 0.0f, 1.0f, 0.0f);
+    glRotatef((float)scp914Setting * 45.0f, 0.0f, 0.0f, 1.0f);
+    drawModelRT(&knob914RT);
+    glPopMatrix();
+    /* The control key just below it. */
+    glPushMatrix();
+    glTranslatef(scp914Knob[0], scp914Knob[1] - 40.0f, scp914Knob[2]);
+    glRotatef(-scp914Yaw, 0.0f, 1.0f, 0.0f);
+    drawModelRT(&key914RT);
+    glPopMatrix();
 }
 
 /* Place FillRoom's literal item spawns in every placed room (rotated
@@ -6219,6 +7550,12 @@ static const char *useInventoryItem(int slot) {
         return wear268 ? "YOU PUT ON THE CAP. YOU FEEL... UNNOTICEABLE"
                        : "YOU TAKE OFF THE CAP";
     }
+    if (strcmp(name, "SCP-513") == 0) {
+        /* Ringing the bell summons SCP-513-1 (it keeps the bell). */
+        consumeSlot(slot);
+        spawn513();
+        return "YOU RING THE BELL. SOMETHING ANSWERS...";
+    }
     if (strcmp(name, "Ballistic Vest") == 0) {
         wearVest = !wearVest;
         return wearVest ? "YOU PUT ON THE BALLISTIC VEST"
@@ -6365,6 +7702,7 @@ static void applyDifficulty(int d) {
     gameDiff = d;
     invSlotCap = DIFFICULTIES[d].slots;
     npcAggressive = DIFFICULTIES[d].aggressiveNPCs;
+    gDiffFactor = DIFFICULTIES[d].factors;
 }
 
 /* ---- new game form state ---- */
@@ -6372,6 +7710,8 @@ static void applyDifficulty(int d) {
 static char newName[16];
 static char newSeedStr[16];
 static int introEnabled = 1;
+static int startupVideosEnabled = 1; /* opt\PlayStartup: boot splash clips */
+static int pendingIntroVideo;        /* play startup_Intro on 1st game frame */
 static int newSel; /* focused row */
 
 static char curSaveName[16] = "untitled";
@@ -6460,8 +7800,9 @@ static void optionsApply(void) {
 static void optionsSave(void) {
     FILE *f = fopen(OPTIONS_PATH, "w");
     if (!f) return;
-    fprintf(f, "music=%f\nsfx=%f\nsens=%f\ninverty=%d\nintro=%d\n",
-            optMusicVol, optSfxVol, optLookSens, optInvertY, introEnabled);
+    fprintf(f, "music=%f\nsfx=%f\nsens=%f\ninverty=%d\nintro=%d\nstartup=%d\n",
+            optMusicVol, optSfxVol, optLookSens, optInvertY, introEnabled,
+            startupVideosEnabled);
     fclose(f);
 }
 
@@ -6480,6 +7821,8 @@ static void optionsLoad(void) {
             optInvertY = (int)strtol(line + 8, NULL, 10);
         } else if (strncmp(line, "intro=", 6) == 0) {
             introEnabled = (int)strtol(line + 6, NULL, 10);
+        } else if (strncmp(line, "startup=", 8) == 0) {
+            startupVideosEnabled = (int)strtol(line + 8, NULL, 10);
         }
     }
     fclose(f);
@@ -6535,11 +7878,51 @@ static const char *ZONE_MUSIC[4] = {
     DATA_ROOT "/SFX/Music/EntranceZone.ogg",
 };
 
+/* Per-SCP / per-room chamber music (Main_Core's ShouldPlay overrides).
+ * The base track is the room's zone music; entering a signature chamber
+ * or a monster starting its chase swaps in that encounter's track, and
+ * chase music outranks chamber music the way the source's ShouldPlay
+ * assignments do (a later, higher-priority event wins the frame).
+ * Returns a static path literal so callers can compare by pointer. */
+static const char *desiredMusicPath(void) {
+    if (!worldReady) return ZONE_MUSIC[1];
+    /* Chase music - highest priority, matches Music[10/12/19] and the
+     * 096 angered/chase streams. */
+    if (npc096Active && npc096State == S096_CHASE)
+        return DATA_ROOT "/SFX/Music/096Chase.ogg";
+    if (npc096Active && npc096State == S096_TRIGGERED)
+        return DATA_ROOT "/SFX/Music/096Angered.ogg";
+    if (npc106Active &&
+        (npc106State == N106_CHASING || npc106State == N106_GRABBING))
+        return DATA_ROOT "/SFX/Music/106Chase.ogg";
+    if (npc049Active &&
+        (npc049State == S049_PURSUE || npc049State == S049_KILL))
+        return DATA_ROOT "/SFX/Music/049Chase.ogg";
+    /* Signature chamber music while the player is in the room. */
+    const char *r = roomNameAt(camPos);
+    if (!strcmp(r, "cont1_079")) return DATA_ROOT "/SFX/Music/079Chamber.ogg";
+    if (!strcmp(r, "cont1_914")) return DATA_ROOT "/SFX/Music/914Chamber.ogg";
+    if (!strcmp(r, "cont2_012")) return DATA_ROOT "/SFX/Music/012Chamber.ogg";
+    if (!strcmp(r, "cont1_035")) return DATA_ROOT "/SFX/Music/035Chamber.ogg";
+    if (!strcmp(r, "cont2_049")) return DATA_ROOT "/SFX/Music/049Chamber.ogg";
+    if (!strcmp(r, "cont1_205")) return DATA_ROOT "/SFX/Music/205Chamber.ogg";
+    if (!strcmp(r, "cont1_106")) return DATA_ROOT "/SFX/Music/106Chamber.ogg";
+    if (!strcmp(r, "room3_storage"))
+        return DATA_ROOT "/SFX/Music/Room3_Storage.ogg";
+    if (!strcmp(r, "cont2_860_1"))
+        return DATA_ROOT "/SFX/Music/860_1_Blue.ogg";
+    /* Default: the room's zone track. */
+    return ZONE_MUSIC[zoneAt(camPos)];
+}
+
+static const char *currentMusicPath = NULL;
+
 static void gameMusicStart(void) {
     if (radioChannel >= 0) return; /* the radio owns the music path */
-    int z = worldReady ? zoneAt(camPos) : 1;
-    currentMusicZone = z;
-    audioStreamMusic(ZONE_MUSIC[z], 0.55f, 1);
+    const char *path = desiredMusicPath();
+    currentMusicPath = path;
+    currentMusicZone = worldReady ? zoneAt(camPos) : 1;
+    audioStreamMusic(path, 0.55f, 1);
 }
 
 /* Bleeding, healing and sanity, run each gameplay frame
@@ -6598,10 +7981,11 @@ static void updatePlayerCondition(void) {
 /* Called each gameplay frame: swap the track when the zone changes. */
 static void updateZoneMusic(void) {
     if (radioChannel >= 0 || !worldReady) return;
-    int z = zoneAt(camPos);
-    if (z != currentMusicZone) {
-        currentMusicZone = z;
-        audioStreamMusic(ZONE_MUSIC[z], 0.55f, 1);
+    const char *path = desiredMusicPath();
+    if (path != currentMusicPath) {
+        currentMusicPath = path;
+        currentMusicZone = zoneAt(camPos);
+        audioStreamMusic(path, 0.55f, 1);
     }
 }
 
@@ -6653,6 +8037,42 @@ static void updateRoomAmbience(void) {
         currentAmbienceId = bestId;
         audioLoopAmbience(bestId ? ambienceSound(bestId) : -1, bestVol);
     }
+}
+
+/* Ambient one-shots (source AmbientSFX): every so often a random distant
+ * sound from the current zone's set drifts in from the dark - a scream,
+ * a groan, dripping - positioned off to one side of the player. Loaded on
+ * demand (audioLoad caches by path). */
+static float ambSfxTimer = 300.0f;
+
+static void updateAmbientSfx(void) {
+    if (!worldReady || deathTimer > 0 || introPhase >= 0 || inPocket
+        || inMask) {
+        return;
+    }
+    if (ambSfxTimer > 0.0f) { ambSfxTimer -= 1.0f; return; }
+    const char *folder;
+    int count;
+    if (strcmp(roomNameAt(camPos), "cont2_860_1") == 0) {
+        folder = "Forest"; count = 10;      /* the SCP-860 forest */
+    } else {
+        int z = zoneAt(camPos);             /* 1 LCZ, 2 HCZ, 3 EZ */
+        if (z <= 1) { folder = "Zone1"; count = 11; }
+        else if (z == 2) { folder = "Zone2"; count = 11; }
+        else { folder = "Zone3"; count = 12; }
+    }
+    char path[256];
+    snprintf(path, sizeof(path), SFX_DIR "/Ambient/%s/Ambient%d.ogg",
+             folder, rand() % count);
+    int snd = audioLoad(path);
+    if (snd >= 0) {
+        float ang = (float)(rand() % 628) * 0.01f;
+        float dist = 500.0f + (float)(rand() % 1500);
+        float pos[3] = { camPos[0] + sinf(ang) * dist, camPos[1],
+                         camPos[2] - cosf(ang) * dist };
+        audioPlay3D(snd, pos, camPos, camYaw, dist * 2.2f);
+    }
+    ambSfxTimer = 900.0f + (float)(rand() % 1800); /* ~15-45 s at 60 fps */
 }
 
 /* Radio Transceiver: SCPRadio stations stream where the zone music
@@ -7056,6 +8476,509 @@ static void drawDoors(const float viewPos[3]) {
     }
 }
 
+/* Shortest signed difference a-b, in (-180, 180]. */
+static float yawDelta(float a, float b) {
+    float d = a - b;
+    while (d > 180.0f) d -= 360.0f;
+    while (d < -180.0f) d += 360.0f;
+    return d;
+}
+
+/* Swivel/track the security-camera heads near the player (UpdateSecurity
+ * Cams): follow-cams point at the player, sweep-cams oscillate within
+ * +-Turn (0.2 deg/frame, reversing at +-Turn*1.3), the rest sit still. */
+static void camerasUpdate(void) {
+    for (int i = 0; i < worldCameraCount; i++) {
+        WorldCamera *c = &worldCameras[i];
+        float dx = camPos[0] - c->x, dz = camPos[2] - c->z;
+        if (dx * dx + dz * dz > VIEW_RANGE * VIEW_RANGE) continue;
+        if (c->follow) {
+            float dy = camPos[1] - (c->y - 21.0f);
+            float dist = sqrtf(dx * dx + dz * dz);
+            float tYaw = atan2f(dx, dz) * (180.0f / 3.14159265f);
+            float tPitch = -atan2f(dy, dist) * (180.0f / 3.14159265f);
+            c->headYaw += yawDelta(tYaw, c->headYaw) * 0.12f;
+            c->headPitch += (tPitch - c->headPitch) * 0.12f;
+        } else if (c->turn > 0.0f) {
+            if (!c->dir) {
+                c->currAngle += 0.2f;
+                if (c->currAngle > c->turn * 1.3f) c->dir = 1;
+            } else {
+                c->currAngle -= 0.2f;
+                if (c->currAngle < -c->turn * 1.3f) c->dir = 0;
+            }
+            float cl = c->currAngle;
+            if (cl > c->turn) cl = c->turn;
+            if (cl < -c->turn) cl = -c->turn;
+            c->headYaw = c->yawBase + cl;
+            c->headPitch = c->pitch;
+        } else {
+            c->headYaw = c->yawBase;
+            c->headPitch = c->pitch;
+        }
+    }
+}
+
+static void camerasDraw(const float viewPos[3]) {
+    /* Red light blinks: default texture for the first ~800 of every
+     * ~1350 ms (source MilliSec Mod 1350), red for the rest. At ~60 fps
+     * that is 48 of every 81 frames. */
+    int red = (int)(gTick % 81) >= 48;
+    for (int i = 0; i < worldCameraCount; i++) {
+        const WorldCamera *c = &worldCameras[i];
+        float dx = c->x - viewPos[0], dz = c->z - viewPos[2];
+        if (dx * dx + dz * dz > VIEW_RANGE * VIEW_RANGE) continue;
+
+        glPushMatrix();
+        glTranslatef(c->x, c->y, c->z);
+        glRotatef(-c->roomYaw, 0.0f, 1.0f, 0.0f);
+        drawModelRT(&camBaseRT);
+        glPopMatrix();
+
+        glPushMatrix();
+        glTranslatef(c->x, c->y - 21.0f, c->z); /* head sits below base */
+        glRotatef(-c->headYaw, 0.0f, 1.0f, 0.0f);
+        glRotatef(c->headPitch, 1.0f, 0.0f, 0.0f);
+        if (red) drawModelRTTinted(&camHeadRT, camHeadRedTex);
+        else drawModelRT(&camHeadRT);
+        glPopMatrix();
+    }
+}
+
+/* MTF camera-detection subplot (UpdateCameraCheck): now and then the
+ * MTF run a camera sweep - an announcement, then a window in which any
+ * security camera that sees the player flags it, and a second
+ * announcement (found / not found) when the window closes. The source
+ * kicks this off when an MTF unit loses its target; the port has no MTF,
+ * so it fires on a rare timer for the same tension, and "detected" is a
+ * scare cue (toast + horror sting) rather than a dispatch, since there
+ * is no squad to send. */
+#define CAM_CHECK_DURATION 5400.0f   /* ~90 s at 60 fps (source 70*90) */
+
+static void cameraCheckUpdate(void) {
+    if (!worldReady) return;
+    /* SCP-079 begins broadcasting SCP-895's feed once you clear the LCZ. */
+    if (zoneAt(camPos) >= 2) leftFirstZone = 1;
+    if (camCheckTimer <= 0.0f) {
+        if ((rand() % 10800) == 0) {  /* ~1 sweep per 3 min */
+            camCheckTimer = 1.0f;
+            camCheckSpotted = 0;
+            if (sndCamCheck >= 0) audioPlay(sndCamCheck, 0.9f, 0.0f);
+        }
+        return;
+    }
+    if (!camCheckSpotted) {
+        for (int i = 0; i < worldCameraCount; i++) {
+            const WorldCamera *c = &worldCameras[i];
+            float dx = camPos[0] - c->x, dz = camPos[2] - c->z;
+            if (dx * dx + dz * dz > 2200.0f * 2200.0f) continue;
+            /* Inside the head's ~60 deg cone (source DeltaYaw < 60) and
+             * not occluded. */
+            float toPlayer = atan2f(dx, dz) * (180.0f / 3.14159265f);
+            if (fabsf(yawDelta(toPlayer, c->headYaw)) > 60.0f) continue;
+            float eye[3] = { c->x, c->y - 21.0f, c->z };
+            if (!lineOfSight(eye, camPos)) continue;
+            camCheckSpotted = 1;
+            break;
+        }
+    }
+    camCheckTimer += 1.0f;
+    if (camCheckTimer >= CAM_CHECK_DURATION) {
+        camCheckTimer = 0.0f;
+        if (camCheckSpotted) {
+            if (sndCamFound[0] >= 0) audioPlay(sndCamFound[rand() % 2],
+                                               0.95f, 0.0f);
+            if (sndHorror11 >= 0) audioPlay(sndHorror11, 0.6f, 0.0f);
+            snprintf(toastMsg, sizeof(toastMsg),
+                     "A SECURITY CAMERA CAUGHT YOU");
+            toastTimer = 220;
+        } else if (sndCamNoFound >= 0) {
+            audioPlay(sndCamNoFound, 0.9f, 0.0f);
+        }
+    }
+}
+
+/* Render the nearest Screen camera's view into monFeedTex. Draws the
+ * scene into a MON_FEED_SIZE corner of the backbuffer (pointed from the
+ * camera toward the player, a security-cam-watching-the-occupant view),
+ * then copies it out with glCopyTexImage2D - the same no-FBO trick as the
+ * blur. Refreshed every few frames (source RenderInterval). Call before
+ * the main scene clear. */
+static void renderCameraFeed(void) {
+    monFeedActive = 0;
+    if (!worldReady || activeCount == 0 || !monitorRT.ok) {
+        monFeedCam = -1;
+        return;
+    }
+    int best = -1;
+    float bestD2 = 2600.0f * 2600.0f;
+    for (int i = 0; i < worldCameraCount; i++) {
+        if (!worldCameras[i].screen) continue;
+        float dx = worldCameras[i].mx - camPos[0];
+        float dz = worldCameras[i].mz - camPos[2];
+        float d2 = dx * dx + dz * dz;
+        if (d2 < bestD2) { bestD2 = d2; best = i; }
+    }
+    monFeedCam = best;
+    if (best < 0) return;
+    monFeedTick += 1.0f;
+    if (monFeedTex && monFeedTick < 6.0f) { monFeedActive = 1; return; }
+    monFeedTick = 0.0f;
+
+    const WorldCamera *c = &worldCameras[best];
+    float eyeY = c->y - 21.0f;
+    /* Aim at the player, except the cont1_205 observation camera aims at
+     * the shadow demon so it shows on the monitor. */
+    float tx = camPos[0], ty = camPos[1], tz = camPos[2];
+    if (npc205Ok) {
+        float cx = c->x - npc205Pos[0], cz = c->z - npc205Pos[2];
+        if (cx * cx + cz * cz < 1600.0f * 1600.0f) {
+            tx = npc205Pos[0]; ty = npc205Pos[1] + 90.0f; tz = npc205Pos[2];
+        }
+    }
+    float dx = tx - c->x, dz = tz - c->z, dy = ty - eyeY;
+    float horiz = sqrtf(dx * dx + dz * dz);
+    if (horiz < 1.0f) horiz = 1.0f;
+    float yaw = atan2f(dx, -dz) * (180.0f / 3.14159265f);
+    float pitch = atan2f(-dy, horiz) * (180.0f / 3.14159265f);
+
+    glViewport(0, 0, MON_FEED_SIZE, MON_FEED_SIZE);
+    glEnable(GL_SCISSOR_TEST);
+    glScissor(0, 0, MON_FEED_SIZE, MON_FEED_SIZE);
+    glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+    float zn = 4.0f, zf = VIEW_RANGE * 3.0f;
+    float t = zn * tanf(35.0f * 3.14159265f / 180.0f);
+    glMatrixMode(GL_PROJECTION);
+    glLoadIdentity();
+    glFrustum(-t, t, -t, t, zn, zf);
+    glMatrixMode(GL_MODELVIEW);
+    glLoadIdentity();
+    glRotatef(pitch, 1, 0, 0);
+    glRotatef(yaw, 0, 1, 0);
+    glTranslatef(-c->x, -eyeY, -c->z);
+    glEnable(GL_DEPTH_TEST);
+    glEnable(GL_CULL_FACE);
+    glCullFace(GL_BACK);
+    glFrontFace(GL_CW);
+    glColor4f(1, 1, 1, 1);
+    for (int i = 0; i < activeCount; i++) drawRoomBatches(activeRooms[i], 0);
+    /* SCP-205's shadow demon is seen chiefly here, on the monitor. */
+    float feedEye[3] = { c->x, eyeY, c->z };
+    draw205(feedEye);
+
+    if (!monFeedTex) {
+        glGenTextures(1, &monFeedTex);
+        glBindTexture(GL_TEXTURE_2D, monFeedTex);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    }
+    glBindTexture(GL_TEXTURE_2D, monFeedTex);
+    glCopyTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, 0, 0, MON_FEED_SIZE,
+                     MON_FEED_SIZE, 0);
+    glDisable(GL_SCISSOR_TEST);
+    glViewport(0, 0, SCREEN_W, SCREEN_H);
+    monFeedActive = 1;
+}
+
+/* Draw the monitor props; the active one shows the live feed, the rest a
+ * dark screen. */
+static void drawMonitors(const float viewPos[3]) {
+    for (int i = 0; i < worldCameraCount; i++) {
+        const WorldCamera *c = &worldCameras[i];
+        if (!c->screen) continue;
+        float dx = c->mx - viewPos[0], dz = c->mz - viewPos[2];
+        if (dx * dx + dz * dz > VIEW_RANGE * VIEW_RANGE) continue;
+
+        glPushMatrix();
+        glTranslatef(c->mx, c->my, c->mz);
+        glRotatef(-c->myaw, 0.0f, 1.0f, 0.0f);
+        glRotatef(c->mpitch, 1.0f, 0.0f, 0.0f);
+        drawModelRT(&monitorRT);
+        glPopMatrix();
+
+        int lit = (i == monFeedCam && monFeedActive && monFeedTex);
+        int broadcast = leftFirstZone && scp895Ok;
+        glPushMatrix();
+        glTranslatef(c->mx, c->my, c->mz);
+        glRotatef(-c->myaw, 0.0f, 1.0f, 0.0f);
+        glTranslatef(0.0f, 0.0f, 34.0f); /* onto the screen face */
+        glBindBuffer(GL_ARRAY_BUFFER, 0);
+        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
+        glDisableClientState(GL_COLOR_ARRAY);
+        GLfloat sv[18] = {
+            -62.0f,  46.0f, 0.0f,  62.0f,  46.0f, 0.0f,  62.0f, -46.0f, 0.0f,
+            -62.0f,  46.0f, 0.0f,  62.0f, -46.0f, 0.0f, -62.0f, -46.0f, 0.0f,
+        };
+        if (lit) {
+            /* The capture is bottom-up; flip V. Under the SCP-895/079
+             * broadcast the feed jitters and bleeds red. */
+            float j = broadcast ? ((rand() % 20) - 10) / 100.0f : 0.0f;
+            GLfloat uv[12] = { 0, 1 + j, 1, 1 + j, 1, j,
+                               0, 1 + j, 1, j, 0, j };
+            glEnable(GL_TEXTURE_2D);
+            glBindTexture(GL_TEXTURE_2D, monFeedTex);
+            glEnableClientState(GL_TEXTURE_COORD_ARRAY);
+            glTexCoordPointer(2, GL_FLOAT, 0, uv);
+            if (broadcast) glColor4f(1.0f, 0.35f, 0.3f, 1.0f);
+            else glColor4f(1.0f, 1.0f, 1.0f, 1.0f);
+        } else if (broadcast) {
+            /* No live feed here, but the broadcast still scrambles it:
+             * a flickering red static. */
+            glDisable(GL_TEXTURE_2D);
+            float f = 0.15f + (rand() % 40) / 100.0f;
+            glColor4f(f, 0.02f, 0.02f, 1.0f);
+        } else {
+            glDisable(GL_TEXTURE_2D);
+            glColor4f(0.02f, 0.03f, 0.05f, 1.0f);
+        }
+        glVertexPointer(3, GL_FLOAT, 0, sv);
+        glDrawArrays(GL_TRIANGLES, 0, 6);
+        glColor4f(1, 1, 1, 1);
+        glEnableClientState(GL_COLOR_ARRAY);
+        glPopMatrix();
+    }
+}
+
+/* ---- SCP-079 (cont1_079): the sentient computer ---- */
+
+static void spawn079(void) {
+    scp079Ok = 0;
+    scp079State = 0;
+    scp079Timer = 0.0f;
+    scp079OvFrame = 0;
+    scp079FlickT = 0.0f;
+    scp079DocDone = 0;
+    for (uint32_t r = 0; r < map.roomCount; r++) {
+        const RoomPlacement *p = &map.rooms[r];
+        if (strcmp(tplList.items[p->templateIndex].name, "cont1_079") != 0) {
+            continue;
+        }
+        /* Computer position, source-local (PositionEntity 166,-10800,1606
+         * * RoomScale) with the room's quarter-turn; RotateEntity yaw -90. */
+        float local[3] = { 166.0f, -10800.0f, 1606.0f }, w[3];
+        localToWorld(p, local, w);
+        scp079Pos[0] = w[0]; scp079Pos[1] = w[1]; scp079Pos[2] = w[2];
+        scp079Yaw = (float)(p->angle * 90) - 90.0f;
+        scp079Ok = 1;
+        break;
+    }
+}
+
+/* e_cont1_079: reaching the terminal in the lower chamber wakes SCP-079 -
+ * it speaks (Speech.ogg), its screen flickers overlay frames, and it
+ * drops the SCP-079 document; approaching again once it has finished
+ * makes it refuse (Refuse.ogg). The Gate B broadcast tie-in is out of
+ * scope (no gate endings ported). */
+static void update079(void) {
+    if (!scp079Ok) return;
+    float dx = camPos[0] - scp079Pos[0];
+    float dy = camPos[1] - scp079Pos[1];
+    float dz = camPos[2] - scp079Pos[2];
+    int atTerminal = (dx * dx + dy * dy + dz * dz) < 768.0f * 768.0f;
+
+    if (scp079State == 1) {
+        scp079Timer += 1.0f;
+        scp079FlickT += 1.0f;
+        if (scp079FlickT >= 8.0f) {
+            scp079FlickT = 0.0f;
+            scp079OvFrame = 1 + (rand() % 6); /* overlays 2..7 while talking */
+        }
+        if (scp079Timer > 1800.0f) {          /* ~30 s, then settle */
+            scp079State = 2;
+            scp079Timer = 0.0f;
+            scp079OvFrame = 0;                /* overlay 1: idle screen */
+        }
+    } else if (scp079State == 2) {
+        scp079Timer += 1.0f;
+    }
+
+    if (atTerminal && scp079State == 0) {
+        if (snd079Speech >= 0) audioPlay(snd079Speech, 1.0f, 0.0f);
+        scp079State = 1;
+        scp079Timer = 0.0f;
+        snprintf(toastMsg, sizeof(toastMsg), "SCP-079 STIRS...");
+        toastTimer = 200;
+        if (!scp079DocDone) {
+            worldItemAdd(itemTplFind("Document SCP-079"), scp079Pos[0],
+                         scp079Pos[1] + 20.0f, scp079Pos[2] + 120.0f);
+            scp079DocDone = 1;
+        }
+    } else if (atTerminal && scp079State == 2 && scp079Timer > 300.0f) {
+        if (snd079Refuse >= 0) audioPlay(snd079Refuse, 1.0f, 0.0f);
+        scp079State = 1;
+        scp079Timer = 0.0f;
+    }
+}
+
+static void draw079(const float viewPos[3]) {
+    if (!scp079Ok) return;
+    float dx = scp079Pos[0] - viewPos[0], dz = scp079Pos[2] - viewPos[2];
+    if (dx * dx + dz * dz > VIEW_RANGE * VIEW_RANGE) return;
+
+    glPushMatrix();
+    glTranslatef(scp079Pos[0], scp079Pos[1], scp079Pos[2]);
+    glRotatef(-scp079Yaw, 0.0f, 1.0f, 0.0f);
+    drawModelRT(&scp079RT);
+    glPopMatrix();
+
+    /* The screen: a small glowing quad on the console's front face,
+     * showing the current overlay frame (flickers while it speaks). */
+    int f = scp079OvFrame;
+    if (f < 0 || f > 6) f = 0;
+    GLuint ov = scp079Ov[f];
+    if (!ov) return;
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
+    glDisableClientState(GL_COLOR_ARRAY);
+    glEnable(GL_TEXTURE_2D);
+    glBindTexture(GL_TEXTURE_2D, ov);
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE);   /* additive glow */
+    glDepthMask(GL_FALSE);
+    glColor4f(1.0f, 1.0f, 1.0f, 1.0f);
+    static const GLfloat uv[12] = { 0, 0, 1, 0, 1, 1, 0, 0, 1, 1, 0, 1 };
+    GLfloat v[18] = {
+        -45.0f,  36.0f, 0.0f,   45.0f,  36.0f, 0.0f,   45.0f, -36.0f, 0.0f,
+        -45.0f,  36.0f, 0.0f,   45.0f, -36.0f, 0.0f,  -45.0f, -36.0f, 0.0f,
+    };
+    glPushMatrix();
+    glTranslatef(scp079Pos[0], scp079Pos[1] + 44.0f, scp079Pos[2]);
+    glRotatef(-scp079Yaw, 0.0f, 1.0f, 0.0f);
+    glTranslatef(0.0f, 0.0f, 26.0f);     /* onto the console's face */
+    glTexCoordPointer(2, GL_FLOAT, 0, uv);
+    glVertexPointer(3, GL_FLOAT, 0, v);
+    glDrawArrays(GL_TRIANGLES, 0, 6);
+    glPopMatrix();
+    glColor4f(1, 1, 1, 1);
+    glDepthMask(GL_TRUE);
+    glDisable(GL_BLEND);
+    glEnableClientState(GL_COLOR_ARRAY);
+}
+
+/* ---- SCP-895 (cont1_895): the camera coffin ---- */
+
+static void spawn895(void) {
+    scp895Ok = 0;
+    scp895State = 0;
+    scp895Timer = 0.0f;
+    scp895IdleT = 0.0f;
+    for (uint32_t r = 0; r < map.roomCount; r++) {
+        const RoomPlacement *p = &map.rooms[r];
+        if (strcmp(tplList.items[p->templateIndex].name, "cont1_895") != 0) {
+            continue;
+        }
+        float local[3] = { 0.0f, -1532.0f, 2508.0f }, w[3];
+        localToWorld(p, local, w);
+        scp895Coffin[0] = w[0]; scp895Coffin[1] = w[1]; scp895Coffin[2] = w[2];
+        scp895GuardYaw = (float)(p->angle * 90) + 90.0f;
+        scp895Ok = 1;
+        break;
+    }
+}
+
+/* e_cont1_895: the coffin fills its chamber with dread (sanity bleeds,
+ * the view blurs, the trapped guard murmurs), and a close approach makes
+ * the slumped guard corpse lurch into view with a scream. The source's
+ * SCP-106 lure and the SCP-895 camera-feed amplification (CoffinEffect)
+ * need subsystems the port lacks and are left out. */
+static void update895(void) {
+    if (!scp895Ok) return;
+    float dx = camPos[0] - scp895Coffin[0];
+    float dy = camPos[1] - scp895Coffin[1];
+    float dz = camPos[2] - scp895Coffin[2];
+    float d2 = dx * dx + dy * dy + dz * dz;
+    if (d2 > 2200.0f * 2200.0f) return;   /* only inside the chamber */
+    float dist = sqrtf(d2);
+    float prox = 1.0f - dist / 2200.0f;
+    sanity -= 0.04f * prox;
+    if (sanity < -1000.0f) sanity = -1000.0f;
+    if (blurAmount < 0.28f * prox) blurAmount = 0.28f * prox;
+
+    if (scp895State == 0) {
+        scp895IdleT += 1.0f;
+        if (scp895IdleT > 280.0f) {
+            scp895IdleT = 0.0f;
+            audioPlay3D(snd895Idle[rand() % 3], scp895Coffin, camPos, camYaw,
+                        1800.0f);
+        }
+        if (dist < 520.0f) {
+            scp895State = 1;
+            scp895Timer = 0.0f;
+            audioPlay3D(snd895Scream[rand() % 3], scp895Coffin, camPos, camYaw,
+                        3000.0f);
+            if (sndHorror11 >= 0) audioPlay(sndHorror11, 0.7f, 0.0f);
+            if (camShake < 8.0f) camShake = 8.0f;
+            blurAmount = 0.7f;
+            snprintf(toastMsg, sizeof(toastMsg), "SCP-895");
+            toastTimer = 200;
+        }
+    } else {
+        scp895Timer += 1.0f;
+        if (blurAmount < 0.45f) blurAmount = 0.45f;
+        if (dist > 900.0f) scp895State = 0; /* re-arms if you back off */
+    }
+}
+
+static void draw895(const float viewPos[3]) {
+    if (!scp895Ok || scp895State == 0) return;
+    float dx = scp895Coffin[0] - viewPos[0], dz = scp895Coffin[2] - viewPos[2];
+    if (dx * dx + dz * dz > VIEW_RANGE * VIEW_RANGE) return;
+    glPushMatrix();
+    glTranslatef(scp895Coffin[0], scp895Coffin[1], scp895Coffin[2]);
+    glRotatef(-scp895GuardYaw, 0.0f, 1.0f, 0.0f);
+    glRotatef(80.0f, 1.0f, 0.0f, 0.0f); /* slumped over */
+    drawModelRT(&introGuardRT);
+    glPopMatrix();
+}
+
+/* ---- SCP-012 (cont2_012): "A Bad Composition" ---- */
+
+static void spawn012(void) {
+    scp012Ok = 0;
+    scp012Comp = 0.0f;
+    for (uint32_t r = 0; r < map.roomCount; r++) {
+        const RoomPlacement *p = &map.rooms[r];
+        if (strcmp(tplList.items[p->templateIndex].name, "cont2_012") != 0) {
+            continue;
+        }
+        /* The score's display box (Objects[0]) - source local
+         * -360,-130,456. */
+        float local[3] = { -360.0f, -130.0f, 456.0f }, w[3];
+        localToWorld(p, local, w);
+        scp012Pos[0] = w[0]; scp012Pos[1] = w[1]; scp012Pos[2] = w[2];
+        scp012Ok = 1;
+        break;
+    }
+}
+
+/* Main_Core scribe_event: standing at the score (DistanceSquared < 0.36
+ * world = 0.6 world -> 153 raw) pins the eyes open and paints the bloody
+ * compulsion overlay, with a horror sting. Sanity bleeds while it holds
+ * you. The overlay itself is drawn in the HUD pass from scp012Comp. */
+static void update012(void) {
+    if (!scp012Ok) return;
+    float dx = camPos[0] - scp012Pos[0];
+    float dz = camPos[2] - scp012Pos[2];
+    int atScore = (dx * dx + dz * dz) < 153.0f * 153.0f;
+    if (atScore) {
+        if (scp012Comp < 0.02f && sndHorror11 >= 0) {
+            audioPlay(sndHorror11, 0.7f, 0.0f); /* HorrorSFX[11] */
+        }
+        blinkFrames = 0;               /* it forces the eyes open */
+        blinkTimer = 100.0f;
+        scp012Comp += 0.05f;
+        if (scp012Comp > 1.0f) scp012Comp = 1.0f;
+        sanity -= 0.15f;
+        if (sanity < -1000.0f) sanity = -1000.0f;
+    } else if (scp012Comp > 0.0f) {
+        scp012Comp -= 0.04f;
+        if (scp012Comp < 0.0f) scp012Comp = 0.0f;
+    }
+}
+
 static const ModelRT *buttonModelFor(int btnId) {
     switch (btnId) {
         case 1: return &buttonKeycardRT;
@@ -7128,6 +9051,48 @@ static int fixtureNearest(const float pos[3], int *type) {
     }
     if (type) *type = bt;
     return bi;
+}
+
+/* Rooms whose lever/button drives a bespoke, unported subsystem rather
+ * than a door - they must not fall through to the generic door control:
+ *   cont1_106  the femur breaker + magnet (its own handler),
+ *   room2_nuke the Omega Warhead arming,
+ *   cont1_914  the SCP-914 refinement knob,
+ *   gate_a/b   the Gate A/B endings.
+ * Everything else (containment chambers, checkpoints, guard/server/
+ * storage rooms) uses its fixtures as door controls, which the port
+ * has. */
+static int fixtureDrivesDoor(const char *room) {
+    return strcmp(room, "cont1_106") != 0
+        && strcmp(room, "room2_nuke") != 0
+        && strcmp(room, "cont1_914") != 0
+        && strcmp(room, "gate_a") != 0
+        && strcmp(room, "gate_b") != 0;
+}
+
+/* Open/close the nearest door to a just-operated fixture within the same
+ * room (a wall control panel authorises the door, so any lock/keycard
+ * gives way). Returns the door, or NULL if none is in reach. */
+static Door *fixtureOperateDoor(const float fxPos[3], const float ear[3]) {
+    Door *best = NULL;
+    float bestD2 = 1400.0f * 1400.0f; /* within the room */
+    for (uint32_t i = 0; i < doors.count; i++) {
+        Door *d = &doors.items[i];
+        if (d->type == 1) continue; /* elevator cars ride, not toggle */
+        float dx = d->x - fxPos[0], dz = d->z - fxPos[2];
+        float dy = d->y - fxPos[1];
+        float d2 = dx * dx + dz * dz + dy * dy;
+        if (d2 < bestD2) { bestD2 = d2; best = d; }
+    }
+    if (!best) return NULL;
+    best->locked = 0;
+    best->open = !best->open;
+    float dpos[3] = { best->x, ear[1], best->z };
+    int v = rand() % 3;
+    int snd = best->heavy ? (best->open ? sndBigOpen[v] : sndBigClose[v])
+                          : (best->open ? sndDoorOpen[v] : sndDoorClose[v]);
+    audioPlay3D(snd, dpos, ear, camYaw, 2500.0f);
+    return best;
 }
 
 static GLuint hudBlinkIcon, hudBlinkBar, hudSprintIcon, hudStaminaBar;
@@ -7717,6 +9682,10 @@ static int startNewGame(void) {
     gameState = 1;
     worldReady = 1;
     pauseOpen = 0;
+    /* The pre-rendered intro cutscene plays before the wake-up, gated
+     * by both the intro and the startup-videos options (like the
+     * source's PlayMovie, which honours opt\PlayStartup). */
+    pendingIntroVideo = introEnabled && startupVideosEnabled;
     if (introEnabled) {
         introStart();
         /* You wake with the orientation leaflet (the no-intro path
@@ -8034,7 +10003,7 @@ static void loadGameTab(void) {
 
 /* ---- OPTIONS tab ---- */
 
-#define OPT_ROWS 4
+#define OPT_ROWS 5
 
 static void optionsTab(void) {
     const float SX = MENU_SX, SY = MENU_SY;
@@ -8065,6 +10034,8 @@ static void optionsTab(void) {
                 optionsApply();
             } else if (i == 3) {
                 optInvertY = !optInvertY;
+            } else if (i == 4) {
+                startupVideosEnabled = !startupVideosEnabled;
             } else {
                 rgt = 1; /* sensitivity: tap steps forward */
             }
@@ -8093,10 +10064,14 @@ static void optionsTab(void) {
             case 3:
                 optInvertY = !optInvertY;
                 break;
+            case 4:
+                startupVideosEnabled = !startupVideosEnabled;
+                break;
         }
     }
     if (inputHit(ACTION_INTERACT)) {
         if (optSel == 3) optInvertY = !optInvertY;
+        if (optSel == 4) startupVideosEnabled = !startupVideosEnabled;
         if (optSel == backIdx) {
             optionsSave();
             menuTab = 0;
@@ -8110,10 +10085,11 @@ static void optionsTab(void) {
     }
 
     drawTabHeader("OPTIONS", optSel == backIdx);
-    drawFrame(x, y, 580.0f * SX, 260.0f * SY, 0);
+    drawFrame(x, y, 580.0f * SX, 310.0f * SY, 0);
 
     const char *labels[OPT_ROWS] = {
         "Music volume", "Sound volume", "Look sensitivity", "Invert Y axis",
+        "Startup videos",
     };
     for (int i = 0; i < OPT_ROWS; i++) {
         float ry = y + (30.0f + i * 55.0f) * SY;
@@ -8128,8 +10104,11 @@ static void optionsTab(void) {
                      (int)(optSfxVol * 100.0f + 0.5f));
         } else if (i == 2) {
             snprintf(val, sizeof(val), "< %.2fx >", optLookSens);
-        } else {
+        } else if (i == 3) {
             snprintf(val, sizeof(val), "< %s >", optInvertY ? "ON" : "OFF");
+        } else {
+            snprintf(val, sizeof(val), "< %s >",
+                     startupVideosEnabled ? "ON" : "OFF");
         }
         mtext(x + 330.0f * SX, ry, 1.5f, g, g, g, val);
         /* Volume sliders like the game's option bars. */
@@ -8141,7 +10120,7 @@ static void optionsTab(void) {
                      0.85f, 0.85f, 0.85f, 1.0f);
         }
     }
-    mtext(x + 24.0f * SX, y + 260.0f * SY + 10.0f, 1.5f, 0.5f, 0.5f, 0.5f,
+    mtext(x + 24.0f * SX, y + 310.0f * SY + 10.0f, 1.5f, 0.5f, 0.5f, 0.5f,
           "left/right: adjust   O: back");
 }
 
@@ -8230,6 +10209,92 @@ static void enterMenu(void) {
     invOpen = 0;
     docOpen = 0;
     menuMusicStart();
+}
+
+/* Startup splash videos (Graphics_Core PlayStartupVideos): the studio
+ * idents and the content warning play in order before the title menu.
+ * The Vita has no WMV/VC-1 decoder, so the motion frames can't be
+ * shown; the port stays faithful to the sequence - the paired .ogg
+ * audio plays in full, each clip's title card is held for the length of
+ * that audio, and any button or a touch skips the current clip. Gated
+ * by the "Startup videos" option (opt\PlayStartup); a fresh install has
+ * no options file, so it runs once and the player can turn it off. */
+static int startupSkipPressed(void) {
+    float tx, ty;
+    return inputHit(ACTION_INTERACT) || inputHit(ACTION_MENU)
+        || inputHit(ACTION_CROUCH) || inputHit(ACTION_INVENTORY)
+        || inputHit(ACTION_USE_ITEM) || inputHit(ACTION_SAVE)
+        || inputDpadDownHit() || inputTouchTap(&tx, &ty);
+}
+
+static void playStartupVideos(void) {
+    if (!startupVideosEnabled) return;
+    /* The clips are the studio idents and the content warning. The source
+     * .wmv is undecodable on the Vita, but they ship re-encoded to H.264
+     * MP4 (startup_<name>.mp4) alongside it, so each plays as real video
+     * through sceAvPlayer; if that file is missing/unopenable the code
+     * falls back to a title card over the clip's original .ogg audio. */
+    static const struct {
+        const char *file, *title, *sub;
+    } CLIPS[4] = {
+        { "startup_Undertow", "UNDERTOW GAMES", "" },
+        { "startup_TSS", "SCP - CONTAINMENT BREACH", "Ultimate Edition" },
+        { "startup_UET", "ULTIMATE EDITION TEAM", "" },
+        { "startup_Warning", "WARNING",
+          "Contains flashing lights and disturbing imagery." },
+    };
+    for (int i = 0; i < 4; i++) {
+        char vp[256];
+        snprintf(vp, sizeof(vp), MENU_DIR "/%s.mp4", CLIPS[i].file);
+        if (videoPlayFile(vp)) continue; /* real hardware-decoded video */
+        /* Fallback: title card over the original audio. */
+        char path[256];
+        snprintf(path, sizeof(path), MENU_DIR "/%s.ogg", CLIPS[i].file);
+        audioStreamMusic(path, optSfxVol, 0);
+        for (int frames = 0;; frames++) {
+            inputUpdate();
+            /* A few frames of grace so the mixer thread opens the stream
+             * before the "audio finished" test can fire, and so a button
+             * still held from the previous clip does not skip this one. */
+            if (frames > 8) {
+                if (!audioMusicPlaying()) break;
+                if (startupSkipPressed()) { audioStopMusic(); break; }
+            }
+            if (frames > 3600) { audioStopMusic(); break; } /* 60s safety */
+
+            glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+            glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+            beginHud2D();
+            drawQuad(0, 0, SCREEN_W, SCREEN_H, 0, 0.0f, 0.0f, 0.0f, 1.0f);
+            /* Fade the card in over the first ~0.5 s. */
+            float a = frames < 30 ? frames / 30.0f : 1.0f;
+            mtextC(SCREEN_W * 0.5f, SCREEN_H * 0.44f, 3.0f, a, a, a,
+                   CLIPS[i].title);
+            if (CLIPS[i].sub[0]) {
+                mtextC(SCREEN_W * 0.5f, SCREEN_H * 0.44f + 44.0f, 1.6f,
+                       a * 0.75f, a * 0.75f, a * 0.75f, CLIPS[i].sub);
+            }
+            mtextC(SCREEN_W * 0.5f, SCREEN_H - 34.0f, 1.3f, 0.4f, 0.4f, 0.4f,
+                   "Press any button to skip");
+            endHud2D();
+            vglSwapBuffers(GL_FALSE);
+        }
+    }
+    audioStopMusic();
+}
+
+/* The startup_Intro cutscene (Menu_Core PlayMovie("startup_Intro")):
+ * played when a new game begins with the intro enabled. The source .wmv
+ * is undecodable on the Vita, but the same cutscene ships as H.264 MP4
+ * (three sequential fragments), which sceAvPlayer hardware-decodes.
+ * Deferred to the first game frame via this flag so it runs outside the
+ * menu's HUD 2D scope. */
+static void playIntroVideo(void) {
+    if (!videoInit()) return;
+    audioStopMusic();
+    videoPlayFile(MENU_DIR "/startup_Intro1.mp4");
+    videoPlayFile(MENU_DIR "/startup_Intro2.mp4");
+    videoPlayFile(MENU_DIR "/startup_Intro3.mp4");
 }
 
 /* Pause menu: the game's pause_menu.png panel with its button column
@@ -8321,7 +10386,17 @@ static void drawNav(void) {
 }
 
 int main(void) {
-    vglInit(0x800000);
+    /* vglInit reserves the ENTIRE CDRAM and PHYCONT partitions for
+     * vitaGL, leaving nothing for sceAvPlayer's decoder frame buffers
+     * (the device log showed both partitions 100% full). Leave a slice
+     * of each unreserved so the startup/intro videos can decode; the
+     * game's 256px-capped textures still fit in what remains. Thresholds
+     * are the bytes vitaGL leaves FREE per pool. */
+    vglInitWithCustomThreshold(0x800000, SCREEN_W, SCREEN_H,
+                               0x1000000 /* RAM: 16 MB */,
+                               0x1000000 /* CDRAM: 16 MB */,
+                               0x800000 /* PHYCONT: 8 MB */,
+                               0 /* CDLG */, SCE_GXM_MULTISAMPLE_NONE);
 
     glViewport(0, 0, SCREEN_W, SCREEN_H);
     glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
@@ -8336,23 +10411,29 @@ int main(void) {
     int haveData = templatesLoad(ROOMS_INI, &tplList) && tplList.count > 0;
     if (haveData) {
         tplRT = (TemplateRT *)calloc(tplList.count, sizeof(TemplateRT));
+        optionsLoad();
+        mkdir(SAVES_DIR, 0777);
+        int audioOk = audioInit();
+        if (audioOk) optionsApply();
+        srand((unsigned)sceKernelGetProcessTimeWide());
+        pendingSeed = (uint32_t)(sceKernelGetProcessTimeWide() & 0xFFFFFF) | 1u;
+        /* Play the boot videos now, before the door/NPC/texture/sound
+         * load fills the heap: sceAvPlayer needs a few MB of contiguous
+         * CPU RAM for its demux/decode buffers, and after loadSounds
+         * decodes every SFX to PCM there is none left (the device log
+         * showed its 1.5 MB init alloc returning NULL). */
+        playStartupVideos();
+        /* Heavy asset + audio load. */
         buildDoorAssets();
         buildNpcAssets();
         loadHudTextures();
         loadMenuTextures();
         texButtonRed = textureGet("keypad_locked.png");
         pdThroneTex = textureGet("scp_106_eyes.png");
-        optionsLoad();
-        mkdir(SAVES_DIR, 0777);
-        if (audioInit()) {
-            loadSounds();
-            optionsApply();
-        }
+        if (audioOk) loadSounds();
         decalsInit();
         /* Boot to the title menu; the world is generated when the
          * player starts or loads a game. */
-        srand((unsigned)sceKernelGetProcessTimeWide());
-        pendingSeed = (uint32_t)(sceKernelGetProcessTimeWide() & 0xFFFFFF) | 1u;
         enterMenu();
     } else {
         snprintf(statusLine, sizeof(statusLine),
@@ -8384,6 +10465,13 @@ int main(void) {
             endHud2D();
             vglSwapBuffers(GL_FALSE);
             continue;
+        }
+
+        /* First frame of a fresh game: play the intro cutscene (it takes
+         * over the screen with its own render loop) before gameplay. */
+        if (haveData && pendingIntroVideo) {
+            pendingIntroVideo = 0;
+            playIntroVideo();
         }
 
         if (haveData && inputHit(ACTION_MENU)) {
@@ -8550,6 +10638,10 @@ int main(void) {
          * frame must not also interact with the world. */
         if (haveData && !invOpen && !pauseOpen && !pausedAtFrameStart
             && !keypadOpen && !introCameraLocked()
+            && inputHit(ACTION_INTERACT) && try914Interact()) {
+            /* SCP-914 handled the press (knob cycle or refine run). */
+        } else if (haveData && !invOpen && !pauseOpen && !pausedAtFrameStart
+            && !keypadOpen && !introCameraLocked()
             && inputHit(ACTION_INTERACT)) {
             int fxType = 0;
             int fx = fixtureNearest(camPos, &fxType);
@@ -8560,9 +10652,20 @@ int main(void) {
                     lv->on = !lv->on;
                     float lp[3] = { lv->x, camPos[1], lv->z };
                     audioPlay3D(sndLever, lp, camPos, camYaw, 1200.0f);
-                    if (strcmp(roomNameAt(camPos), "cont1_106") == 0) {
+                    const char *rm = roomNameAt(camPos);
+                    if (strcmp(rm, "cont1_106") == 0) {
                         audioPlay(lv->on ? sndMagnetUp : sndMagnetDown,
                                   0.8f, 0.0f);
+                    } else if (fixtureDrivesDoor(rm)) {
+                        /* Containment/checkpoint/guard-room levers throw
+                         * their room's door (the ported subsystem). */
+                        float fp[3] = { lv->x, lv->y, lv->z };
+                        if (fixtureOperateDoor(fp, camPos)) {
+                            snprintf(toastMsg, sizeof(toastMsg),
+                                     lv->on ? "THE DOOR SLIDES OPEN"
+                                            : "THE DOOR SLIDES SHUT");
+                            toastTimer = 120;
+                        }
                     }
                 } else {
                     WorldButton *bt = &worldButtons[fx];
@@ -8571,14 +10674,14 @@ int main(void) {
                     audioPlay3D(bt->locked ? sndDoorLock
                                            : sndButton[rand() % 2],
                                 bp, camPos, camYaw, 1200.0f);
+                    const char *brm = roomNameAt(camPos);
                     if (bt->locked) {
                         snprintf(toastMsg, sizeof(toastMsg),
                                  "IT WON'T BUDGE");
                         toastTimer = 120;
                     } else if (!bt->btnId && femurTimer <= 0.0f
                                && !npc106Contained
-                               && strcmp(roomNameAt(camPos),
-                                         "cont1_106") == 0) {
+                               && strcmp(brm, "cont1_106") == 0) {
                         /* The femur breaker: the magnet (a chamber
                          * lever) must be engaged first (source: the
                          * button does nothing until EventState2). */
@@ -8605,6 +10708,16 @@ int main(void) {
                             snprintf(toastMsg, sizeof(toastMsg),
                                      "THE FEMUR BREAKER ACTIVATES...");
                             toastTimer = 200;
+                        }
+                    } else if (fixtureDrivesDoor(brm)) {
+                        /* A plain wall button throws its room's door. */
+                        float fp[3] = { bt->x, bt->y, bt->z };
+                        Door *od = fixtureOperateDoor(fp, camPos);
+                        if (od) {
+                            snprintf(toastMsg, sizeof(toastMsg),
+                                     od->open ? "THE DOOR SLIDES OPEN"
+                                              : "THE DOOR SLIDES SHUT");
+                            toastTimer = 120;
                         }
                     }
                 }
@@ -8677,6 +10790,17 @@ int main(void) {
             blurAmount *= 0.88f;
             if (blurAmount < 0.02f) blurAmount = 0.0f;
             doorsUpdate(&doors);
+            camerasUpdate();
+            cameraCheckUpdate();
+            update079();
+            update895();
+            update012();
+            update372();
+            update205();
+            update914();
+            update035();
+            updateRefineHostile();
+            update513();
             update173();
             update106();
             update096();
@@ -8691,6 +10815,7 @@ int main(void) {
             if (introPhase < 0 && !inPocket) {
                 updateZoneMusic();
                 updateRoomAmbience();
+                updateAmbientSfx();
                 updateRoomEvents();
             }
             updatePocketDimension();
@@ -8881,6 +11006,7 @@ int main(void) {
             int pushedUp = 0;
             pushWorld(camPos, PLAYER_RADIUS, &pushedUp);
             doorsCollide(&doors, camPos, PLAYER_RADIUS);
+            collide860Trees(camPos);
 
             float hitY;
             if (rayDownWorld(camPos, eye + STEP_SLACK, &hitY)) {
@@ -8934,6 +11060,10 @@ int main(void) {
             if (blinkFrames == 0) blinkTimer = 100.0f;
         }
 
+        /* Capture the nearest monitor's live feed before clearing the
+         * frame (it renders into a scissored corner, then copies out). */
+        renderCameraFeed();
+
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
 
         if (haveData && activeCount > 0) {
@@ -8966,6 +11096,16 @@ int main(void) {
             decalsDraw();
             drawDoors(camPos);
             drawFixtures(camPos);
+            camerasDraw(camPos);
+            drawMonitors(camPos);
+            draw079(camPos);
+            draw895(camPos);
+            draw372(camPos);
+            draw205(camPos);
+            draw914(camPos);
+            draw035(camPos);
+            drawRefineHostile(camPos);
+            draw513(camPos);
             drawItems(camPos);
             draw173(camPos);
             draw106(camPos);
@@ -9049,6 +11189,15 @@ int main(void) {
                 float jit = sinf(fpsFrames * 0.9f) * 0.05f * sv;
                 drawQuad(0, 0, SCREEN_W, SCREEN_H, 0, 0.0f, 0.05f, 0.03f,
                          sv * 0.5f + jit);
+            }
+            /* SCP-012 floods the view with its bloody compulsion overlay,
+             * jittering it about like the source (Rand offset per frame). */
+            if (scp012Comp > 0.01f && scp012OvTex) {
+                float jx = (float)(rand() % 80) - 40.0f;
+                float jy = (float)(rand() % 40) - 20.0f;
+                drawQuad(jx - 60.0f, jy - 60.0f, SCREEN_W + 120.0f,
+                         SCREEN_H + 120.0f, scp012OvTex, 1.0f, 1.0f, 1.0f,
+                         scp012Comp);
             }
         }
         if (haveData && walkMode && !invOpen && !pauseOpen) {

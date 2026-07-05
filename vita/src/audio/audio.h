@@ -30,6 +30,10 @@ void audioLoopAmbience(int sound, float vol);
 void audioStreamMusic(const char *path, float vol, int loop);
 void audioStopMusic(void);
 
+/* Nonzero while the streamed music channel is (or is about to start)
+ * playing; a non-looping stream reports 0 once it reaches its end. */
+int audioMusicPlaying(void);
+
 /* Master volumes (0..1) applied on top of per-play volumes; the music
  * volume also updates a playing music channel live. */
 void audioSetSfxVolume(float vol);

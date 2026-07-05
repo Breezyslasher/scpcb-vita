@@ -35,7 +35,7 @@ static void alog(const char *fmt, ...) {
  * conversion handles the 44.1 kHz sources. */
 #define OUT_RATE 48000
 #define GRAIN 256
-#define MAX_SOUNDS 160
+#define MAX_SOUNDS 224   /* headroom for the on-demand ambient one-shots */
 #define MAX_CHANNELS 12
 #define AMBIENCE_CHANNEL MAX_CHANNELS       /* extra looping slot */
 #define MUSIC_CHANNEL (MAX_CHANNELS + 1)    /* extra looping slot */
@@ -423,4 +423,11 @@ void audioStreamMusic(const char *path, float vol, int loop) {
 
 void audioStopMusic(void) {
     musicReq = 2;
+}
+
+int audioMusicPlaying(void) {
+    /* A pending start counts as playing so a just-started clip is not
+     * reported finished before the mixer thread opens it; a non-looping
+     * stream clears musicV at EOF. */
+    return musicReq == 1 || musicV != NULL;
 }
