@@ -60,6 +60,8 @@ typedef struct {
     int loop;
 } Channel;
 
+static int decoderLoop(SceSize argSize, void *argp); /* def after decode */
+
 static Sound sounds[MAX_SOUNDS];
 static int soundCount;
 static Channel channels[LAST_CHANNEL + 1];
