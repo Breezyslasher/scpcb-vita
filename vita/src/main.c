@@ -49,6 +49,9 @@ unsigned int _newlib_heap_size_user = 220 * 1024 * 1024;
 #define TEXTURE_CAP 256
 
 #define DATA_ROOT "ux0:data/scpcb-ue"
+/* Shown in the debug HUD so a stale VPK install is instantly visible. */
+#define PORT_BUILD_TAG "diagmem1"
+
 #define MAP_DIR DATA_ROOT "/GFX/Map"
 #define MAP_TEXTURES_DIR DATA_ROOT "/GFX/Map/Textures"
 #define PROPS_DIR DATA_ROOT "/GFX/Map/Props"
@@ -89,6 +92,7 @@ typedef struct {
 
 static CachedTexture *texCache;
 static unsigned texCacheCount;
+static int texFailCount; /* textures that resolved but failed to load */
 
 static GLuint textureGet(const char *name) {
     if (!name) return 0;
@@ -115,6 +119,8 @@ static GLuint textureGet(const char *name) {
                          (GLsizei)img->height, 0, GL_RGBA, GL_UNSIGNED_BYTE,
                          img->pixels);
             textureFree(img);
+        } else {
+            texFailCount++;
         }
     }
 
@@ -11205,12 +11211,16 @@ int main(void) {
         char line1[320];
         snprintf(line1, sizeof(line1), "%s   [%s]", statusLine,
                  haveData ? roomNameAt(camPos) : "-");
-        char line2[200];
+        char line2[256];
         snprintf(line2, sizeof(line2),
-                 "fps=%.0f  au=%d/%d open-fail=%d dec-fail=%d  x: door"
-                 "  up: %s  start: menu", fps, audioStatus(),
-                 audioSoundCount(), audioLoadFopenFails(),
-                 audioLoadDecodeFails(), walkMode ? "WALK" : "fly");
+                 "bld=%s fps=%.0f au=%d/%d dec-fail=%d texfail=%d "
+                 "vram=%uK ram=%uK phy=%uK  up: %s",
+                 PORT_BUILD_TAG, fps, audioStatus(), audioSoundCount(),
+                 audioLoadDecodeFails(), texFailCount,
+                 (unsigned)(vglMemFree(VGL_MEM_VRAM) / 1024),
+                 (unsigned)(vglMemFree(VGL_MEM_RAM) / 1024),
+                 (unsigned)(vglMemFree(VGL_MEM_SLOW) / 1024),
+                 walkMode ? "WALK" : "fly");
         drawHud(line1, line2, toastTimer > 0 ? toastMsg : NULL, NULL);
 
         /* Vitals meters, the inventory and the blink blackout share the
