@@ -50,12 +50,13 @@ unsigned int _newlib_heap_size_user = 220 * 1024 * 1024;
 
 #define DATA_ROOT "ux0:data/scpcb-ue"
 /* Shown in the debug HUD so a stale VPK install is instantly visible. */
-#define PORT_BUILD_TAG "diag2-novid"
+#define PORT_BUILD_TAG "diag3-lmfix"
 
-/* Diagnostic: skip ALL video playback (boot clips and intro) while
- * keeping everything else identical, to isolate whether the video
- * player's GL usage is what blacks out the world pass. */
-#define DIAG_DISABLE_VIDEOS 1
+/* Diagnostic switch: set to 1 to skip ALL video playback (boot clips
+ * and intro). The diag2-novid device test proved the video player was
+ * NOT the cause of the black world (the lightmap blend was), so videos
+ * are back on. */
+#define DIAG_DISABLE_VIDEOS 0
 
 #define MAP_DIR DATA_ROOT "/GFX/Map"
 #define MAP_TEXTURES_DIR DATA_ROOT "/GFX/Map/Textures"
@@ -1854,15 +1855,17 @@ static void drawBatchSet(const Scene *scene, const BatchGL *gl, int alphaPass) {
             glBindTexture(GL_TEXTURE_2D, lightmap);
             glTexCoordPointer(2, GL_FLOAT, sizeof(SceneVertex), VTX_OFF(lu));
             glEnable(GL_BLEND);
-            /* The lightmap modulates the diffuse, it does not add to it.
-             * Source composites 2 * diffuse * (ambient + lightmap): the
-             * diffuse layer is TextureBlend 5 (multiply x2), so this
-             * second pass is a modulate2x - result = 2 * dst * src -
-             * darkening shadowed areas instead of washing them out the
-             * way a plain additive (GL_ONE, GL_ONE) pass did. The
-             * per-room AmbientLightRoomTex term the port lacks is dropped
-             * (a dim uniform add), leaving 2 * diffuse * lightmap. */
-            glBlendFunc(GL_DST_COLOR, GL_SRC_COLOR);
+            /* Additive lightmap. A modulate2x pass (GL_DST_COLOR,
+             * GL_SRC_COLOR) is mathematically closer to the source's
+             * 2 * diffuse * (ambient + lightmap), but on device it
+             * darkened the world to near-black: the RMESH vertex colours
+             * are baked into BOTH passes (the colour array stays bound,
+             * so the result is 2 * diffuse * lm * vc^2) and the port has
+             * no AmbientLightRoomTex floor, so dim lightmaps multiply to
+             * black. Bisected on hardware to the modulate change; keep
+             * the known-good additive until a corrected modulate (single
+             * vc + ambient floor) can be tested on device. */
+            glBlendFunc(GL_ONE, GL_ONE);
             glDrawElements(GL_TRIANGLES, (GLsizei)b->indexCount,
                            GL_UNSIGNED_SHORT, NULL);
             glDisable(GL_BLEND);
