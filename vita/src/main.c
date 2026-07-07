@@ -11,11 +11,13 @@
 #include <dirent.h>
 #include <math.h>
 #include <sys/stat.h>
+#include <stdarg.h>
 #include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
+#include <malloc.h>
 
 #include <psp2/kernel/processmgr.h>
 #include <vitaGL.h>
@@ -49,6 +51,30 @@ unsigned int _newlib_heap_size_user = 220 * 1024 * 1024;
 #define TEXTURE_CAP 256
 
 #define DATA_ROOT "ux0:data/scpcb-ue"
+/* Shown in the debug HUD so a stale VPK install is instantly visible. */
+#define PORT_BUILD_TAG "diag4-lazysnd"
+
+/* Diagnostic switch: set to 1 to skip ALL video playback (boot clips
+ * and intro). The diag2-novid device test proved the video player was
+ * NOT the cause of the black world, so videos are back on. */
+#define DIAG_DISABLE_VIDEOS 0
+
+/* Render/load diagnostics -> ux0:data/scpcb-ue/render_log.txt.
+ * Flushed per line so a crash keeps it. */
+static void plog(const char *fmt, ...) {
+    static FILE *lf;
+    if (!lf) lf = fopen(DATA_ROOT "/render_log.txt", "w");
+    if (!lf) return;
+    va_list ap;
+    va_start(ap, fmt);
+    vfprintf(lf, fmt, ap);
+    va_end(ap);
+    fputc('\n', lf);
+    fflush(lf);
+}
+
+static int tplFailCount; /* room templates currently in a failed state */
+
 #define MAP_DIR DATA_ROOT "/GFX/Map"
 #define MAP_TEXTURES_DIR DATA_ROOT "/GFX/Map/Textures"
 #define PROPS_DIR DATA_ROOT "/GFX/Map/Props"
@@ -89,6 +115,7 @@ typedef struct {
 
 static CachedTexture *texCache;
 static unsigned texCacheCount;
+static int texFailCount; /* textures that resolved but failed to load */
 
 static GLuint textureGet(const char *name) {
     if (!name) return 0;
@@ -115,6 +142,8 @@ static GLuint textureGet(const char *name) {
                          (GLsizei)img->height, 0, GL_RGBA, GL_UNSIGNED_BYTE,
                          img->pixels);
             textureFree(img);
+        } else {
+            texFailCount++;
         }
     }
 
@@ -215,6 +244,7 @@ typedef struct {
 typedef struct {
     int state;        /* 0 = not loaded, 1 = ok, -1 = failed,
                          2 = geometry built, textures loading */
+    int retries;      /* failed attempts so far (transient OOM retries) */
     uint32_t texDone; /* batches with textures resolved (state 2) */
     Scene *scene;
     BatchGL *gl;
@@ -247,22 +277,43 @@ static void templateUnload(TemplateRT *rt) {
  * player is standing in it). Step 1 parses the mesh and builds the
  * scene and collision; each following step resolves the textures of
  * a couple of batches; the last one uploads the VBOs. */
+/* A template load failure is usually transient (a malloc failing under
+ * heap pressure), so failures log their cause, count into the HUD's
+ * tpl= readout and retry on later calls instead of silently latching
+ * the room black forever (which skipped the whole 3D pass when every
+ * template failed). */
+#define TPL_MAX_RETRIES 8
+
 static void templateEnsureStep(int idx) {
     TemplateRT *rt = &tplRT[idx];
-    if (rt->state == 1 || rt->state == -1) return;
+    if (rt->state == 1) return;
+    if (rt->state == -1) {
+        if (rt->retries >= TPL_MAX_RETRIES) return;
+        rt->state = 0; /* try again */
+    }
 
     if (rt->state == 0) {
         rt->state = -1;
+        rt->retries++;
         const RoomTemplateInfo *info = &tplList.items[idx];
-        if (!info->meshPath) return;
+        if (!info->meshPath) {
+            rt->retries = TPL_MAX_RETRIES; /* permanent: nothing to load */
+            return;
+        }
         char path[1024];
         snprintf(path, sizeof(path), MAP_DIR "/%s", info->meshPath);
         char err[128];
         RMesh *mesh = rmeshLoadFile(path, err, sizeof(err));
-        if (!mesh) return;
+        if (!mesh) {
+            if (rt->retries == 1) tplFailCount++;
+            plog("tpl FAIL rmesh %s: %s (try %d)", path, err, rt->retries);
+            return;
+        }
         rt->scene = sceneBuild(mesh);
         if (!rt->scene) {
             rmeshFree(mesh);
+            if (rt->retries == 1) tplFailCount++;
+            plog("tpl FAIL sceneBuild %s (try %d)", path, rt->retries);
             return;
         }
         for (uint32_t i = 0; i < mesh->entityCount; i++) {
@@ -298,7 +349,19 @@ static void templateEnsureStep(int idx) {
         rt->gl = (BatchGL *)calloc(
             rt->scene->batchCount ? rt->scene->batchCount : 1,
             sizeof(BatchGL));
-        if (!rt->gl) return;
+        if (!rt->gl) {
+            sceneFree(rt->scene);
+            rt->scene = NULL;
+            collisionFree(rt->col);
+            rt->col = NULL;
+            if (rt->retries == 1) tplFailCount++;
+            plog("tpl FAIL gl-calloc %s (try %d)", path, rt->retries);
+            return;
+        }
+        if (rt->retries > 1) {
+            tplFailCount--; /* a retry recovered it */
+            plog("tpl RECOVERED %s (try %d)", path, rt->retries);
+        }
         rt->texDone = 0;
         rt->state = 2;
         return;
@@ -1751,6 +1814,12 @@ static void regenerateMap(uint32_t seed) {
         spawnRoomDecals();
         reset173();
         reset106();
+        {
+            struct mallinfo mi = mallinfo();
+            plog("map gen: seed %u rooms %u; heap used=%uK free=%uK",
+                 mapSeed, map.roomCount, (unsigned)mi.uordblks / 1024,
+                 (unsigned)mi.fordblks / 1024);
+        }
         snprintf(statusLine, sizeof(statusLine), "map seed %u: %u rooms %u doors",
                  mapSeed, map.roomCount, doors.count);
     } else {
@@ -1843,15 +1912,17 @@ static void drawBatchSet(const Scene *scene, const BatchGL *gl, int alphaPass) {
             glBindTexture(GL_TEXTURE_2D, lightmap);
             glTexCoordPointer(2, GL_FLOAT, sizeof(SceneVertex), VTX_OFF(lu));
             glEnable(GL_BLEND);
-            /* The lightmap modulates the diffuse, it does not add to it.
-             * Source composites 2 * diffuse * (ambient + lightmap): the
-             * diffuse layer is TextureBlend 5 (multiply x2), so this
-             * second pass is a modulate2x - result = 2 * dst * src -
-             * darkening shadowed areas instead of washing them out the
-             * way a plain additive (GL_ONE, GL_ONE) pass did. The
-             * per-room AmbientLightRoomTex term the port lacks is dropped
-             * (a dim uniform add), leaving 2 * diffuse * lightmap. */
-            glBlendFunc(GL_DST_COLOR, GL_SRC_COLOR);
+            /* Additive lightmap. A modulate2x pass (GL_DST_COLOR,
+             * GL_SRC_COLOR) is mathematically closer to the source's
+             * 2 * diffuse * (ambient + lightmap), but on device it
+             * darkened the world to near-black: the RMESH vertex colours
+             * are baked into BOTH passes (the colour array stays bound,
+             * so the result is 2 * diffuse * lm * vc^2) and the port has
+             * no AmbientLightRoomTex floor, so dim lightmaps multiply to
+             * black. Bisected on hardware to the modulate change; keep
+             * the known-good additive until a corrected modulate (single
+             * vc + ambient floor) can be tested on device. */
+            glBlendFunc(GL_ONE, GL_ONE);
             glDrawElements(GL_TRIANGLES, (GLsizei)b->indexCount,
                            GL_UNSIGNED_SHORT, NULL);
             glDisable(GL_BLEND);
@@ -3106,6 +3177,11 @@ static void update173(void) {
             npc173EnemyZ = camPos[2];
             npc173HeadYawDeg = 0.0f; /* body faces the player */
             if (dist < 166.0f) {
+                /* During the intro the breach is scripted (the source
+                 * sets the player non-playable and 173 only snaps the
+                 * scripted NPCs, then leaves through the vent) - it must
+                 * never kill the player here. */
+                if (introPhase >= 0) return;
                 /* Kill: neck snap, camera wrenched around. */
                 snprintf(deathCause, sizeof(deathCause), "SCP-173");
                 audioPlay(sndNeckSnap[rand() % 3], 1.0f, 0.0f);
@@ -3491,6 +3567,43 @@ static void introUpdate(void) {
         }
     }
 
+    /* Ulgrin's partner (the source's NPC[4]) trails behind the player
+     * instead of standing at the cell: he walks to keep within a short
+     * distance once the player is out and moving through the block. */
+    IntroHuman *rear = introHumanCount > 1
+                           && INTRO_HUMANS[1].rt == &introGuardRT
+                       ? &INTRO_HUMANS[1]
+                       : NULL;
+    if (rear && introPhase >= 1 && introPhase <= 2) {
+        float wx = INTRO_GX * ROOM_SPACING + rear->x;
+        float wz = INTRO_GY * ROOM_SPACING + rear->z;
+        float dx = camPos[0] - wx, dz = camPos[2] - wz;
+        float d = sqrtf(dx * dx + dz * dz);
+        int walking = 0;
+        if (d > 360.0f) {
+            float sp = 4.4f;
+            rear->x += dx / d * sp;
+            rear->z += dz / d * sp;
+            rear->yawDeg = -atan2f(dx, dz) * 180.0f / 3.14159265f;
+            float o[3] = { INTRO_GX * ROOM_SPACING + rear->x, 200.0f,
+                           INTRO_GY * ROOM_SPACING + rear->z };
+            float hy;
+            if (rayDownWorld(o, 600.0f, &hy)) rear->y = hy;
+            walking = 1;
+        }
+        if (walking && rear->animStart != 1.0f) {
+            rear->animStart = 1.0f;
+            rear->animEnd = 38.0f;
+            rear->animSpeed = 0.66f;
+            rear->frame = 1.0f;
+        } else if (!walking && rear->animStart != 77.0f) {
+            rear->animStart = 77.0f;
+            rear->animEnd = 201.0f;
+            rear->animSpeed = 0.4f;
+            rear->frame = 77.0f;
+        }
+    }
+
     /* Doors along the escort route slide open as the player or the
      * escort nears (they are locked, so buttons cannot derail the
      * sequence). */
@@ -3627,10 +3740,12 @@ static void introUpdate(void) {
                         d->frame = 39.0f;
                     }
                 } else if (d->animStart == 39.0f) {
-                    d->animStart = 357.0f;
-                    d->animEnd = 381.0f;
-                    d->animSpeed = 0.12f;
-                    d->frame = 357.0f;
+                    /* Arrived: settle into a standing idle (not the
+                     * cowering pose, which read as dead). */
+                    d->animStart = 210.0f;
+                    d->animEnd = 235.0f;
+                    d->animSpeed = 0.1f;
+                    d->frame = 210.0f;
                 }
             }
             if (l[0] > 1100.0f) {
@@ -3716,9 +3831,9 @@ static void introPlaceHumans(void) {
         { &introScientistRT, -3073.0f, -315.0f, -2165.0f, 225.0f,
           NULL, 1, "scientist.png", 182, 182, 0.0f, 182 },
         { &introClassDRT, 208.0f, 0.0f, 480.0f, 270.0f,
-          NULL, 1, NULL, 357, 381, 0.12f, 360 },   /* chamber D #1 */
+          NULL, 1, NULL, 210, 235, 0.1f, 210 },    /* chamber D #1 */
         { &introClassDRT, 160.0f, 0.0f, 320.0f, 270.0f,
-          NULL, 1, "class_d(2).png", 357, 381, 0.12f, 372 }, /* D #2 */
+          NULL, 1, "class_d(2).png", 210, 235, 0.1f, 220 }, /* D #2 */
         { &introGuardRT, -3800.0f, 250.0f, -4088.0f, 0.0f,
           NULL, 1, NULL, 77, 201, 0.4f, 90 },      /* south balcony */
         { &introGuardRT, -4200.0f, 250.0f, -4088.0f, 0.0f,
@@ -10219,6 +10334,9 @@ static void enterMenu(void) {
  * like the source's PlayMovie, a clip that will not open is simply
  * skipped - there is no title-card substitute. */
 static void playStartupVideos(void) {
+#if DIAG_DISABLE_VIDEOS
+    return;
+#endif
     if (!startupVideosEnabled) return;
     static const char *CLIPS[4] = {
         "startup_Undertow", "startup_TSS", "startup_UET", "startup_Warning",
@@ -10305,6 +10423,9 @@ static void renderLoadingScreen(const char *step, int percent) {
  * Deferred to the first game frame via this flag so it runs outside the
  * menu's HUD 2D scope. */
 static void playIntroVideo(void) {
+#if DIAG_DISABLE_VIDEOS
+    return;
+#endif
     if (!videoInit()) return;
     audioStopMusic();
     videoPlayFile(MENU_DIR "/startup_Intro1.mp4");
@@ -11161,12 +11282,15 @@ int main(void) {
         char line1[320];
         snprintf(line1, sizeof(line1), "%s   [%s]", statusLine,
                  haveData ? roomNameAt(camPos) : "-");
-        char line2[200];
+        char line2[256];
+        struct mallinfo hmi = mallinfo();
         snprintf(line2, sizeof(line2),
-                 "fps=%.0f  au=%d/%d open-fail=%d dec-fail=%d  x: door"
-                 "  up: %s  start: menu", fps, audioStatus(),
-                 audioSoundCount(), audioLoadFopenFails(),
-                 audioLoadDecodeFails(), walkMode ? "WALK" : "fly");
+                 "bld=%s fps=%.0f dec-fail=%d texfail=%d tpl=%d act=%d "
+                 "vram=%uK heap=%uK",
+                 PORT_BUILD_TAG, fps, audioLoadDecodeFails(), texFailCount,
+                 tplFailCount, activeCount,
+                 (unsigned)(vglMemFree(VGL_MEM_VRAM) / 1024),
+                 (unsigned)((unsigned)hmi.fordblks / 1024));
         drawHud(line1, line2, toastTimer > 0 ? toastMsg : NULL, NULL);
 
         /* Vitals meters, the inventory and the blink blackout share the

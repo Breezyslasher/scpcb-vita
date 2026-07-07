@@ -43,10 +43,11 @@ static void alog(const char *fmt, ...) {
 
 typedef struct {
     char *path;
-    int16_t *pcm;        /* interleaved */
+    int16_t *pcm;        /* interleaved; NULL until first play (lazy) */
     uint32_t frames;
     int channels;        /* 1 or 2 */
     int rate;
+    int failed;          /* decode failed; don't rehit the disk */
 } Sound;
 
 typedef struct {
@@ -277,22 +278,15 @@ static int loadFopenFails, loadDecodeFails;
 int audioLoadFopenFails(void) { return loadFopenFails; }
 int audioLoadDecodeFails(void) { return loadDecodeFails; }
 
-int audioLoad(const char *path) {
-    for (int i = 0; i < soundCount; i++) {
-        if (strcmp(sounds[i].path, path) == 0) return i;
-    }
-    if (soundCount >= MAX_SOUNDS) {
-        alog("load FULL %s", path);
-        return -1;
-    }
-
-    FILE *probe = fopen(path, "rb");
-    if (!probe) {
-        loadFopenFails++;
-        alog("load OPEN-FAIL %s", path);
-        return -1;
-    }
-    fclose(probe);
+/* Decode a registered sound's PCM on first play. Decoding every
+ * preloaded sound up front held >100 MB of PCM in the newlib heap and
+ * exhausted it, which then made room-template / texture / later sound
+ * loads fail (the black-world bug); lazily the resident set is only
+ * what actually plays. */
+static int ensureDecoded(int idx) {
+    Sound *s = &sounds[idx];
+    if (s->pcm) return 1;
+    if (s->failed) return 0;
 
     /* Decode manually: stb_vorbis_decode_filename() treats a
      * zero-sample frame as end-of-stream, but some encoders (the menu
@@ -300,11 +294,12 @@ int audioLoad(const char *path) {
      * whole file decode to 0 frames. Only two consecutive empty reads
      * mean real EOF. */
     int err = 0;
-    stb_vorbis *v = stb_vorbis_open_filename(path, &err, NULL);
+    stb_vorbis *v = stb_vorbis_open_filename(s->path, &err, NULL);
     if (!v) {
+        s->failed = 1;
         loadDecodeFails++;
-        alog("load DECODE-FAIL %s open err=%d", path, err);
-        return -1;
+        alog("decode DECODE-FAIL %s open err=%d", s->path, err);
+        return 0;
     }
     stb_vorbis_info info = stb_vorbis_get_info(v);
     int chans = info.channels >= 2 ? 2 : 1;
@@ -336,22 +331,50 @@ int audioLoad(const char *path) {
     int frames = (int)total;
     if (frames <= 0 || !pcm) {
         free(pcm);
+        s->failed = 1;
         loadDecodeFails++;
-        alog("load DECODE-FAIL %s frames=%d", path, frames);
+        alog("decode DECODE-FAIL %s frames=%d", s->path, frames);
+        return 0;
+    }
+
+    /* Publish pcm/rate before any channel can reference the sound. */
+    s->frames = (uint32_t)frames;
+    s->channels = chans;
+    s->rate = rate;
+    s->pcm = pcm;
+    return 1;
+}
+
+int audioLoad(const char *path) {
+    for (int i = 0; i < soundCount; i++) {
+        if (strcmp(sounds[i].path, path) == 0) return i;
+    }
+    if (soundCount >= MAX_SOUNDS) {
+        alog("load FULL %s", path);
         return -1;
     }
 
+    /* Registration only confirms the file exists; PCM decodes lazily on
+     * first play (see ensureDecoded). */
+    FILE *probe = fopen(path, "rb");
+    if (!probe) {
+        loadFopenFails++;
+        alog("load OPEN-FAIL %s", path);
+        return -1;
+    }
+    fclose(probe);
+
     Sound *s = &sounds[soundCount];
     s->path = strdup(path);
-    s->pcm = pcm;
-    s->frames = (uint32_t)frames;
-    s->channels = chans >= 2 ? 2 : 1;
-    s->rate = rate;
+    s->pcm = NULL;
+    s->frames = 0;
+    s->channels = 1;
+    s->rate = OUT_RATE;
+    s->failed = 0;
     if (!s->path) {
         alog("load OOM %s", path);
         return -1;
     }
-    alog("load OK %s frames=%d ch=%d rate=%d", path, frames, chans, rate);
     return soundCount++;
 }
 
@@ -378,6 +401,7 @@ void audioSetMusicVolume(float vol) {
 
 void audioPlay(int sound, float vol, float pan) {
     if (sound < 0 || sound >= soundCount) return;
+    if (!ensureDecoded(sound)) return;
     vol *= sfxVol;
     if (pan < -1) pan = -1;
     if (pan > 1) pan = 1;
@@ -406,7 +430,7 @@ void audioPlay3D(int sound, const float pos[3], const float listener[3],
 }
 
 void audioLoopAmbience(int sound, float vol) {
-    if (sound < 0 || sound >= soundCount) {
+    if (sound < 0 || sound >= soundCount || !ensureDecoded(sound)) {
         channels[AMBIENCE_CHANNEL].sound = -1;
         return;
     }
