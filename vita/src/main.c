@@ -50,7 +50,12 @@ unsigned int _newlib_heap_size_user = 220 * 1024 * 1024;
 
 #define DATA_ROOT "ux0:data/scpcb-ue"
 /* Shown in the debug HUD so a stale VPK install is instantly visible. */
-#define PORT_BUILD_TAG "diagmem1"
+#define PORT_BUILD_TAG "diag2-novid"
+
+/* Diagnostic: skip ALL video playback (boot clips and intro) while
+ * keeping everything else identical, to isolate whether the video
+ * player's GL usage is what blacks out the world pass. */
+#define DIAG_DISABLE_VIDEOS 1
 
 #define MAP_DIR DATA_ROOT "/GFX/Map"
 #define MAP_TEXTURES_DIR DATA_ROOT "/GFX/Map/Textures"
@@ -10269,6 +10274,9 @@ static void enterMenu(void) {
  * like the source's PlayMovie, a clip that will not open is simply
  * skipped - there is no title-card substitute. */
 static void playStartupVideos(void) {
+#if DIAG_DISABLE_VIDEOS
+    return;
+#endif
     if (!startupVideosEnabled) return;
     static const char *CLIPS[4] = {
         "startup_Undertow", "startup_TSS", "startup_UET", "startup_Warning",
@@ -10355,6 +10363,9 @@ static void renderLoadingScreen(const char *step, int percent) {
  * Deferred to the first game frame via this flag so it runs outside the
  * menu's HUD 2D scope. */
 static void playIntroVideo(void) {
+#if DIAG_DISABLE_VIDEOS
+    return;
+#endif
     if (!videoInit()) return;
     audioStopMusic();
     videoPlayFile(MENU_DIR "/startup_Intro1.mp4");
