@@ -52,7 +52,7 @@ unsigned int _newlib_heap_size_user = 220 * 1024 * 1024;
 
 #define DATA_ROOT "ux0:data/scpcb-ue"
 /* Shown in the debug HUD so a stale VPK install is instantly visible. */
-#define PORT_BUILD_TAG "diag4-lazysnd"
+#define PORT_BUILD_TAG "heapfix1"
 
 /* Diagnostic switch: set to 1 to skip ALL video playback (boot clips
  * and intro). The diag2-novid device test proved the video player was
@@ -10555,9 +10555,9 @@ int main(void) {
         pendingSeed = (uint32_t)(sceKernelGetProcessTimeWide() & 0xFFFFFF) | 1u;
         /* Play the boot videos now, before the door/NPC/texture/sound
          * load fills the heap: sceAvPlayer needs a few MB of contiguous
-         * CPU RAM for its demux/decode buffers, and after loadSounds
-         * decodes every SFX to PCM there is none left (the device log
-         * showed its 1.5 MB init alloc returning NULL). */
+         * CPU RAM for its demux/decode buffers, so give it the emptiest
+         * heap of the session (sounds now decode lazily, but the door/
+         * NPC/texture load below still costs real memory). */
         playStartupVideos();
         /* Heavy asset + audio load, behind the loading screen so the
          * player sees progress instead of a black screen. */
@@ -10575,6 +10575,16 @@ int main(void) {
         renderLoadingScreen("LOADING DECALS", 90);
         decalsInit();
         renderLoadingScreen("DONE", 100);
+        /* The loading art is never drawn again; return its VRAM (the
+         * world fills the pool completely, so every MB counts). */
+        if (loadBackTex) {
+            glDeleteTextures(1, &loadBackTex);
+            loadBackTex = 0;
+        }
+        if (loadImgTex) {
+            glDeleteTextures(1, &loadImgTex);
+            loadImgTex = 0;
+        }
         /* Boot to the title menu; the world is generated when the
          * player starts or loads a game. */
         enterMenu();

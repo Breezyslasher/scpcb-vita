@@ -118,6 +118,20 @@ Updated as features land. States: **done** / **partial** / **missing**.
 | Door/interact/horror/intro voice sets | done | |
 | Ambient room emitters | done | Source AmbientSFX: every ~15-45 s a random distant one-shot from the current zone's set (SFX/Ambient/Zone1-3, or Forest in the SCP-860 room) drifts in - a scream, a groan, dripping - positioned off to one side of the player and attenuated with distance, so the facility never falls silent. Loaded on demand (the audio cache dedups by path; MAX_SOUNDS raised to fit). Suspended in the intro / pocket / mask dimensions |
 
+## Memory model (the black-world postmortem)
+
+The port once decoded every preloaded sound to PCM at boot (>100 MB),
+running the 220 MB newlib heap to ~230 MB used / <1 MB free in-game.
+Under that pressure allocations failed all over: sound decodes
+(dec-fail), texture decodes (texfail), and - fatally - room-template
+loads, which `templateEnsureStep` latched dead silently, so
+`activeCount` stayed 0 and the whole 3D pass was skipped: black world
+with a live HUD. Hardware-bisected with the on-screen `bld=` tag and
+memory HUD; fixed by decoding sounds lazily on first play (boot heap
+now ~42-67 MB used), retrying + logging template failures to
+`ux0:data/scpcb-ue/render_log.txt`, and freeing the loading-screen art
+after boot. First play of a long sound costs a one-time decode hitch.
+
 ## Known visual gaps
 
 - Green-tinted windows reported on device; repo data verified neutral
