@@ -52,7 +52,7 @@ unsigned int _newlib_heap_size_user = 220 * 1024 * 1024;
 
 #define DATA_ROOT "ux0:data/scpcb-ue"
 /* Shown in the debug HUD so a stale VPK install is instantly visible. */
-#define PORT_BUILD_TAG "heapfix1"
+#define PORT_BUILD_TAG "perf1"
 
 /* Diagnostic switch: set to 1 to skip ALL video playback (boot clips
  * and intro). The diag2-novid device test proved the video player was
@@ -243,9 +243,13 @@ typedef struct {
 
 typedef struct {
     int state;        /* 0 = not loaded, 1 = ok, -1 = failed,
-                         2 = geometry built, textures loading */
+                         3 = props loading, 4 = collision pending,
+                         2 = textures loading, 5 = VBO uploads */
     int retries;      /* failed attempts so far (transient OOM retries) */
     uint32_t texDone; /* batches with textures resolved (state 2) */
+    uint32_t propDone;/* mesh entities examined for props (state 3) */
+    uint32_t vboDone; /* batches with buffers uploaded (state 5) */
+    RMesh *mesh;      /* kept alive between states 0 and 4 */
     Scene *scene;
     BatchGL *gl;
     CollisionWorld *col;
@@ -269,6 +273,7 @@ static void templateUnload(TemplateRT *rt) {
     free(rt->gl);
     sceneFree(rt->scene);
     collisionFree(rt->col);
+    rmeshFree(rt->mesh); /* set only while a load is mid-flight */
     memset(rt, 0, sizeof(*rt));
 }
 
@@ -284,6 +289,15 @@ static void templateUnload(TemplateRT *rt) {
  * template failed). */
 #define TPL_MAX_RETRIES 8
 
+/* One SMALL unit of loading per call, so the per-frame budget loop in
+ * updateActiveRooms can spread a room's load over many frames:
+ *   0: mesh read+parse, scene build, emitters, batch table  -> 3
+ *   3: ONE prop model appended per call                     -> 4
+ *   4: collision build, mesh freed                          -> 2
+ *   2: ONE batch's textures resolved+decoded per call       -> 5
+ *   5: a few VBO/IBO uploads per call                       -> 1
+ * (Profiled on device: the old single-frame state 0 cost 150-450 ms,
+ * and 2-batch texture steps cost 25-80 ms per frame for seconds.) */
 static void templateEnsureStep(int idx) {
     TemplateRT *rt = &tplRT[idx];
     if (rt->state == 1) return;
@@ -303,36 +317,23 @@ static void templateEnsureStep(int idx) {
         char path[1024];
         snprintf(path, sizeof(path), MAP_DIR "/%s", info->meshPath);
         char err[128];
-        RMesh *mesh = rmeshLoadFile(path, err, sizeof(err));
-        if (!mesh) {
+        rt->mesh = rmeshLoadFile(path, err, sizeof(err));
+        if (!rt->mesh) {
             if (rt->retries == 1) tplFailCount++;
             plog("tpl FAIL rmesh %s: %s (try %d)", path, err, rt->retries);
             return;
         }
-        rt->scene = sceneBuild(mesh);
+        rt->scene = sceneBuild(rt->mesh);
         if (!rt->scene) {
-            rmeshFree(mesh);
+            rmeshFree(rt->mesh);
+            rt->mesh = NULL;
             if (rt->retries == 1) tplFailCount++;
             plog("tpl FAIL sceneBuild %s (try %d)", path, rt->retries);
             return;
         }
-        for (uint32_t i = 0; i < mesh->entityCount; i++) {
-            const RMeshEntity *e = &mesh->entities[i];
-            if (e->type != RMESH_ENTITY_PROP || !e->u.prop.file) continue;
-            B3DModel *model = propModelGet(e->u.prop.file);
-            if (!model) continue;
-            float pos[3] = { e->x, e->y, e->z };
-            float euler[3] = { e->u.prop.pitch, e->u.prop.yaw,
-                               e->u.prop.roll };
-            float scl[3] = { e->u.prop.scaleX, e->u.prop.scaleY,
-                             e->u.prop.scaleZ };
-            sceneAppendB3D(rt->scene, model, pos, euler, scl,
-                           e->u.prop.texture);
-        }
-        rt->col = collisionBuild(rt->scene, mesh);
         rt->emitterCount = 0;
-        for (uint32_t i = 0; i < mesh->entityCount; i++) {
-            const RMeshEntity *e = &mesh->entities[i];
+        for (uint32_t i = 0; i < rt->mesh->entityCount; i++) {
+            const RMeshEntity *e = &rt->mesh->entities[i];
             if (e->type != RMESH_ENTITY_SOUND_EMITTER) continue;
             if (rt->emitterCount >= MAX_ROOM_EMITTERS) break;
             RoomEmitter *em = &rt->emitters[rt->emitterCount++];
@@ -345,7 +346,43 @@ static void templateEnsureStep(int idx) {
             em->range = e->u.soundEmitter.range;
             if (em->range < 256.0f) em->range = 1024.0f;
         }
-        rmeshFree(mesh);
+        if (rt->retries > 1) {
+            tplFailCount--; /* a retry recovered it */
+            plog("tpl RECOVERED %s (try %d)", path, rt->retries);
+        }
+        rt->propDone = 0;
+        rt->state = 3;
+        return;
+    }
+
+    if (rt->state == 3) {
+        /* One prop per call: a cold B3D load is a one-time 30-90 ms
+         * file read + parse, so it must not share a frame with the
+         * mesh parse or other props. */
+        while (rt->propDone < rt->mesh->entityCount) {
+            const RMeshEntity *e = &rt->mesh->entities[rt->propDone++];
+            if (e->type != RMESH_ENTITY_PROP || !e->u.prop.file) continue;
+            B3DModel *model = propModelGet(e->u.prop.file);
+            if (!model) continue;
+            float pos[3] = { e->x, e->y, e->z };
+            float euler[3] = { e->u.prop.pitch, e->u.prop.yaw,
+                               e->u.prop.roll };
+            float scl[3] = { e->u.prop.scaleX, e->u.prop.scaleY,
+                             e->u.prop.scaleZ };
+            sceneAppendB3D(rt->scene, model, pos, euler, scl,
+                           e->u.prop.texture);
+            return; /* one appended; the rest on later calls */
+        }
+        rt->state = 4;
+        return;
+    }
+
+    if (rt->state == 4) {
+        /* Collision includes the prop triangles, so it must run after
+         * every prop is appended. */
+        rt->col = collisionBuild(rt->scene, rt->mesh);
+        rmeshFree(rt->mesh);
+        rt->mesh = NULL;
         rt->gl = (BatchGL *)calloc(
             rt->scene->batchCount ? rt->scene->batchCount : 1,
             sizeof(BatchGL));
@@ -355,44 +392,51 @@ static void templateEnsureStep(int idx) {
             collisionFree(rt->col);
             rt->col = NULL;
             if (rt->retries == 1) tplFailCount++;
-            plog("tpl FAIL gl-calloc %s (try %d)", path, rt->retries);
+            plog("tpl FAIL gl-calloc idx=%d (try %d)", idx, rt->retries);
+            rt->state = -1;
             return;
-        }
-        if (rt->retries > 1) {
-            tplFailCount--; /* a retry recovered it */
-            plog("tpl RECOVERED %s (try %d)", path, rt->retries);
         }
         rt->texDone = 0;
         rt->state = 2;
         return;
     }
 
-    /* state 2: a couple of texture batches per step. */
-    uint32_t end = rt->texDone + 2;
-    if (end > rt->scene->batchCount) end = rt->scene->batchCount;
-    for (; rt->texDone < end; rt->texDone++) {
-        const SceneBatch *b = &rt->scene->batches[rt->texDone];
-        rt->gl[rt->texDone].diffuse = textureGet(b->diffuseName);
-        rt->gl[rt->texDone].lightmap = textureGet(b->lightmapName);
+    if (rt->state == 2) {
+        /* One batch's textures per call: each cache miss pays a PNG
+         * decode (~13-60 ms on the Vita CPU), the dominant cost of the
+         * old multi-second fps drop. */
+        if (rt->texDone < rt->scene->batchCount) {
+            const SceneBatch *b = &rt->scene->batches[rt->texDone];
+            rt->gl[rt->texDone].diffuse = textureGet(b->diffuseName);
+            rt->gl[rt->texDone].lightmap = textureGet(b->lightmapName);
+            rt->texDone++;
+            return;
+        }
+        rt->vboDone = 0;
+        rt->state = 5;
+        return;
     }
-    if (rt->texDone < rt->scene->batchCount) return;
 
-    /* Final step: VBO uploads (cheap). */
-    for (uint32_t i = 0; i < rt->scene->batchCount; i++) {
-        const SceneBatch *b = &rt->scene->batches[i];
-        glGenBuffers(1, &rt->gl[i].vbo);
-        glBindBuffer(GL_ARRAY_BUFFER, rt->gl[i].vbo);
+    /* state 5: a few VBO/IBO uploads per call (the full-room burst was
+     * a 10-40 ms spike on prop-heavy rooms). */
+    uint32_t end = rt->vboDone + 8;
+    if (end > rt->scene->batchCount) end = rt->scene->batchCount;
+    for (; rt->vboDone < end; rt->vboDone++) {
+        const SceneBatch *b = &rt->scene->batches[rt->vboDone];
+        glGenBuffers(1, &rt->gl[rt->vboDone].vbo);
+        glBindBuffer(GL_ARRAY_BUFFER, rt->gl[rt->vboDone].vbo);
         glBufferData(GL_ARRAY_BUFFER,
                      (GLsizeiptr)(b->vertexCount * sizeof(SceneVertex)),
                      b->vertices, GL_STATIC_DRAW);
-        glGenBuffers(1, &rt->gl[i].ibo);
-        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, rt->gl[i].ibo);
+        glGenBuffers(1, &rt->gl[rt->vboDone].ibo);
+        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, rt->gl[rt->vboDone].ibo);
         glBufferData(GL_ELEMENT_ARRAY_BUFFER,
                      (GLsizeiptr)(b->indexCount * sizeof(uint16_t)),
                      b->indices, GL_STATIC_DRAW);
     }
     glBindBuffer(GL_ARRAY_BUFFER, 0);
     glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
+    if (rt->vboDone < rt->scene->batchCount) return;
     rt->state = 1;
 }
 
@@ -1398,7 +1442,15 @@ static void updateActiveRooms(const float pos[3]) {
         }
         TemplateRT *rt = &tplRT[p->templateIndex];
         if (self && rt->state != 1 && rt->state != -1) {
+            /* The floor under the player cannot wait; log the stall so
+             * device captures show when the prefetch lost the race. */
+            uint64_t t0 = sceKernelGetProcessTimeWide();
             templateEnsure(p->templateIndex);
+            uint64_t us = sceKernelGetProcessTimeWide() - t0;
+            if (us > 8000) {
+                plog("hitch: blocking room load idx=%d %ums",
+                     p->templateIndex, (unsigned)(us / 1000));
+            }
         } else if (ring <= 2 && rt->state != 1 && rt->state != -1) {
             /* Prefer nearer rings; among equals prefer rooms already
              * mid-load so they finish sooner. */
@@ -1412,7 +1464,23 @@ static void updateActiveRooms(const float pos[3]) {
             activeRooms[activeCount++] = p;
         }
     }
-    if (stepIdx >= 0) templateEnsureStep(stepIdx);
+    if (stepIdx >= 0) {
+        /* Loading budget: ~3 ms of streaming work per frame. Steps are
+         * small units now, so several run when they are cheap (cached
+         * textures, empty prop slots) and a single expensive one (PNG
+         * decode, cold prop) ends the frame's work. */
+        uint64_t t0 = sceKernelGetProcessTimeWide();
+        uint64_t us;
+        do {
+            templateEnsureStep(stepIdx);
+            us = sceKernelGetProcessTimeWide() - t0;
+        } while (tplRT[stepIdx].state != 1 && tplRT[stepIdx].state != -1
+                 && us < 3000);
+        if (us > 8000) {
+            plog("hitch: stream step idx=%d state=%d %ums", stepIdx,
+                 tplRT[stepIdx].state, (unsigned)(us / 1000));
+        }
+    }
 }
 
 static int inIntroBounds(float x, float z);
@@ -10571,7 +10639,13 @@ int main(void) {
         texButtonRed = textureGet("keypad_locked.png");
         pdThroneTex = textureGet("scp_106_eyes.png");
         renderLoadingScreen("LOADING SOUNDS", 70);
-        if (audioOk) loadSounds();
+        if (audioOk) {
+            loadSounds();
+            /* Warm the small, hot SFX so first plays are instant; big
+             * files (voice lines, stingers, ambience) decode on the
+             * decoder thread when first triggered. */
+            audioPredecodeSmall(160 * 1024, 24 * 1024 * 1024);
+        }
         renderLoadingScreen("LOADING DECALS", 90);
         decalsInit();
         renderLoadingScreen("DONE", 100);
@@ -10601,10 +10675,21 @@ int main(void) {
     while (running) {
         fpsFrames++;
         uint64_t now = sceKernelGetProcessTimeWide();
+        /* Worst frame in the last fps window: the smoothed fps hides
+         * single-frame stalls, this exposes them. */
+        static uint64_t framePrevUs;
+        static uint64_t frameMaxUs;
+        static unsigned worstMs;
+        if (framePrevUs && now - framePrevUs > frameMaxUs) {
+            frameMaxUs = now - framePrevUs;
+        }
+        framePrevUs = now;
         if (now - fpsLast >= 500000) {
             fps = fpsFrames * 1000000.0f / (float)(now - fpsLast);
             fpsFrames = 0;
             fpsLast = now;
+            worstMs = (unsigned)(frameMaxUs / 1000);
+            frameMaxUs = 0;
         }
 
         inputUpdate();
@@ -10971,6 +11056,7 @@ int main(void) {
                 updateAmbientSfx();
                 updateRoomEvents();
             }
+            audioService(); /* start ambience whose PCM just finished */
             updatePocketDimension();
             updatePlayerCondition();
             teslaUpdate();
@@ -11295,10 +11381,10 @@ int main(void) {
         char line2[256];
         struct mallinfo hmi = mallinfo();
         snprintf(line2, sizeof(line2),
-                 "bld=%s fps=%.0f dec-fail=%d texfail=%d tpl=%d act=%d "
-                 "vram=%uK heap=%uK",
-                 PORT_BUILD_TAG, fps, audioLoadDecodeFails(), texFailCount,
-                 tplFailCount, activeCount,
+                 "bld=%s fps=%.0f ms=%u dec-fail=%d texfail=%d tpl=%d "
+                 "act=%d vram=%uK heap=%uK",
+                 PORT_BUILD_TAG, fps, worstMs, audioLoadDecodeFails(),
+                 texFailCount, tplFailCount, activeCount,
                  (unsigned)(vglMemFree(VGL_MEM_VRAM) / 1024),
                  (unsigned)((unsigned)hmi.fordblks / 1024));
         drawHud(line1, line2, toastTimer > 0 ? toastMsg : NULL, NULL);

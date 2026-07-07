@@ -43,11 +43,12 @@ static void alog(const char *fmt, ...) {
 
 typedef struct {
     char *path;
-    int16_t *pcm;        /* interleaved; NULL until first play (lazy) */
+    int16_t *volatile pcm; /* interleaved; NULL until decoded */
     uint32_t frames;
     int channels;        /* 1 or 2 */
     int rate;
     int failed;          /* decode failed; don't rehit the disk */
+    volatile int wanted; /* queued for the decoder thread */
 } Sound;
 
 typedef struct {
@@ -261,6 +262,11 @@ int audioInit(void) {
         return 0;
     }
     sceKernelStartThread(mixThread, 0, NULL);
+    /* PCM decoder: low priority so it never starves the mixer or the
+     * render loop; a lost thread just means decodes stay boot-only. */
+    SceUID decThread = sceKernelCreateThread("audio_decode", decoderLoop,
+                                             160, 0x40000, 0, 0, NULL);
+    if (decThread >= 0) sceKernelStartThread(decThread, 0, NULL);
     initState = 1;
     return 1;
 }
@@ -278,12 +284,11 @@ static int loadFopenFails, loadDecodeFails;
 int audioLoadFopenFails(void) { return loadFopenFails; }
 int audioLoadDecodeFails(void) { return loadDecodeFails; }
 
-/* Decode a registered sound's PCM on first play. Decoding every
- * preloaded sound up front held >100 MB of PCM in the newlib heap and
- * exhausted it, which then made room-template / texture / later sound
- * loads fail (the black-world bug); lazily the resident set is only
- * what actually plays. */
-static int ensureDecoded(int idx) {
+/* Full PCM decode of one registered sound. Runs on the decoder thread
+ * (or on the main thread only during the boot loading screen): a long
+ * OGG costs 0.1-3 s on the Vita CPU, which froze gameplay frames when
+ * it ran inside audioPlay on first play. */
+static int decodeSoundNow(int idx) {
     Sound *s = &sounds[idx];
     if (s->pcm) return 1;
     if (s->failed) return 0;
@@ -337,12 +342,68 @@ static int ensureDecoded(int idx) {
         return 0;
     }
 
-    /* Publish pcm/rate before any channel can reference the sound. */
+    /* Publish everything before pcm: readers gate on pcm != NULL. */
     s->frames = (uint32_t)frames;
     s->channels = chans;
     s->rate = rate;
+    __sync_synchronize();
     s->pcm = pcm;
     return 1;
+}
+
+/* Main-thread check: never decodes. A miss queues the sound for the
+ * decoder thread and reports not-ready; the caller skips or defers. */
+static int ensureDecoded(int idx) {
+    Sound *s = &sounds[idx];
+    if (s->pcm) {
+        __sync_synchronize();
+        return 1;
+    }
+    if (s->failed) return 0;
+    s->wanted = 1;
+    return 0;
+}
+
+/* Decoder thread: scans for wanted sounds and decodes them off the
+ * render loop. Priority sits below the mixer so decoding never starves
+ * audio output. */
+static int decoderLoop(SceSize argSize, void *argp) {
+    (void)argSize;
+    (void)argp;
+    while (running) {
+        int worked = 0;
+        int count = soundCount;
+        for (int i = 0; i < count; i++) {
+            if (sounds[i].wanted && !sounds[i].pcm && !sounds[i].failed) {
+                decodeSoundNow(i);
+                sounds[i].wanted = 0;
+                worked = 1;
+            }
+        }
+        if (!worked) sceKernelDelayThread(10 * 1000);
+    }
+    return sceKernelExitDeleteThread(0);
+}
+
+void audioPredecodeSmall(unsigned maxFileBytes, unsigned maxTotalPcmBytes) {
+    /* Boot-time warmup for the small, hot SFX (steps, doors, buttons):
+     * their first play must not wait on the decoder thread. Bounded by
+     * file size and by a total PCM budget so this can never recreate
+     * the decode-everything heap exhaustion. */
+    unsigned total = 0;
+    for (int i = 0; i < soundCount && total < maxTotalPcmBytes; i++) {
+        if (sounds[i].pcm || sounds[i].failed) continue;
+        FILE *f = fopen(sounds[i].path, "rb");
+        if (!f) continue;
+        fseek(f, 0, SEEK_END);
+        long sz = ftell(f);
+        fclose(f);
+        if (sz <= 0 || (unsigned)sz > maxFileBytes) continue;
+        if (decodeSoundNow(i)) {
+            total += sounds[i].frames * (unsigned)sounds[i].channels * 2u;
+        }
+    }
+    alog("predecode: %u KB PCM resident", total / 1024);
 }
 
 int audioLoad(const char *path) {
@@ -371,10 +432,13 @@ int audioLoad(const char *path) {
     s->channels = 1;
     s->rate = OUT_RATE;
     s->failed = 0;
+    s->wanted = 0;
     if (!s->path) {
         alog("load OOM %s", path);
         return -1;
     }
+    /* Publish the entry before the decoder thread can see the count. */
+    __sync_synchronize();
     return soundCount++;
 }
 
@@ -429,13 +493,42 @@ void audioPlay3D(int sound, const float pos[3], const float listener[3],
     audioPlay(sound, vol, pan * 0.7f);
 }
 
+/* Ambience whose PCM is still decoding: remembered here and started by
+ * audioService once the decoder thread finishes, so entering a room
+ * with a new emitter never stalls a frame (it just fades in late). */
+static volatile int ambPending = -1;
+static float ambPendingVol;
+
 void audioLoopAmbience(int sound, float vol) {
-    if (sound < 0 || sound >= soundCount || !ensureDecoded(sound)) {
+    ambPending = -1;
+    if (sound < 0 || sound >= soundCount) {
         channels[AMBIENCE_CHANNEL].sound = -1;
+        return;
+    }
+    if (!ensureDecoded(sound)) {
+        channels[AMBIENCE_CHANNEL].sound = -1; /* silent while decoding */
+        if (!sounds[sound].failed) {
+            ambPending = sound;
+            ambPendingVol = vol;
+        }
         return;
     }
     vol *= sfxVol;
     startChannel(AMBIENCE_CHANNEL, sound, vol, vol, 1);
+}
+
+void audioService(void) {
+    int p = ambPending;
+    if (p >= 0) {
+        if (sounds[p].failed) {
+            ambPending = -1;
+        } else if (sounds[p].pcm) {
+            __sync_synchronize();
+            ambPending = -1;
+            float vol = ambPendingVol * sfxVol;
+            startChannel(AMBIENCE_CHANNEL, p, vol, vol, 1);
+        }
+    }
 }
 
 void audioStreamMusic(const char *path, float vol, int loop) {

@@ -132,6 +132,24 @@ now ~42-67 MB used), retrying + logging template failures to
 `ux0:data/scpcb-ue/render_log.txt`, and freeing the loading-screen art
 after boot. First play of a long sound costs a one-time decode hitch.
 
+## Room-streaming performance
+
+The fps used to drop ~5 and stay unstable for a few seconds whenever a
+new room streamed in. Profiled (static analysis + host measurement of
+the real loaders, adversarially verified): texture steps decoded PNGs
+2 batches per frame at ~13-60 ms each on the Vita CPU, every cache miss
+also paid an unindexed readdir scan of 300+ entry directories, state 0
+did mesh parse + all props + collision in one frame (150-450 ms), the
+VBO upload burst added 10-40 ms, and entering a room with a new sound
+emitter full-decoded its OGG on the main thread (a 30 s ambience loop =
+1-3 s frozen). Fixes: per-directory listing cache in textureResolve;
+the load pipeline split into small per-call units (mesh, one prop,
+collision, one texture batch, 8 VBOs) driven by a ~3 ms per-frame
+budget; sound PCM decodes on a low-priority decoder thread (ambience
+starts when ready via audioService; small hot SFX pre-decode at boot so
+first plays stay instant). Frames stalling >8 ms in the loader log to
+render_log.txt, and the debug HUD shows the worst frame ms per window.
+
 ## Known visual gaps
 
 - Green-tinted windows reported on device; repo data verified neutral

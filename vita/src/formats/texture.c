@@ -275,6 +275,64 @@ static int stemEqNoCase(const char *a, const char *b) {
     return 1;
 }
 
+/* Directory-listing cache. On the Vita's storage every resolve
+ * otherwise pays opendir/readdir over 300+ entry directories
+ * (milliseconds of I/O each), and the room-streaming path resolves
+ * several names per frame - a measured contributor to the fps drop
+ * while rooms load. Each directory is read once and matched from
+ * memory afterwards; the asset set never changes mid-run. */
+#define DIRCACHE_MAX 16
+
+typedef struct {
+    char *path;
+    char **names;
+    size_t count;
+} DirListing;
+
+static DirListing dirCache[DIRCACHE_MAX];
+static size_t dirCacheCount;
+
+static const DirListing *dirListingGet(const char *path) {
+    for (size_t i = 0; i < dirCacheCount; i++) {
+        if (strcmp(dirCache[i].path, path) == 0) return &dirCache[i];
+    }
+    if (dirCacheCount >= DIRCACHE_MAX) return NULL;
+    /* Read it once; a directory that fails to open caches as empty so
+     * the filesystem is not retried on every resolve. */
+    char **names = NULL;
+    size_t count = 0, cap = 0;
+    DIR *d = opendir(path);
+    if (d) {
+        struct dirent *de;
+        while ((de = readdir(d)) != NULL) {
+            if (de->d_name[0] == '.') continue;
+            if (count == cap) {
+                size_t ncap = cap ? cap * 2 : 64;
+                char **grown =
+                    (char **)realloc(names, ncap * sizeof(char *));
+                if (!grown) break;
+                names = grown;
+                cap = ncap;
+            }
+            names[count] = strdup(de->d_name);
+            if (!names[count]) break;
+            count++;
+        }
+        closedir(d);
+    }
+    DirListing *dl = &dirCache[dirCacheCount];
+    dl->path = strdup(path);
+    if (!dl->path) {
+        for (size_t i = 0; i < count; i++) free(names[i]);
+        free(names);
+        return NULL;
+    }
+    dl->names = names;
+    dl->count = count;
+    dirCacheCount++;
+    return dl;
+}
+
 int textureResolve(const char *name, const char *const *searchDirs,
                    size_t searchDirCount, char *out, size_t outLen) {
     /* Texture names may carry Windows path separators; only the final
@@ -293,6 +351,21 @@ int textureResolve(const char *name, const char *const *searchDirs,
      * original engine left those surfaces untextured. */
     for (int pass = 0; pass < 2; pass++) {
         for (size_t i = 0; i < searchDirCount; i++) {
+            const DirListing *dl = dirListingGet(searchDirs[i]);
+            if (dl) {
+                for (size_t n = 0; n < dl->count; n++) {
+                    int match = pass == 0
+                                    ? strEqNoCase(dl->names[n], base)
+                                    : stemEqNoCase(dl->names[n], base);
+                    if (match) {
+                        snprintf(out, outLen, "%s/%s", searchDirs[i],
+                                 dl->names[n]);
+                        return 1;
+                    }
+                }
+                continue;
+            }
+            /* Cache table full/OOM: fall back to a direct scan. */
             DIR *d = opendir(searchDirs[i]);
             if (!d) continue;
             struct dirent *de;
