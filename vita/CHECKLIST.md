@@ -149,6 +149,14 @@ budget; sound PCM decodes on a low-priority decoder thread (ambience
 starts when ready via audioService; small hot SFX pre-decode at boot so
 first plays stay instant). Frames stalling >8 ms in the loader log to
 render_log.txt, and the debug HUD shows the worst frame ms per window.
+Second round (the on-device log then showed 25-171 ms texture batches,
+8-209 ms props and 50-210 ms mesh parses still landing on the render
+thread): all decode/parse work moved to a dedicated low-priority loader
+thread - mesh+scene build, prop B3D parse, texture PNG decode, with a
+few batches queued ahead so the worker pipelines - and the render
+thread only consumes results, uploading at most two textures per frame.
+The spawn area now loads behind a "LOADING AREA" screen instead of
+freezing the first gameplay frame for ~5 s.
 
 ## Known visual gaps
 
