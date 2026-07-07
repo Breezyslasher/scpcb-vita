@@ -157,6 +157,14 @@ few batches queued ahead so the worker pipelines - and the render
 thread only consumes results, uploading at most two textures per frame.
 The spawn area now loads behind a "LOADING AREA" screen instead of
 freezing the first gameplay frame for ~5 s.
+Third round (the log then showed one 17-133 ms hitch per room - the
+collision grid build - plus a 9 s prewarm dominated by PNG decode):
+collision builds moved to the loader thread too, and the data packager
+now writes world textures as pre-decoded raw RGBA ("VTEX" content under
+the original filenames; textureLoadFile sniffs the magic like DDS), so
+the device never runs a PNG/JPG decoder for them. Requires re-running
+the package-data job and reinstalling the data (~90 MB larger raw);
+old PNG data still works, just slower.
 
 ## Known visual gaps
 

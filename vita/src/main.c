@@ -53,7 +53,7 @@ unsigned int _newlib_heap_size_user = 220 * 1024 * 1024;
 
 #define DATA_ROOT "ux0:data/scpcb-ue"
 /* Shown in the debug HUD so a stale VPK install is instantly visible. */
-#define PORT_BUILD_TAG "perf2"
+#define PORT_BUILD_TAG "perf3"
 
 /* Diagnostic switch: set to 1 to skip ALL video playback (boot clips
  * and intro). The diag2-novid device test proved the video player was
@@ -262,7 +262,8 @@ static B3DModel *propModelGet(const char *rawName) {
  * inserts cache entries. Per-slot handshake: stage 0 (free, owned by
  * the render thread) -> 1 (queued, owned by the worker) -> 2 (done,
  * owned by the render thread again); barriers order the payload. */
-enum { LOADJOB_TEXTURE = 1, LOADJOB_MODEL = 2, LOADJOB_ROOM = 3 };
+enum { LOADJOB_TEXTURE = 1, LOADJOB_MODEL = 2, LOADJOB_ROOM = 3,
+       LOADJOB_COLLISION = 4 };
 #define LOADJOB_MAX 24
 
 typedef struct {
@@ -272,8 +273,9 @@ typedef struct {
     char err[96];         /* worker's failure reason */
     TextureImage *img;    /* LOADJOB_TEXTURE result */
     B3DModel *model;      /* LOADJOB_MODEL result */
-    RMesh *mesh;          /* LOADJOB_ROOM results */
-    Scene *scene;
+    RMesh *mesh;          /* LOADJOB_ROOM results; COLLISION input */
+    Scene *scene;         /* (COLLISION borrows these from the template) */
+    CollisionWorld *col;  /* LOADJOB_COLLISION result */
     volatile int stage;
 } LoadJob;
 
@@ -295,6 +297,8 @@ static int loaderLoop(SceSize argSize, void *argp) {
                                          sizeof(j->err));
             } else if (j->type == LOADJOB_MODEL) {
                 j->model = b3dLoadFile(j->path, j->err, sizeof(j->err));
+            } else if (j->type == LOADJOB_COLLISION) {
+                j->col = collisionBuild(j->scene, j->mesh);
             } else {
                 j->mesh = rmeshLoadFile(j->path, j->err, sizeof(j->err));
                 j->scene = j->mesh ? sceneBuild(j->mesh) : NULL;
@@ -327,6 +331,30 @@ static int loadJobPost(int type, const char *name, const char *path) {
         j->model = NULL;
         j->mesh = NULL;
         j->scene = NULL;
+        j->col = NULL;
+        __sync_synchronize();
+        j->stage = 1;
+        return i;
+    }
+    return -1;
+}
+
+/* Queue a collision build over a template's finished scene+mesh (both
+ * borrowed: the template keeps ownership and must not touch them until
+ * the job completes). */
+static int loadJobPostCollision(Scene *scene, RMesh *mesh) {
+    for (int i = 0; i < LOADJOB_MAX; i++) {
+        LoadJob *j = &loadJobs[i];
+        if (j->stage != 0) continue;
+        j->type = LOADJOB_COLLISION;
+        j->name[0] = '\0';
+        j->path[0] = '\0';
+        j->err[0] = '\0';
+        j->img = NULL;
+        j->model = NULL;
+        j->mesh = mesh;
+        j->scene = scene;
+        j->col = NULL;
         __sync_synchronize();
         j->stage = 1;
         return i;
@@ -352,7 +380,10 @@ static void loaderPump(void) {
     int consumed = 0;
     for (int i = 0; i < LOADJOB_MAX && consumed < 2; i++) {
         LoadJob *j = &loadJobs[i];
-        if (j->stage != 2 || j->type == LOADJOB_ROOM) continue;
+        if (j->stage != 2 || j->type == LOADJOB_ROOM
+            || j->type == LOADJOB_COLLISION) {
+            continue; /* room/collision jobs belong to their template */
+        }
         __sync_synchronize();
         if (j->type == LOADJOB_TEXTURE) {
             /* A blocking load may have raced the same name in; keep the
@@ -500,16 +531,23 @@ static void templateUnload(TemplateRT *rt) {
         }
     }
     if (rt->loadJob > 0) {
-        /* An async room job is in flight (map regen mid-stream): wait
-         * for the worker, then discard its result. */
+        /* An async job is in flight (map regen mid-stream): wait for
+         * the worker, then discard its result. A collision job only
+         * borrowed the template's scene/mesh - those are freed below
+         * with the rest of the template. */
         LoadJob *j = &loadJobs[rt->loadJob - 1];
         while (j->stage == 1) sceKernelDelayThread(1000);
         if (j->stage == 2) {
             __sync_synchronize();
-            sceneFree(j->scene);
-            rmeshFree(j->mesh);
+            if (j->type == LOADJOB_ROOM) {
+                sceneFree(j->scene);
+                rmeshFree(j->mesh);
+            } else {
+                collisionFree(j->col);
+            }
             j->scene = NULL;
             j->mesh = NULL;
+            j->col = NULL;
             j->stage = 0;
         }
     }
@@ -539,7 +577,8 @@ static void templateUnload(TemplateRT *rt) {
  *   0: post mesh+scene job (or build inline when sync)       -> 6 / 3
  *   6: waiting on the worker's mesh+scene                    -> 3
  *   3: ONE prop model appended per call (async loads)        -> 4
- *   4: collision build, mesh freed                           -> 2
+ *   4: post collision job (or build inline when sync)        -> 7 / 2
+ *   7: waiting on the worker's collision                     -> 2
  *   2: ONE batch's textures per call (async decodes)         -> 5
  *   5: a few VBO/IBO uploads per call                        -> 1
  * (Measured on device when done inline: 50-210 ms mesh parse, 8-209 ms
@@ -674,8 +713,47 @@ static int templateEnsureStep(int idx, int allowAsync) {
 
     if (rt->state == 4) {
         /* Collision includes the prop triangles, so it must run after
-         * every prop is appended. */
+         * every prop is appended. Async it goes to the worker (measured
+         * 17-133 ms per room inline); the template must not touch its
+         * scene/mesh while the job is in flight - it stays in state 7,
+         * which does nothing but wait. */
+        if (allowAsync && loaderOk) {
+            int slot = loadJobPostCollision(rt->scene, rt->mesh);
+            if (slot < 0) return 0; /* ring full: retry next frame */
+            rt->loadJob = slot + 1;
+            rt->state = 7;
+            return 1;
+        }
         rt->col = collisionBuild(rt->scene, rt->mesh);
+        rmeshFree(rt->mesh);
+        rt->mesh = NULL;
+        rt->gl = (BatchGL *)calloc(
+            rt->scene->batchCount ? rt->scene->batchCount : 1,
+            sizeof(BatchGL));
+        if (!rt->gl) {
+            sceneFree(rt->scene);
+            rt->scene = NULL;
+            collisionFree(rt->col);
+            rt->col = NULL;
+            templateRoomFailed(rt, idx, "gl-calloc", "");
+            return 1;
+        }
+        rt->texDone = 0;
+        rt->state = 2;
+        return 1;
+    }
+
+    if (rt->state == 7) {
+        /* Collision building on the worker. */
+        LoadJob *j = &loadJobs[rt->loadJob - 1];
+        if (j->stage != 2) return 0;
+        __sync_synchronize();
+        rt->col = j->col;
+        j->col = NULL;
+        j->mesh = NULL;  /* borrowed from the template */
+        j->scene = NULL;
+        j->stage = 0;
+        rt->loadJob = 0;
         rmeshFree(rt->mesh);
         rt->mesh = NULL;
         rt->gl = (BatchGL *)calloc(

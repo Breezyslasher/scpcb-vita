@@ -205,8 +205,83 @@ static int hasDdsMagic(const char *path) {
     return n == 4 && memcmp(magic, "DDS ", 4) == 0;
 }
 
+/* "VTEX": pre-decoded RGBA written by the data packager so the device
+ * never runs a PNG/JPG decoder for world textures (a measured 13-60 ms
+ * per texture on the Vita CPU). Layout: 4-byte magic, u32 LE width,
+ * u32 LE height, then width*height*4 RGBA bytes. Files keep their
+ * original .png/.jpg names; loading sniffs content, like DDS. */
+static int hasVtexMagic(const char *path) {
+    FILE *f = fopen(path, "rb");
+    if (!f) return 0;
+    char magic[4] = {0};
+    size_t n = fread(magic, 1, 4, f);
+    fclose(f);
+    return n == 4 && memcmp(magic, "VTEX", 4) == 0;
+}
+
+static uint32_t leU32(const uint8_t *p) {
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16)
+         | ((uint32_t)p[3] << 24);
+}
+
+static TextureImage *loadVtex(const char *path, char *err, size_t errLen) {
+    FILE *f = fopen(path, "rb");
+    if (!f) {
+        setErr(err, errLen, "open failed");
+        return NULL;
+    }
+    uint8_t hdr[12];
+    if (fread(hdr, 1, sizeof(hdr), f) != sizeof(hdr)
+        || memcmp(hdr, "VTEX", 4) != 0) {
+        fclose(f);
+        setErr(err, errLen, "bad vtex header");
+        return NULL;
+    }
+    uint32_t w = leU32(hdr + 4);
+    uint32_t h = leU32(hdr + 8);
+    if (w == 0 || h == 0 || w > 8192 || h > 8192) {
+        fclose(f);
+        setErr(err, errLen, "bad vtex size");
+        return NULL;
+    }
+    size_t bytes = (size_t)w * h * 4;
+    uint8_t *pixels = (uint8_t *)malloc(bytes);
+    if (!pixels) {
+        fclose(f);
+        setErr(err, errLen, "out of memory");
+        return NULL;
+    }
+    if (fread(pixels, 1, bytes, f) != bytes) {
+        free(pixels);
+        fclose(f);
+        setErr(err, errLen, "truncated vtex");
+        return NULL;
+    }
+    fclose(f);
+    TextureImage *img = (TextureImage *)malloc(sizeof(TextureImage));
+    if (!img) {
+        free(pixels);
+        setErr(err, errLen, "out of memory");
+        return NULL;
+    }
+    img->width = w;
+    img->height = h;
+    img->pixels = pixels;
+    return img;
+}
+
 TextureImage *textureLoadFile(const char *path, uint32_t maxDim,
                               char *err, size_t errLen) {
+    if (hasVtexMagic(path)) {
+        TextureImage *img = loadVtex(path, err, errLen);
+        if (!img) return NULL;
+        if (maxDim > 0) {
+            while (img->width > maxDim || img->height > maxDim) {
+                halveImage(img);
+            }
+        }
+        return img;
+    }
     if (hasDdsMagic(path)) {
         TextureImage *img = loadDds(path, err, errLen);
         if (!img) return NULL;
