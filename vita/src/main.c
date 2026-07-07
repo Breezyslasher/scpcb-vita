@@ -11,11 +11,13 @@
 #include <dirent.h>
 #include <math.h>
 #include <sys/stat.h>
+#include <stdarg.h>
 #include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
+#include <malloc.h>
 
 #include <psp2/kernel/processmgr.h>
 #include <vitaGL.h>
@@ -50,13 +52,28 @@ unsigned int _newlib_heap_size_user = 220 * 1024 * 1024;
 
 #define DATA_ROOT "ux0:data/scpcb-ue"
 /* Shown in the debug HUD so a stale VPK install is instantly visible. */
-#define PORT_BUILD_TAG "diag3-lmfix"
+#define PORT_BUILD_TAG "diag4-lazysnd"
 
 /* Diagnostic switch: set to 1 to skip ALL video playback (boot clips
  * and intro). The diag2-novid device test proved the video player was
- * NOT the cause of the black world (the lightmap blend was), so videos
- * are back on. */
+ * NOT the cause of the black world, so videos are back on. */
 #define DIAG_DISABLE_VIDEOS 0
+
+/* Render/load diagnostics -> ux0:data/scpcb-ue/render_log.txt.
+ * Flushed per line so a crash keeps it. */
+static void plog(const char *fmt, ...) {
+    static FILE *lf;
+    if (!lf) lf = fopen(DATA_ROOT "/render_log.txt", "w");
+    if (!lf) return;
+    va_list ap;
+    va_start(ap, fmt);
+    vfprintf(lf, fmt, ap);
+    va_end(ap);
+    fputc('\n', lf);
+    fflush(lf);
+}
+
+static int tplFailCount; /* room templates currently in a failed state */
 
 #define MAP_DIR DATA_ROOT "/GFX/Map"
 #define MAP_TEXTURES_DIR DATA_ROOT "/GFX/Map/Textures"
@@ -227,6 +244,7 @@ typedef struct {
 typedef struct {
     int state;        /* 0 = not loaded, 1 = ok, -1 = failed,
                          2 = geometry built, textures loading */
+    int retries;      /* failed attempts so far (transient OOM retries) */
     uint32_t texDone; /* batches with textures resolved (state 2) */
     Scene *scene;
     BatchGL *gl;
@@ -259,22 +277,43 @@ static void templateUnload(TemplateRT *rt) {
  * player is standing in it). Step 1 parses the mesh and builds the
  * scene and collision; each following step resolves the textures of
  * a couple of batches; the last one uploads the VBOs. */
+/* A template load failure is usually transient (a malloc failing under
+ * heap pressure), so failures log their cause, count into the HUD's
+ * tpl= readout and retry on later calls instead of silently latching
+ * the room black forever (which skipped the whole 3D pass when every
+ * template failed). */
+#define TPL_MAX_RETRIES 8
+
 static void templateEnsureStep(int idx) {
     TemplateRT *rt = &tplRT[idx];
-    if (rt->state == 1 || rt->state == -1) return;
+    if (rt->state == 1) return;
+    if (rt->state == -1) {
+        if (rt->retries >= TPL_MAX_RETRIES) return;
+        rt->state = 0; /* try again */
+    }
 
     if (rt->state == 0) {
         rt->state = -1;
+        rt->retries++;
         const RoomTemplateInfo *info = &tplList.items[idx];
-        if (!info->meshPath) return;
+        if (!info->meshPath) {
+            rt->retries = TPL_MAX_RETRIES; /* permanent: nothing to load */
+            return;
+        }
         char path[1024];
         snprintf(path, sizeof(path), MAP_DIR "/%s", info->meshPath);
         char err[128];
         RMesh *mesh = rmeshLoadFile(path, err, sizeof(err));
-        if (!mesh) return;
+        if (!mesh) {
+            if (rt->retries == 1) tplFailCount++;
+            plog("tpl FAIL rmesh %s: %s (try %d)", path, err, rt->retries);
+            return;
+        }
         rt->scene = sceneBuild(mesh);
         if (!rt->scene) {
             rmeshFree(mesh);
+            if (rt->retries == 1) tplFailCount++;
+            plog("tpl FAIL sceneBuild %s (try %d)", path, rt->retries);
             return;
         }
         for (uint32_t i = 0; i < mesh->entityCount; i++) {
@@ -310,7 +349,19 @@ static void templateEnsureStep(int idx) {
         rt->gl = (BatchGL *)calloc(
             rt->scene->batchCount ? rt->scene->batchCount : 1,
             sizeof(BatchGL));
-        if (!rt->gl) return;
+        if (!rt->gl) {
+            sceneFree(rt->scene);
+            rt->scene = NULL;
+            collisionFree(rt->col);
+            rt->col = NULL;
+            if (rt->retries == 1) tplFailCount++;
+            plog("tpl FAIL gl-calloc %s (try %d)", path, rt->retries);
+            return;
+        }
+        if (rt->retries > 1) {
+            tplFailCount--; /* a retry recovered it */
+            plog("tpl RECOVERED %s (try %d)", path, rt->retries);
+        }
         rt->texDone = 0;
         rt->state = 2;
         return;
@@ -1763,6 +1814,12 @@ static void regenerateMap(uint32_t seed) {
         spawnRoomDecals();
         reset173();
         reset106();
+        {
+            struct mallinfo mi = mallinfo();
+            plog("map gen: seed %u rooms %u; heap used=%uK free=%uK",
+                 mapSeed, map.roomCount, (unsigned)mi.uordblks / 1024,
+                 (unsigned)mi.fordblks / 1024);
+        }
         snprintf(statusLine, sizeof(statusLine), "map seed %u: %u rooms %u doors",
                  mapSeed, map.roomCount, doors.count);
     } else {
@@ -11226,15 +11283,14 @@ int main(void) {
         snprintf(line1, sizeof(line1), "%s   [%s]", statusLine,
                  haveData ? roomNameAt(camPos) : "-");
         char line2[256];
+        struct mallinfo hmi = mallinfo();
         snprintf(line2, sizeof(line2),
-                 "bld=%s fps=%.0f au=%d/%d dec-fail=%d texfail=%d "
-                 "vram=%uK ram=%uK phy=%uK  up: %s",
-                 PORT_BUILD_TAG, fps, audioStatus(), audioSoundCount(),
-                 audioLoadDecodeFails(), texFailCount,
+                 "bld=%s fps=%.0f dec-fail=%d texfail=%d tpl=%d act=%d "
+                 "vram=%uK heap=%uK",
+                 PORT_BUILD_TAG, fps, audioLoadDecodeFails(), texFailCount,
+                 tplFailCount, activeCount,
                  (unsigned)(vglMemFree(VGL_MEM_VRAM) / 1024),
-                 (unsigned)(vglMemFree(VGL_MEM_RAM) / 1024),
-                 (unsigned)(vglMemFree(VGL_MEM_SLOW) / 1024),
-                 walkMode ? "WALK" : "fly");
+                 (unsigned)((unsigned)hmi.fordblks / 1024));
         drawHud(line1, line2, toastTimer > 0 ? toastMsg : NULL, NULL);
 
         /* Vitals meters, the inventory and the blink blackout share the
