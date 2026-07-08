@@ -53,7 +53,7 @@ unsigned int _newlib_heap_size_user = 220 * 1024 * 1024;
 
 #define DATA_ROOT "ux0:data/scpcb-ue"
 /* Shown in the debug HUD so a stale VPK install is instantly visible. */
-#define PORT_BUILD_TAG "perf3"
+#define PORT_BUILD_TAG "perf4diag"
 
 /* Diagnostic switch: set to 1 to skip ALL video playback (boot clips
  * and intro). The diag2-novid device test proved the video player was
@@ -2336,6 +2336,11 @@ static void applyDebugState(void) {
     }
 }
 
+/* Per-frame glDrawElements count (world batches incl. lightmap passes)
+ * for the debug HUD: at 8 fps the question is CPU draw-call overhead vs
+ * GPU fill, and this is the draw-call half of the answer. */
+static int drawCallsFrame, drawCallsShown;
+
 static void drawBatchSet(const Scene *scene, const BatchGL *gl, int alphaPass) {
     for (uint32_t i = 0; i < scene->batchCount; i++) {
         const SceneBatch *b = &scene->batches[i];
@@ -2364,6 +2369,7 @@ static void drawBatchSet(const Scene *scene, const BatchGL *gl, int alphaPass) {
             glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
             glDepthMask(GL_FALSE);
         }
+        drawCallsFrame++;
         glDrawElements(GL_TRIANGLES, (GLsizei)b->indexCount,
                        GL_UNSIGNED_SHORT, NULL);
         if (alphaPass) {
@@ -2389,6 +2395,7 @@ static void drawBatchSet(const Scene *scene, const BatchGL *gl, int alphaPass) {
              * the known-good additive until a corrected modulate (single
              * vc + ambient floor) can be tested on device. */
             glBlendFunc(GL_ONE, GL_ONE);
+            drawCallsFrame++;
             glDrawElements(GL_TRIANGLES, (GLsizei)b->indexCount,
                            GL_UNSIGNED_SHORT, NULL);
             glDisable(GL_BLEND);
@@ -11119,11 +11126,14 @@ int main(void) {
     while (running) {
         fpsFrames++;
         uint64_t now = sceKernelGetProcessTimeWide();
-        /* Worst frame in the last fps window: the smoothed fps hides
-         * single-frame stalls, this exposes them. */
+        /* Worst frame in the last fps window, split by phase (update /
+         * 3D+HUD draw / buffer swap): the smoothed fps hides stalls and
+         * cannot say whether a slow frame is CPU sim, CPU draw-call
+         * overhead, or GPU-bound (which shows up in the swap wait). */
         static uint64_t framePrevUs;
-        static uint64_t frameMaxUs;
-        static unsigned worstMs;
+        static uint64_t frameMaxUs, updMaxUs, drawMaxUs, swapMaxUs;
+        static unsigned worstMs, updWorst, drawWorst, swapWorst;
+        uint64_t tUpd = 0, tDraw = 0;
         if (framePrevUs && now - framePrevUs > frameMaxUs) {
             frameMaxUs = now - framePrevUs;
         }
@@ -11133,8 +11143,13 @@ int main(void) {
             fpsFrames = 0;
             fpsLast = now;
             worstMs = (unsigned)(frameMaxUs / 1000);
-            frameMaxUs = 0;
+            updWorst = (unsigned)(updMaxUs / 1000);
+            drawWorst = (unsigned)(drawMaxUs / 1000);
+            swapWorst = (unsigned)(swapMaxUs / 1000);
+            frameMaxUs = updMaxUs = drawMaxUs = swapMaxUs = 0;
         }
+        drawCallsShown = drawCallsFrame;
+        drawCallsFrame = 0;
 
         inputUpdate();
 
@@ -11743,6 +11758,8 @@ int main(void) {
             if (blinkFrames == 0) blinkTimer = 100.0f;
         }
 
+        tUpd = sceKernelGetProcessTimeWide(); /* sim done; render begins */
+
         /* Capture the nearest monitor's live feed before clearing the
          * frame (it renders into a scissored corner, then copies out). */
         renderCameraFeed();
@@ -11825,10 +11842,10 @@ int main(void) {
         char line2[256];
         struct mallinfo hmi = mallinfo();
         snprintf(line2, sizeof(line2),
-                 "bld=%s fps=%.0f ms=%u dec-fail=%d texfail=%d tpl=%d "
+                 "bld=%s fps=%.0f ms=%u up=%u dr=%u sw=%u dc=%d tpl=%d "
                  "act=%d vram=%uK heap=%uK",
-                 PORT_BUILD_TAG, fps, worstMs, audioLoadDecodeFails(),
-                 texFailCount, tplFailCount, activeCount,
+                 PORT_BUILD_TAG, fps, worstMs, updWorst, drawWorst,
+                 swapWorst, drawCallsShown, tplFailCount, activeCount,
                  (unsigned)(vglMemFree(VGL_MEM_VRAM) / 1024),
                  (unsigned)((unsigned)hmi.fordblks / 1024));
         drawHud(line1, line2, toastTimer > 0 ? toastMsg : NULL, NULL);
@@ -11992,7 +12009,25 @@ int main(void) {
         glEnableClientState(GL_TEXTURE_COORD_ARRAY);
         glEnable(GL_DEPTH_TEST);
 
+        tDraw = sceKernelGetProcessTimeWide();
         vglSwapBuffers(GL_FALSE);
+        if (tUpd) {
+            uint64_t tEnd = sceKernelGetProcessTimeWide();
+            uint64_t u = tUpd - now, d = tDraw - tUpd, s = tEnd - tDraw;
+            if (u > updMaxUs) updMaxUs = u;
+            if (d > drawMaxUs) drawMaxUs = d;
+            if (s > swapMaxUs) swapMaxUs = s;
+            if (u + d + s > 80000) {
+                static uint64_t lastSlowLog;
+                if (tEnd - lastSlowLog > 1000000) {
+                    lastSlowLog = tEnd;
+                    plog("slowframe upd=%ums draw=%ums swap=%ums dc=%d "
+                         "act=%d",
+                         (unsigned)(u / 1000), (unsigned)(d / 1000),
+                         (unsigned)(s / 1000), drawCallsShown, activeCount);
+                }
+            }
+        }
     }
 
     if (haveData) {
