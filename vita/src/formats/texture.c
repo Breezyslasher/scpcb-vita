@@ -205,8 +205,83 @@ static int hasDdsMagic(const char *path) {
     return n == 4 && memcmp(magic, "DDS ", 4) == 0;
 }
 
+/* "VTEX": pre-decoded RGBA written by the data packager so the device
+ * never runs a PNG/JPG decoder for world textures (a measured 13-60 ms
+ * per texture on the Vita CPU). Layout: 4-byte magic, u32 LE width,
+ * u32 LE height, then width*height*4 RGBA bytes. Files keep their
+ * original .png/.jpg names; loading sniffs content, like DDS. */
+static int hasVtexMagic(const char *path) {
+    FILE *f = fopen(path, "rb");
+    if (!f) return 0;
+    char magic[4] = {0};
+    size_t n = fread(magic, 1, 4, f);
+    fclose(f);
+    return n == 4 && memcmp(magic, "VTEX", 4) == 0;
+}
+
+static uint32_t leU32(const uint8_t *p) {
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16)
+         | ((uint32_t)p[3] << 24);
+}
+
+static TextureImage *loadVtex(const char *path, char *err, size_t errLen) {
+    FILE *f = fopen(path, "rb");
+    if (!f) {
+        setErr(err, errLen, "open failed");
+        return NULL;
+    }
+    uint8_t hdr[12];
+    if (fread(hdr, 1, sizeof(hdr), f) != sizeof(hdr)
+        || memcmp(hdr, "VTEX", 4) != 0) {
+        fclose(f);
+        setErr(err, errLen, "bad vtex header");
+        return NULL;
+    }
+    uint32_t w = leU32(hdr + 4);
+    uint32_t h = leU32(hdr + 8);
+    if (w == 0 || h == 0 || w > 8192 || h > 8192) {
+        fclose(f);
+        setErr(err, errLen, "bad vtex size");
+        return NULL;
+    }
+    size_t bytes = (size_t)w * h * 4;
+    uint8_t *pixels = (uint8_t *)malloc(bytes);
+    if (!pixels) {
+        fclose(f);
+        setErr(err, errLen, "out of memory");
+        return NULL;
+    }
+    if (fread(pixels, 1, bytes, f) != bytes) {
+        free(pixels);
+        fclose(f);
+        setErr(err, errLen, "truncated vtex");
+        return NULL;
+    }
+    fclose(f);
+    TextureImage *img = (TextureImage *)malloc(sizeof(TextureImage));
+    if (!img) {
+        free(pixels);
+        setErr(err, errLen, "out of memory");
+        return NULL;
+    }
+    img->width = w;
+    img->height = h;
+    img->pixels = pixels;
+    return img;
+}
+
 TextureImage *textureLoadFile(const char *path, uint32_t maxDim,
                               char *err, size_t errLen) {
+    if (hasVtexMagic(path)) {
+        TextureImage *img = loadVtex(path, err, errLen);
+        if (!img) return NULL;
+        if (maxDim > 0) {
+            while (img->width > maxDim || img->height > maxDim) {
+                halveImage(img);
+            }
+        }
+        return img;
+    }
     if (hasDdsMagic(path)) {
         TextureImage *img = loadDds(path, err, errLen);
         if (!img) return NULL;
@@ -275,6 +350,64 @@ static int stemEqNoCase(const char *a, const char *b) {
     return 1;
 }
 
+/* Directory-listing cache. On the Vita's storage every resolve
+ * otherwise pays opendir/readdir over 300+ entry directories
+ * (milliseconds of I/O each), and the room-streaming path resolves
+ * several names per frame - a measured contributor to the fps drop
+ * while rooms load. Each directory is read once and matched from
+ * memory afterwards; the asset set never changes mid-run. */
+#define DIRCACHE_MAX 16
+
+typedef struct {
+    char *path;
+    char **names;
+    size_t count;
+} DirListing;
+
+static DirListing dirCache[DIRCACHE_MAX];
+static size_t dirCacheCount;
+
+static const DirListing *dirListingGet(const char *path) {
+    for (size_t i = 0; i < dirCacheCount; i++) {
+        if (strcmp(dirCache[i].path, path) == 0) return &dirCache[i];
+    }
+    if (dirCacheCount >= DIRCACHE_MAX) return NULL;
+    /* Read it once; a directory that fails to open caches as empty so
+     * the filesystem is not retried on every resolve. */
+    char **names = NULL;
+    size_t count = 0, cap = 0;
+    DIR *d = opendir(path);
+    if (d) {
+        struct dirent *de;
+        while ((de = readdir(d)) != NULL) {
+            if (de->d_name[0] == '.') continue;
+            if (count == cap) {
+                size_t ncap = cap ? cap * 2 : 64;
+                char **grown =
+                    (char **)realloc(names, ncap * sizeof(char *));
+                if (!grown) break;
+                names = grown;
+                cap = ncap;
+            }
+            names[count] = strdup(de->d_name);
+            if (!names[count]) break;
+            count++;
+        }
+        closedir(d);
+    }
+    DirListing *dl = &dirCache[dirCacheCount];
+    dl->path = strdup(path);
+    if (!dl->path) {
+        for (size_t i = 0; i < count; i++) free(names[i]);
+        free(names);
+        return NULL;
+    }
+    dl->names = names;
+    dl->count = count;
+    dirCacheCount++;
+    return dl;
+}
+
 int textureResolve(const char *name, const char *const *searchDirs,
                    size_t searchDirCount, char *out, size_t outLen) {
     /* Texture names may carry Windows path separators; only the final
@@ -293,6 +426,21 @@ int textureResolve(const char *name, const char *const *searchDirs,
      * original engine left those surfaces untextured. */
     for (int pass = 0; pass < 2; pass++) {
         for (size_t i = 0; i < searchDirCount; i++) {
+            const DirListing *dl = dirListingGet(searchDirs[i]);
+            if (dl) {
+                for (size_t n = 0; n < dl->count; n++) {
+                    int match = pass == 0
+                                    ? strEqNoCase(dl->names[n], base)
+                                    : stemEqNoCase(dl->names[n], base);
+                    if (match) {
+                        snprintf(out, outLen, "%s/%s", searchDirs[i],
+                                 dl->names[n]);
+                        return 1;
+                    }
+                }
+                continue;
+            }
+            /* Cache table full/OOM: fall back to a direct scan. */
             DIR *d = opendir(searchDirs[i]);
             if (!d) continue;
             struct dirent *de;

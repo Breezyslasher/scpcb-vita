@@ -22,8 +22,20 @@ void audioPlay(int sound, float vol, float pan);
 void audioPlay3D(int sound, const float pos[3], const float listener[3],
                  float yaw, float range);
 
-/* Loop a sound on the dedicated ambience channel (replaces previous). */
+/* Loop a sound on the dedicated ambience channel (replaces previous).
+ * If the sound's PCM is still decoding, it starts once ready via
+ * audioService. */
 void audioLoopAmbience(int sound, float vol);
+
+/* Call once per frame: starts pending ambience whose PCM finished
+ * decoding on the decoder thread. */
+void audioService(void);
+
+/* Boot-time warmup: synchronously decode registered sounds whose OGG
+ * file is at most maxFileBytes, stopping once maxTotalPcmBytes of PCM
+ * is resident - keeps hot interactive SFX (steps, doors, buttons)
+ * instant without recreating the decode-everything heap exhaustion. */
+void audioPredecodeSmall(unsigned maxFileBytes, unsigned maxTotalPcmBytes);
 
 /* Stream an OGG from disk on the dedicated music path (decoded on
  * the mixer thread, so a 3-minute track costs no PCM memory). */

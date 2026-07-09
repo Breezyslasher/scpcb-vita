@@ -20,6 +20,7 @@
 #include <malloc.h>
 
 #include <psp2/kernel/processmgr.h>
+#include <psp2/kernel/threadmgr.h>
 #include <vitaGL.h>
 
 #include "audio/audio.h"
@@ -52,7 +53,7 @@ unsigned int _newlib_heap_size_user = 220 * 1024 * 1024;
 
 #define DATA_ROOT "ux0:data/scpcb-ue"
 /* Shown in the debug HUD so a stale VPK install is instantly visible. */
-#define PORT_BUILD_TAG "diag4-lazysnd"
+#define PORT_BUILD_TAG "diag5-room"
 
 /* Diagnostic switch: set to 1 to skip ALL video playback (boot clips
  * and intro). The diag2-novid device test proved the video player was
@@ -117,6 +118,33 @@ static CachedTexture *texCache;
 static unsigned texCacheCount;
 static int texFailCount; /* textures that resolved but failed to load */
 
+/* Upload a decoded image (NULL = failed/unresolved -> cached as 0 so
+ * it is not retried) and record it under `name`. GL thread only. */
+static GLuint textureCacheInsert(const char *name, TextureImage *img) {
+    GLuint handle = 0;
+    if (img) {
+        glGenTextures(1, &handle);
+        glBindTexture(GL_TEXTURE_2D, handle);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, (GLsizei)img->width,
+                     (GLsizei)img->height, 0, GL_RGBA, GL_UNSIGNED_BYTE,
+                     img->pixels);
+        textureFree(img);
+    }
+    CachedTexture *grown = (CachedTexture *)realloc(
+        texCache, (texCacheCount + 1) * sizeof(CachedTexture));
+    if (grown) {
+        texCache = grown;
+        texCache[texCacheCount].name = strdup(name);
+        texCache[texCacheCount].handle = handle;
+        if (texCache[texCacheCount].name) texCacheCount++;
+    }
+    return handle;
+}
+
 static GLuint textureGet(const char *name) {
     if (!name) return 0;
     for (unsigned i = 0; i < texCacheCount; i++) {
@@ -179,18 +207,36 @@ typedef struct {
 static CachedModel *modelCache;
 static unsigned modelCacheCount;
 
-static B3DModel *propModelGet(const char *rawName) {
+/* Canonical cache key for a prop model reference: basename, forced to
+ * a single ".b3d" suffix. */
+static void propModelKey(const char *rawName, char *name, size_t nameLen) {
     const char *base = rawName;
     for (const char *p = rawName; *p; p++) {
         if (*p == '\\' || *p == '/') base = p + 1;
     }
-    char name[256];
-    snprintf(name, sizeof(name), "%s", base);
+    snprintf(name, nameLen, "%s", base);
     size_t len = strlen(name);
     if (len > 4 && strcasecmp(name + len - 4, ".b3d") == 0) {
         name[len - 4] = '\0';
     }
-    strncat(name, ".b3d", sizeof(name) - strlen(name) - 1);
+    strncat(name, ".b3d", nameLen - strlen(name) - 1);
+}
+
+/* Record a loaded model (NULL = failed, cached so it is not retried). */
+static void modelCacheInsert(const char *name, B3DModel *model) {
+    CachedModel *grown = (CachedModel *)realloc(
+        modelCache, (modelCacheCount + 1) * sizeof(CachedModel));
+    if (grown) {
+        modelCache = grown;
+        modelCache[modelCacheCount].name = strdup(name);
+        modelCache[modelCacheCount].model = model;
+        if (modelCache[modelCacheCount].name) modelCacheCount++;
+    }
+}
+
+static B3DModel *propModelGet(const char *rawName) {
+    char name[256];
+    propModelKey(rawName, name, sizeof(name));
 
     for (unsigned i = 0; i < modelCacheCount; i++) {
         if (strcmp(modelCache[i].name, name) == 0) return modelCache[i].model;
@@ -203,16 +249,229 @@ static B3DModel *propModelGet(const char *rawName) {
         char err[128];
         model = b3dLoadFile(path, err, sizeof(err));
     }
-
-    CachedModel *grown = (CachedModel *)realloc(
-        modelCache, (modelCacheCount + 1) * sizeof(CachedModel));
-    if (grown) {
-        modelCache = grown;
-        modelCache[modelCacheCount].name = strdup(name);
-        modelCache[modelCacheCount].model = model;
-        if (modelCache[modelCacheCount].name) modelCacheCount++;
-    }
+    modelCacheInsert(name, model);
     return model;
+}
+
+/* ---------------- async asset loader ----------------
+ * A low-priority worker decodes texture PNGs, parses prop B3Ds and
+ * builds room meshes/scenes off the render thread. Measured on device
+ * when this ran inline: 25-171 ms per texture batch, 8-209 ms per prop
+ * and 50-210 ms per mesh parse - each one a blown 16.6 ms frame. The
+ * render thread only uploads finished images (a couple of ms) and
+ * inserts cache entries. Per-slot handshake: stage 0 (free, owned by
+ * the render thread) -> 1 (queued, owned by the worker) -> 2 (done,
+ * owned by the render thread again); barriers order the payload. */
+enum { LOADJOB_TEXTURE = 1, LOADJOB_MODEL = 2, LOADJOB_ROOM = 3,
+       LOADJOB_COLLISION = 4 };
+#define LOADJOB_MAX 24
+
+typedef struct {
+    int type;
+    char name[192];       /* cache key (texture/model) */
+    char path[1024];      /* resolved file path */
+    char err[96];         /* worker's failure reason */
+    TextureImage *img;    /* LOADJOB_TEXTURE result */
+    B3DModel *model;      /* LOADJOB_MODEL result */
+    RMesh *mesh;          /* LOADJOB_ROOM results; COLLISION input */
+    Scene *scene;         /* (COLLISION borrows these from the template) */
+    CollisionWorld *col;  /* LOADJOB_COLLISION result */
+    volatile int stage;
+} LoadJob;
+
+static LoadJob loadJobs[LOADJOB_MAX];
+static volatile int loaderRunning;
+static int loaderOk; /* thread alive: async paths permitted */
+
+static int loaderLoop(SceSize argSize, void *argp) {
+    (void)argSize;
+    (void)argp;
+    while (loaderRunning) {
+        int worked = 0;
+        for (int i = 0; i < LOADJOB_MAX; i++) {
+            LoadJob *j = &loadJobs[i];
+            if (j->stage != 1) continue;
+            __sync_synchronize();
+            if (j->type == LOADJOB_TEXTURE) {
+                j->img = textureLoadFile(j->path, TEXTURE_CAP, j->err,
+                                         sizeof(j->err));
+            } else if (j->type == LOADJOB_MODEL) {
+                j->model = b3dLoadFile(j->path, j->err, sizeof(j->err));
+            } else if (j->type == LOADJOB_COLLISION) {
+                j->col = collisionBuild(j->scene, j->mesh);
+            } else {
+                j->mesh = rmeshLoadFile(j->path, j->err, sizeof(j->err));
+                j->scene = j->mesh ? sceneBuild(j->mesh) : NULL;
+                if (j->mesh && !j->scene) {
+                    rmeshFree(j->mesh);
+                    j->mesh = NULL;
+                    snprintf(j->err, sizeof(j->err), "sceneBuild failed");
+                }
+            }
+            __sync_synchronize();
+            j->stage = 2;
+            worked = 1;
+        }
+        if (!worked) sceKernelDelayThread(4000);
+    }
+    return sceKernelExitDeleteThread(0);
+}
+
+/* Find a free slot and queue a job. Returns the slot or -1 (ring full).
+ * Render thread only. */
+static int loadJobPost(int type, const char *name, const char *path) {
+    for (int i = 0; i < LOADJOB_MAX; i++) {
+        LoadJob *j = &loadJobs[i];
+        if (j->stage != 0) continue;
+        j->type = type;
+        snprintf(j->name, sizeof(j->name), "%s", name ? name : "");
+        snprintf(j->path, sizeof(j->path), "%s", path);
+        j->err[0] = '\0';
+        j->img = NULL;
+        j->model = NULL;
+        j->mesh = NULL;
+        j->scene = NULL;
+        j->col = NULL;
+        __sync_synchronize();
+        j->stage = 1;
+        return i;
+    }
+    return -1;
+}
+
+/* Queue a collision build over a template's finished scene+mesh (both
+ * borrowed: the template keeps ownership and must not touch them until
+ * the job completes). */
+static int loadJobPostCollision(Scene *scene, RMesh *mesh) {
+    for (int i = 0; i < LOADJOB_MAX; i++) {
+        LoadJob *j = &loadJobs[i];
+        if (j->stage != 0) continue;
+        j->type = LOADJOB_COLLISION;
+        j->name[0] = '\0';
+        j->path[0] = '\0';
+        j->err[0] = '\0';
+        j->img = NULL;
+        j->model = NULL;
+        j->mesh = mesh;
+        j->scene = scene;
+        j->col = NULL;
+        __sync_synchronize();
+        j->stage = 1;
+        return i;
+    }
+    return -1;
+}
+
+/* Is a texture/model job for this cache key already queued or done? */
+static int loadJobFind(int type, const char *name) {
+    for (int i = 0; i < LOADJOB_MAX; i++) {
+        if (loadJobs[i].stage != 0 && loadJobs[i].type == type
+            && strcmp(loadJobs[i].name, name) == 0) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+/* Consume finished texture/model jobs: upload + cache-insert on the GL
+ * thread. Room jobs are consumed by their owning template instead. At
+ * most two uploads per frame so a burst of completions cannot stall. */
+static void loaderPump(void) {
+    int consumed = 0;
+    for (int i = 0; i < LOADJOB_MAX && consumed < 2; i++) {
+        LoadJob *j = &loadJobs[i];
+        if (j->stage != 2 || j->type == LOADJOB_ROOM
+            || j->type == LOADJOB_COLLISION) {
+            continue; /* room/collision jobs belong to their template */
+        }
+        __sync_synchronize();
+        if (j->type == LOADJOB_TEXTURE) {
+            /* A blocking load may have raced the same name in; keep the
+             * first entry. */
+            int exists = 0;
+            for (unsigned c = 0; c < texCacheCount; c++) {
+                if (strcmp(texCache[c].name, j->name) == 0) {
+                    exists = 1;
+                    break;
+                }
+            }
+            if (exists) {
+                if (j->img) textureFree(j->img);
+            } else {
+                if (!j->img) texFailCount++;
+                textureCacheInsert(j->name, j->img);
+            }
+            j->img = NULL;
+        } else {
+            int exists = 0;
+            for (unsigned c = 0; c < modelCacheCount; c++) {
+                if (strcmp(modelCache[c].name, j->name) == 0) {
+                    exists = 1;
+                    break;
+                }
+            }
+            if (!exists) modelCacheInsert(j->name, j->model);
+            j->model = NULL; /* cached, or dropped after a lost race */
+        }
+        j->stage = 0;
+        consumed++;
+    }
+}
+
+/* Async textureGet: cache hit returns the handle; a miss queues the
+ * decode and reports pending (handle arrives via loaderPump). Falls
+ * back to the synchronous path if the worker is unavailable. */
+static GLuint textureGetAsync(const char *name, int *pending) {
+    *pending = 0;
+    if (!name) return 0;
+    for (unsigned i = 0; i < texCacheCount; i++) {
+        if (strcmp(texCache[i].name, name) == 0) return texCache[i].handle;
+    }
+    if (!loaderOk) return textureGet(name);
+    if (loadJobFind(LOADJOB_TEXTURE, name) >= 0) {
+        *pending = 1;
+        return 0;
+    }
+    const char *dirs[10] = { MAP_DIR, MAP_TEXTURES_DIR, PROPS_DIR, ITEMS_DIR,
+                             ITEMS_HUD_DIR, HUD_DIR, INV_ICONS_DIR, NPCS_DIR,
+                             DECALS_DIR, OVERLAYS_DIR };
+    char path[1024];
+    if (!textureResolve(name, dirs, 10, path, sizeof(path))) {
+        return textureCacheInsert(name, NULL); /* unresolved: cache the 0 */
+    }
+    if (loadJobPost(LOADJOB_TEXTURE, name, path) < 0) {
+        *pending = 1; /* ring full; retry next frame */
+        return 0;
+    }
+    *pending = 1;
+    return 0;
+}
+
+/* Async propModelGet, same contract. */
+static B3DModel *propModelGetAsync(const char *rawName, int *pending) {
+    *pending = 0;
+    char name[256];
+    propModelKey(rawName, name, sizeof(name));
+    for (unsigned i = 0; i < modelCacheCount; i++) {
+        if (strcmp(modelCache[i].name, name) == 0) return modelCache[i].model;
+    }
+    if (!loaderOk) return propModelGet(rawName);
+    if (loadJobFind(LOADJOB_MODEL, name) >= 0) {
+        *pending = 1;
+        return NULL;
+    }
+    const char *dirs[3] = { PROPS_DIR, ITEMS_DIR, NPCS_DIR };
+    char path[1024];
+    if (!textureResolve(name, dirs, 3, path, sizeof(path))) {
+        modelCacheInsert(name, NULL);
+        return NULL;
+    }
+    if (loadJobPost(LOADJOB_MODEL, name, path) >= 0) {
+        *pending = 1;
+    } else {
+        *pending = 1; /* ring full; retry next frame */
+    }
+    return NULL;
 }
 
 static void modelCacheClear(void) {
@@ -243,9 +502,14 @@ typedef struct {
 
 typedef struct {
     int state;        /* 0 = not loaded, 1 = ok, -1 = failed,
-                         2 = geometry built, textures loading */
+                         3 = props loading, 4 = collision pending,
+                         2 = textures loading, 5 = VBO uploads */
     int retries;      /* failed attempts so far (transient OOM retries) */
+    int loadJob;      /* slot+1 of an in-flight async room job, 0 none */
     uint32_t texDone; /* batches with textures resolved (state 2) */
+    uint32_t propDone;/* mesh entities examined for props (state 3) */
+    uint32_t vboDone; /* batches with buffers uploaded (state 5) */
+    RMesh *mesh;      /* kept alive between states 0 and 4 */
     Scene *scene;
     BatchGL *gl;
     CollisionWorld *col;
@@ -266,9 +530,31 @@ static void templateUnload(TemplateRT *rt) {
             if (rt->gl[i].ibo) glDeleteBuffers(1, &rt->gl[i].ibo);
         }
     }
+    if (rt->loadJob > 0) {
+        /* An async job is in flight (map regen mid-stream): wait for
+         * the worker, then discard its result. A collision job only
+         * borrowed the template's scene/mesh - those are freed below
+         * with the rest of the template. */
+        LoadJob *j = &loadJobs[rt->loadJob - 1];
+        while (j->stage == 1) sceKernelDelayThread(1000);
+        if (j->stage == 2) {
+            __sync_synchronize();
+            if (j->type == LOADJOB_ROOM) {
+                sceneFree(j->scene);
+                rmeshFree(j->mesh);
+            } else {
+                collisionFree(j->col);
+            }
+            j->scene = NULL;
+            j->mesh = NULL;
+            j->col = NULL;
+            j->stage = 0;
+        }
+    }
     free(rt->gl);
     sceneFree(rt->scene);
     collisionFree(rt->col);
+    rmeshFree(rt->mesh); /* set only while a load is mid-flight */
     memset(rt, 0, sizeof(*rt));
 }
 
@@ -284,42 +570,133 @@ static void templateUnload(TemplateRT *rt) {
  * template failed). */
 #define TPL_MAX_RETRIES 8
 
-static void templateEnsureStep(int idx) {
+/* One SMALL unit of loading per call, so the per-frame budget loop in
+ * updateActiveRooms can spread a room's load over many frames. With the
+ * async loader the heavy work (mesh parse, PNG decode, B3D parse) runs
+ * on the worker thread and the render thread only consumes results:
+ *   0: post mesh+scene job (or build inline when sync)       -> 6 / 3
+ *   6: waiting on the worker's mesh+scene                    -> 3
+ *   3: ONE prop model appended per call (async loads)        -> 4
+ *   4: post collision job (or build inline when sync)        -> 7 / 2
+ *   7: waiting on the worker's collision                     -> 2
+ *   2: ONE batch's textures per call (async decodes)         -> 5
+ *   5: a few VBO/IBO uploads per call                        -> 1
+ * (Measured on device when done inline: 50-210 ms mesh parse, 8-209 ms
+ * per prop, 25-171 ms per texture batch - each a blown frame.)
+ * Returns 1 when the call made progress, 0 when it is waiting on the
+ * worker (or the template is terminal). */
+static void templateRoomFailed(TemplateRT *rt, int idx, const char *what,
+                               const char *err) {
+    if (rt->retries == 1) tplFailCount++;
+    plog("tpl FAIL %s idx=%d: %s (try %d)", what, idx, err, rt->retries);
+    rt->state = -1;
+}
+
+static void templateRoomReady(TemplateRT *rt, int idx) {
+    rt->emitterCount = 0;
+    for (uint32_t i = 0; i < rt->mesh->entityCount; i++) {
+        const RMeshEntity *e = &rt->mesh->entities[i];
+        if (e->type != RMESH_ENTITY_SOUND_EMITTER) continue;
+        if (rt->emitterCount >= MAX_ROOM_EMITTERS) break;
+        RoomEmitter *em = &rt->emitters[rt->emitterCount++];
+        em->x = e->x;
+        em->y = e->y;
+        em->z = e->z;
+        em->id = e->u.soundEmitter.id;
+        /* File range is raw; the game loops within `range` and uses
+         * the same units the emitter position is in. */
+        em->range = e->u.soundEmitter.range;
+        if (em->range < 256.0f) em->range = 1024.0f;
+    }
+    if (rt->retries > 1) {
+        tplFailCount--; /* a retry recovered it */
+        plog("tpl RECOVERED idx=%d (try %d)", idx, rt->retries);
+    }
+    rt->propDone = 0;
+    rt->state = 3;
+}
+
+static int templateEnsureStep(int idx, int allowAsync) {
     TemplateRT *rt = &tplRT[idx];
-    if (rt->state == 1) return;
+    if (rt->state == 1) return 0;
     if (rt->state == -1) {
-        if (rt->retries >= TPL_MAX_RETRIES) return;
+        if (rt->retries >= TPL_MAX_RETRIES) return 0;
         rt->state = 0; /* try again */
     }
 
     if (rt->state == 0) {
-        rt->state = -1;
-        rt->retries++;
         const RoomTemplateInfo *info = &tplList.items[idx];
         if (!info->meshPath) {
             rt->retries = TPL_MAX_RETRIES; /* permanent: nothing to load */
-            return;
+            rt->state = -1;
+            return 0;
         }
         char path[1024];
         snprintf(path, sizeof(path), MAP_DIR "/%s", info->meshPath);
+        if (allowAsync && loaderOk) {
+            int slot = loadJobPost(LOADJOB_ROOM, info->meshPath, path);
+            if (slot < 0) return 0; /* ring full: retry next frame */
+            rt->retries++;
+            rt->loadJob = slot + 1;
+            rt->state = 6;
+            return 1;
+        }
+        rt->retries++;
         char err[128];
-        RMesh *mesh = rmeshLoadFile(path, err, sizeof(err));
-        if (!mesh) {
-            if (rt->retries == 1) tplFailCount++;
-            plog("tpl FAIL rmesh %s: %s (try %d)", path, err, rt->retries);
-            return;
+        rt->mesh = rmeshLoadFile(path, err, sizeof(err));
+        if (!rt->mesh) {
+            templateRoomFailed(rt, idx, "rmesh", err);
+            return 1;
         }
-        rt->scene = sceneBuild(mesh);
+        rt->scene = sceneBuild(rt->mesh);
         if (!rt->scene) {
-            rmeshFree(mesh);
-            if (rt->retries == 1) tplFailCount++;
-            plog("tpl FAIL sceneBuild %s (try %d)", path, rt->retries);
-            return;
+            rmeshFree(rt->mesh);
+            rt->mesh = NULL;
+            templateRoomFailed(rt, idx, "sceneBuild", "");
+            return 1;
         }
-        for (uint32_t i = 0; i < mesh->entityCount; i++) {
-            const RMeshEntity *e = &mesh->entities[i];
-            if (e->type != RMESH_ENTITY_PROP || !e->u.prop.file) continue;
-            B3DModel *model = propModelGet(e->u.prop.file);
+        templateRoomReady(rt, idx);
+        return 1;
+    }
+
+    if (rt->state == 6) {
+        /* Mesh+scene building on the worker. */
+        LoadJob *j = &loadJobs[rt->loadJob - 1];
+        if (j->stage != 2) return 0;
+        __sync_synchronize();
+        rt->mesh = j->mesh;
+        rt->scene = j->scene;
+        j->mesh = NULL;
+        j->scene = NULL;
+        char err[96];
+        snprintf(err, sizeof(err), "%s", j->err);
+        j->stage = 0;
+        rt->loadJob = 0;
+        if (!rt->mesh || !rt->scene) {
+            if (rt->mesh) rmeshFree(rt->mesh);
+            rt->mesh = NULL;
+            rt->scene = NULL;
+            templateRoomFailed(rt, idx, "async room", err);
+            return 1;
+        }
+        templateRoomReady(rt, idx);
+        return 1;
+    }
+
+    if (rt->state == 3) {
+        /* One prop per call; cold B3D parses run on the worker. */
+        while (rt->propDone < rt->mesh->entityCount) {
+            const RMeshEntity *e = &rt->mesh->entities[rt->propDone];
+            if (e->type != RMESH_ENTITY_PROP || !e->u.prop.file) {
+                rt->propDone++;
+                continue;
+            }
+            int pending = 0;
+            B3DModel *model =
+                allowAsync ? propModelGetAsync(e->u.prop.file, &pending)
+                           : propModelGet(e->u.prop.file);
+            if (pending) return 0;
+            rt->propDone++;
             if (!model) continue;
             float pos[3] = { e->x, e->y, e->z };
             float euler[3] = { e->u.prop.pitch, e->u.prop.yaw,
@@ -328,24 +705,28 @@ static void templateEnsureStep(int idx) {
                              e->u.prop.scaleZ };
             sceneAppendB3D(rt->scene, model, pos, euler, scl,
                            e->u.prop.texture);
+            return 1; /* one appended; the rest on later calls */
         }
-        rt->col = collisionBuild(rt->scene, mesh);
-        rt->emitterCount = 0;
-        for (uint32_t i = 0; i < mesh->entityCount; i++) {
-            const RMeshEntity *e = &mesh->entities[i];
-            if (e->type != RMESH_ENTITY_SOUND_EMITTER) continue;
-            if (rt->emitterCount >= MAX_ROOM_EMITTERS) break;
-            RoomEmitter *em = &rt->emitters[rt->emitterCount++];
-            em->x = e->x;
-            em->y = e->y;
-            em->z = e->z;
-            em->id = e->u.soundEmitter.id;
-            /* File range is raw; the game loops within `range` and
-             * uses the same units the emitter position is in. */
-            em->range = e->u.soundEmitter.range;
-            if (em->range < 256.0f) em->range = 1024.0f;
+        rt->state = 4;
+        return 1;
+    }
+
+    if (rt->state == 4) {
+        /* Collision includes the prop triangles, so it must run after
+         * every prop is appended. Async it goes to the worker (measured
+         * 17-133 ms per room inline); the template must not touch its
+         * scene/mesh while the job is in flight - it stays in state 7,
+         * which does nothing but wait. */
+        if (allowAsync && loaderOk) {
+            int slot = loadJobPostCollision(rt->scene, rt->mesh);
+            if (slot < 0) return 0; /* ring full: retry next frame */
+            rt->loadJob = slot + 1;
+            rt->state = 7;
+            return 1;
         }
-        rmeshFree(mesh);
+        rt->col = collisionBuild(rt->scene, rt->mesh);
+        rmeshFree(rt->mesh);
+        rt->mesh = NULL;
         rt->gl = (BatchGL *)calloc(
             rt->scene->batchCount ? rt->scene->batchCount : 1,
             sizeof(BatchGL));
@@ -354,54 +735,114 @@ static void templateEnsureStep(int idx) {
             rt->scene = NULL;
             collisionFree(rt->col);
             rt->col = NULL;
-            if (rt->retries == 1) tplFailCount++;
-            plog("tpl FAIL gl-calloc %s (try %d)", path, rt->retries);
-            return;
-        }
-        if (rt->retries > 1) {
-            tplFailCount--; /* a retry recovered it */
-            plog("tpl RECOVERED %s (try %d)", path, rt->retries);
+            templateRoomFailed(rt, idx, "gl-calloc", "");
+            return 1;
         }
         rt->texDone = 0;
         rt->state = 2;
-        return;
+        return 1;
     }
 
-    /* state 2: a couple of texture batches per step. */
-    uint32_t end = rt->texDone + 2;
+    if (rt->state == 7) {
+        /* Collision building on the worker. */
+        LoadJob *j = &loadJobs[rt->loadJob - 1];
+        if (j->stage != 2) return 0;
+        __sync_synchronize();
+        rt->col = j->col;
+        j->col = NULL;
+        j->mesh = NULL;  /* borrowed from the template */
+        j->scene = NULL;
+        j->stage = 0;
+        rt->loadJob = 0;
+        rmeshFree(rt->mesh);
+        rt->mesh = NULL;
+        rt->gl = (BatchGL *)calloc(
+            rt->scene->batchCount ? rt->scene->batchCount : 1,
+            sizeof(BatchGL));
+        if (!rt->gl) {
+            sceneFree(rt->scene);
+            rt->scene = NULL;
+            collisionFree(rt->col);
+            rt->col = NULL;
+            templateRoomFailed(rt, idx, "gl-calloc", "");
+            return 1;
+        }
+        rt->texDone = 0;
+        rt->state = 2;
+        return 1;
+    }
+
+    if (rt->state == 2) {
+        /* One batch's textures per call; decodes run on the worker and
+         * the next few batches are queued ahead so it stays fed. */
+        if (rt->texDone < rt->scene->batchCount) {
+            const SceneBatch *b = &rt->scene->batches[rt->texDone];
+            GLuint d, l;
+            if (allowAsync && loaderOk) {
+                int p1 = 0, p2 = 0;
+                d = textureGetAsync(b->diffuseName, &p1);
+                l = textureGetAsync(b->lightmapName, &p2);
+                for (uint32_t k = rt->texDone + 1;
+                     k < rt->scene->batchCount && k < rt->texDone + 4; k++) {
+                    int pk = 0;
+                    (void)textureGetAsync(rt->scene->batches[k].diffuseName,
+                                          &pk);
+                    (void)textureGetAsync(rt->scene->batches[k].lightmapName,
+                                          &pk);
+                }
+                if (p1 || p2) return 0;
+            } else {
+                d = textureGet(b->diffuseName);
+                l = textureGet(b->lightmapName);
+            }
+            rt->gl[rt->texDone].diffuse = d;
+            rt->gl[rt->texDone].lightmap = l;
+            rt->texDone++;
+            return 1;
+        }
+        rt->vboDone = 0;
+        rt->state = 5;
+        return 1;
+    }
+
+    /* state 5: a few VBO/IBO uploads per call (the full-room burst was
+     * a 10-40 ms spike on prop-heavy rooms). */
+    uint32_t end = rt->vboDone + 8;
     if (end > rt->scene->batchCount) end = rt->scene->batchCount;
-    for (; rt->texDone < end; rt->texDone++) {
-        const SceneBatch *b = &rt->scene->batches[rt->texDone];
-        rt->gl[rt->texDone].diffuse = textureGet(b->diffuseName);
-        rt->gl[rt->texDone].lightmap = textureGet(b->lightmapName);
-    }
-    if (rt->texDone < rt->scene->batchCount) return;
-
-    /* Final step: VBO uploads (cheap). */
-    for (uint32_t i = 0; i < rt->scene->batchCount; i++) {
-        const SceneBatch *b = &rt->scene->batches[i];
-        glGenBuffers(1, &rt->gl[i].vbo);
-        glBindBuffer(GL_ARRAY_BUFFER, rt->gl[i].vbo);
+    for (; rt->vboDone < end; rt->vboDone++) {
+        const SceneBatch *b = &rt->scene->batches[rt->vboDone];
+        glGenBuffers(1, &rt->gl[rt->vboDone].vbo);
+        glBindBuffer(GL_ARRAY_BUFFER, rt->gl[rt->vboDone].vbo);
         glBufferData(GL_ARRAY_BUFFER,
                      (GLsizeiptr)(b->vertexCount * sizeof(SceneVertex)),
                      b->vertices, GL_STATIC_DRAW);
-        glGenBuffers(1, &rt->gl[i].ibo);
-        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, rt->gl[i].ibo);
+        glGenBuffers(1, &rt->gl[rt->vboDone].ibo);
+        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, rt->gl[rt->vboDone].ibo);
         glBufferData(GL_ELEMENT_ARRAY_BUFFER,
                      (GLsizeiptr)(b->indexCount * sizeof(uint16_t)),
                      b->indices, GL_STATIC_DRAW);
     }
     glBindBuffer(GL_ARRAY_BUFFER, 0);
     glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
+    if (rt->vboDone < rt->scene->batchCount) return 1;
     rt->state = 1;
+    return 1;
 }
 
-/* Load a room to completion (the cell the player stands in). */
+/* Load a room to completion (the cell the player stands in, and the
+ * spawn-area prewarm behind the loading screen). Synchronous work; if
+ * an async job for this template is already in flight, wait for the
+ * worker rather than duplicating its work. */
 static void templateEnsure(int idx) {
     while (tplRT[idx].state != 1 && tplRT[idx].state != -1) {
-        templateEnsureStep(idx);
+        if (!templateEnsureStep(idx, 0)) {
+            sceKernelDelayThread(500);
+        }
     }
 }
+
+/* Defined after the loading screen: loads the spawn area behind it. */
+static void prewarmSpawnArea(void);
 
 /* ---------------- placement transforms ---------------- */
 
@@ -1377,6 +1818,7 @@ static int activeCount;
 static void updateActiveRooms(const float pos[3]) {
     int px = (int)floorf(pos[0] / ROOM_SPACING + 0.5f);
     int py = (int)floorf(pos[2] / ROOM_SPACING + 0.5f);
+    loaderPump(); /* land finished decodes (a couple of ms at most) */
     activeCount = 0;
     /* One loading increment per frame: the room under the player
      * loads to completion (it is the floor), everything else -
@@ -1398,7 +1840,15 @@ static void updateActiveRooms(const float pos[3]) {
         }
         TemplateRT *rt = &tplRT[p->templateIndex];
         if (self && rt->state != 1 && rt->state != -1) {
+            /* The floor under the player cannot wait; log the stall so
+             * device captures show when the prefetch lost the race. */
+            uint64_t t0 = sceKernelGetProcessTimeWide();
             templateEnsure(p->templateIndex);
+            uint64_t us = sceKernelGetProcessTimeWide() - t0;
+            if (us > 8000) {
+                plog("hitch: blocking room load idx=%d %ums",
+                     p->templateIndex, (unsigned)(us / 1000));
+            }
         } else if (ring <= 2 && rt->state != 1 && rt->state != -1) {
             /* Prefer nearer rings; among equals prefer rooms already
              * mid-load so they finish sooner. */
@@ -1412,19 +1862,53 @@ static void updateActiveRooms(const float pos[3]) {
             activeRooms[activeCount++] = p;
         }
     }
-    if (stepIdx >= 0) templateEnsureStep(stepIdx);
+    if (stepIdx >= 0) {
+        /* Loading budget: ~3 ms of streaming work per frame. The heavy
+         * lifting (decode/parse) runs on the worker; a step returning 0
+         * is waiting on it, so stop for this frame. */
+        uint64_t t0 = sceKernelGetProcessTimeWide();
+        uint64_t us;
+        do {
+            if (!templateEnsureStep(stepIdx, 1)) break;
+            us = sceKernelGetProcessTimeWide() - t0;
+        } while (tplRT[stepIdx].state != 1 && tplRT[stepIdx].state != -1
+                 && us < 3000);
+        us = sceKernelGetProcessTimeWide() - t0;
+        if (us > 8000) {
+            plog("hitch: stream step idx=%d state=%d %ums", stepIdx,
+                 tplRT[stepIdx].state, (unsigned)(us / 1000));
+        }
+    }
 }
 
 static int inIntroBounds(float x, float z);
 
-static const char *roomNameAt(const float pos[3]) {
-    if (inIntroBounds(pos[0], pos[2])) return "cont1_173_intro";
+/* The player's room, with the source's UpdateRooms semantics:
+ * PlayerRoom only changes when another room's cell claims the player,
+ * and PERSISTS while they are over unplaced cells - oversized meshes
+ * like the 173 chamber physically extend across neighbor cells that
+ * carry no placement (verified with seed 959: the start room's exits
+ * cross three empty cells), and recomputing from scratch there made
+ * the HUD read "(void)" and zone/music/ambience fall back to defaults. */
+static int playerRoomIdx = -1;
+
+static int playerRoomLookup(const float pos[3]) {
     int px = (int)floorf(pos[0] / ROOM_SPACING + 0.5f);
     int py = (int)floorf(pos[2] / ROOM_SPACING + 0.5f);
     for (uint32_t i = 0; i < map.roomCount; i++) {
         if (map.rooms[i].gridX == px && map.rooms[i].gridY == py) {
-            return tplList.items[map.rooms[i].templateIndex].name;
+            playerRoomIdx = (int)i;
+            return (int)i;
         }
+    }
+    return playerRoomIdx; /* keep the last claimed room */
+}
+
+static const char *roomNameAt(const float pos[3]) {
+    if (inIntroBounds(pos[0], pos[2])) return "cont1_173_intro";
+    int idx = playerRoomLookup(pos);
+    if (idx >= 0) {
+        return tplList.items[map.rooms[idx].templateIndex].name;
     }
     return "(void)";
 }
@@ -1436,13 +1920,8 @@ static const char *roomNameAt(const float pos[3]) {
  * Defaults to LCZ. */
 static int zoneAt(const float pos[3]) {
     if (inIntroBounds(pos[0], pos[2])) return 1;
-    int px = (int)floorf(pos[0] / ROOM_SPACING + 0.5f);
-    int py = (int)floorf(pos[2] / ROOM_SPACING + 0.5f);
-    for (uint32_t i = 0; i < map.roomCount; i++) {
-        if (map.rooms[i].gridX == px && map.rooms[i].gridY == py) {
-            return mapZoneOf(map.rooms[i].gridY);
-        }
-    }
+    int idx = playerRoomLookup(pos);
+    if (idx >= 0) return mapZoneOf(map.rooms[idx].gridY);
     return 1;
 }
 
@@ -1751,6 +2230,7 @@ static void spawn035(void);
 static void regenerateMap(uint32_t seed) {
     memset(roomVisited, 0, sizeof(roomVisited));
     currentMusicZone = -1;
+    playerRoomIdx = -1; /* the old map's rooms are gone */
     currentAmbienceId = 0;
     inPocket = 0;
     inMask = 0;
@@ -1870,6 +2350,11 @@ static void applyDebugState(void) {
     }
 }
 
+/* Per-frame glDrawElements count (world batches incl. lightmap passes)
+ * for the debug HUD: at 8 fps the question is CPU draw-call overhead vs
+ * GPU fill, and this is the draw-call half of the answer. */
+static int drawCallsFrame, drawCallsShown;
+
 static void drawBatchSet(const Scene *scene, const BatchGL *gl, int alphaPass) {
     for (uint32_t i = 0; i < scene->batchCount; i++) {
         const SceneBatch *b = &scene->batches[i];
@@ -1898,6 +2383,7 @@ static void drawBatchSet(const Scene *scene, const BatchGL *gl, int alphaPass) {
             glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
             glDepthMask(GL_FALSE);
         }
+        drawCallsFrame++;
         glDrawElements(GL_TRIANGLES, (GLsizei)b->indexCount,
                        GL_UNSIGNED_SHORT, NULL);
         if (alphaPass) {
@@ -1923,6 +2409,7 @@ static void drawBatchSet(const Scene *scene, const BatchGL *gl, int alphaPass) {
              * the known-good additive until a corrected modulate (single
              * vc + ambient floor) can be tested on device. */
             glBlendFunc(GL_ONE, GL_ONE);
+            drawCallsFrame++;
             glDrawElements(GL_TRIANGLES, (GLsizei)b->indexCount,
                            GL_UNSIGNED_SHORT, NULL);
             glDisable(GL_BLEND);
@@ -8396,6 +8883,7 @@ static int loadGameFrom(const char *path) {
         doors.items[i].open = doorLine[i] == '1';
         doors.items[i].openState = doors.items[i].open ? 180.0f : 0.0f;
     }
+    prewarmSpawnArea();
     return 1;
 }
 
@@ -9813,6 +10301,7 @@ static int startNewGame(void) {
         introPhase = -1;
         gameMusicStart();
     }
+    prewarmSpawnArea();
     return 1;
 }
 
@@ -10416,6 +10905,41 @@ static void renderLoadingScreen(const char *step, int percent) {
     vglSwapBuffers(GL_FALSE);
 }
 
+/* Load the player's cell and its ring-1 neighbors to completion behind
+ * the loading screen: the synchronous spawn-room load measured 5.4 s on
+ * device, which used to freeze the first gameplay frame. */
+static void prewarmSpawnArea(void) {
+    int px = (int)floorf(camPos[0] / ROOM_SPACING + 0.5f);
+    int py = (int)floorf(camPos[2] / ROOM_SPACING + 0.5f);
+    int total = 0, done = 0;
+    for (uint32_t i = 0; i < map.roomCount; i++) {
+        const RoomPlacement *p = &map.rooms[i];
+        int adx = abs(p->gridX - px), ady = abs(p->gridY - py);
+        const TemplateRT *rt = &tplRT[p->templateIndex];
+        if ((adx > ady ? adx : ady) <= 1 && rt->state != 1
+            && rt->state != -1) {
+            total++;
+        }
+    }
+    if (!total) return;
+    uint64_t t0 = sceKernelGetProcessTimeWide();
+    for (uint32_t i = 0; i < map.roomCount; i++) {
+        const RoomPlacement *p = &map.rooms[i];
+        int adx = abs(p->gridX - px), ady = abs(p->gridY - py);
+        const TemplateRT *rt = &tplRT[p->templateIndex];
+        if ((adx > ady ? adx : ady) > 1 || rt->state == 1
+            || rt->state == -1) {
+            continue;
+        }
+        renderLoadingScreen("LOADING AREA", 100 * done / total);
+        templateEnsure(p->templateIndex);
+        done++;
+    }
+    renderLoadingScreen("LOADING AREA", 100);
+    plog("prewarm: %d rooms in %ums", done,
+         (unsigned)((sceKernelGetProcessTimeWide() - t0) / 1000));
+}
+
 /* The startup_Intro cutscene (Menu_Core PlayMovie("startup_Intro")):
  * played when a new game begins with the intro enabled. The source .wmv
  * is undecodable on the Vita, but the same cutscene ships as H.264 MP4
@@ -10544,6 +11068,15 @@ int main(void) {
 
     inputInit();
 
+    /* Asset loader worker: decodes/parses off the render thread. */
+    loaderRunning = 1;
+    SceUID loaderThread = sceKernelCreateThread("asset_loader", loaderLoop,
+                                                160, 0x40000, 0, 0, NULL);
+    if (loaderThread >= 0) {
+        sceKernelStartThread(loaderThread, 0, NULL);
+        loaderOk = 1;
+    }
+
     int haveData = templatesLoad(ROOMS_INI, &tplList) && tplList.count > 0;
     if (haveData) {
         tplRT = (TemplateRT *)calloc(tplList.count, sizeof(TemplateRT));
@@ -10555,9 +11088,9 @@ int main(void) {
         pendingSeed = (uint32_t)(sceKernelGetProcessTimeWide() & 0xFFFFFF) | 1u;
         /* Play the boot videos now, before the door/NPC/texture/sound
          * load fills the heap: sceAvPlayer needs a few MB of contiguous
-         * CPU RAM for its demux/decode buffers, and after loadSounds
-         * decodes every SFX to PCM there is none left (the device log
-         * showed its 1.5 MB init alloc returning NULL). */
+         * CPU RAM for its demux/decode buffers, so give it the emptiest
+         * heap of the session (sounds now decode lazily, but the door/
+         * NPC/texture load below still costs real memory). */
         playStartupVideos();
         /* Heavy asset + audio load, behind the loading screen so the
          * player sees progress instead of a black screen. */
@@ -10571,10 +11104,26 @@ int main(void) {
         texButtonRed = textureGet("keypad_locked.png");
         pdThroneTex = textureGet("scp_106_eyes.png");
         renderLoadingScreen("LOADING SOUNDS", 70);
-        if (audioOk) loadSounds();
+        if (audioOk) {
+            loadSounds();
+            /* Warm the small, hot SFX so first plays are instant; big
+             * files (voice lines, stingers, ambience) decode on the
+             * decoder thread when first triggered. */
+            audioPredecodeSmall(160 * 1024, 24 * 1024 * 1024);
+        }
         renderLoadingScreen("LOADING DECALS", 90);
         decalsInit();
         renderLoadingScreen("DONE", 100);
+        /* The loading art is never drawn again; return its VRAM (the
+         * world fills the pool completely, so every MB counts). */
+        if (loadBackTex) {
+            glDeleteTextures(1, &loadBackTex);
+            loadBackTex = 0;
+        }
+        if (loadImgTex) {
+            glDeleteTextures(1, &loadImgTex);
+            loadImgTex = 0;
+        }
         /* Boot to the title menu; the world is generated when the
          * player starts or loads a game. */
         enterMenu();
@@ -10591,11 +11140,30 @@ int main(void) {
     while (running) {
         fpsFrames++;
         uint64_t now = sceKernelGetProcessTimeWide();
+        /* Worst frame in the last fps window, split by phase (update /
+         * 3D+HUD draw / buffer swap): the smoothed fps hides stalls and
+         * cannot say whether a slow frame is CPU sim, CPU draw-call
+         * overhead, or GPU-bound (which shows up in the swap wait). */
+        static uint64_t framePrevUs;
+        static uint64_t frameMaxUs, updMaxUs, drawMaxUs, swapMaxUs;
+        static unsigned worstMs, updWorst, drawWorst, swapWorst;
+        uint64_t tUpd = 0, tDraw = 0;
+        if (framePrevUs && now - framePrevUs > frameMaxUs) {
+            frameMaxUs = now - framePrevUs;
+        }
+        framePrevUs = now;
         if (now - fpsLast >= 500000) {
             fps = fpsFrames * 1000000.0f / (float)(now - fpsLast);
             fpsFrames = 0;
             fpsLast = now;
+            worstMs = (unsigned)(frameMaxUs / 1000);
+            updWorst = (unsigned)(updMaxUs / 1000);
+            drawWorst = (unsigned)(drawMaxUs / 1000);
+            swapWorst = (unsigned)(swapMaxUs / 1000);
+            frameMaxUs = updMaxUs = drawMaxUs = swapMaxUs = 0;
         }
+        drawCallsShown = drawCallsFrame;
+        drawCallsFrame = 0;
 
         inputUpdate();
 
@@ -10961,6 +11529,7 @@ int main(void) {
                 updateAmbientSfx();
                 updateRoomEvents();
             }
+            audioService(); /* start ambience whose PCM just finished */
             updatePocketDimension();
             updatePlayerCondition();
             teslaUpdate();
@@ -11203,6 +11772,8 @@ int main(void) {
             if (blinkFrames == 0) blinkTimer = 100.0f;
         }
 
+        tUpd = sceKernelGetProcessTimeWide(); /* sim done; render begins */
+
         /* Capture the nearest monitor's live feed before clearing the
          * frame (it renders into a scissored corner, then copies out). */
         renderCameraFeed();
@@ -11285,10 +11856,10 @@ int main(void) {
         char line2[256];
         struct mallinfo hmi = mallinfo();
         snprintf(line2, sizeof(line2),
-                 "bld=%s fps=%.0f dec-fail=%d texfail=%d tpl=%d act=%d "
-                 "vram=%uK heap=%uK",
-                 PORT_BUILD_TAG, fps, audioLoadDecodeFails(), texFailCount,
-                 tplFailCount, activeCount,
+                 "bld=%s fps=%.0f ms=%u up=%u dr=%u sw=%u dc=%d tpl=%d "
+                 "act=%d vram=%uK heap=%uK",
+                 PORT_BUILD_TAG, fps, worstMs, updWorst, drawWorst,
+                 swapWorst, drawCallsShown, tplFailCount, activeCount,
                  (unsigned)(vglMemFree(VGL_MEM_VRAM) / 1024),
                  (unsigned)((unsigned)hmi.fordblks / 1024));
         drawHud(line1, line2, toastTimer > 0 ? toastMsg : NULL, NULL);
@@ -11452,7 +12023,25 @@ int main(void) {
         glEnableClientState(GL_TEXTURE_COORD_ARRAY);
         glEnable(GL_DEPTH_TEST);
 
+        tDraw = sceKernelGetProcessTimeWide();
         vglSwapBuffers(GL_FALSE);
+        if (tUpd) {
+            uint64_t tEnd = sceKernelGetProcessTimeWide();
+            uint64_t u = tUpd - now, d = tDraw - tUpd, s = tEnd - tDraw;
+            if (u > updMaxUs) updMaxUs = u;
+            if (d > drawMaxUs) drawMaxUs = d;
+            if (s > swapMaxUs) swapMaxUs = s;
+            if (u + d + s > 80000) {
+                static uint64_t lastSlowLog;
+                if (tEnd - lastSlowLog > 1000000) {
+                    lastSlowLog = tEnd;
+                    plog("slowframe upd=%ums draw=%ums swap=%ums dc=%d "
+                         "act=%d",
+                         (unsigned)(u / 1000), (unsigned)(d / 1000),
+                         (unsigned)(s / 1000), drawCallsShown, activeCount);
+                }
+            }
+        }
     }
 
     if (haveData) {

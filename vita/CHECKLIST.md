@@ -118,6 +118,54 @@ Updated as features land. States: **done** / **partial** / **missing**.
 | Door/interact/horror/intro voice sets | done | |
 | Ambient room emitters | done | Source AmbientSFX: every ~15-45 s a random distant one-shot from the current zone's set (SFX/Ambient/Zone1-3, or Forest in the SCP-860 room) drifts in - a scream, a groan, dripping - positioned off to one side of the player and attenuated with distance, so the facility never falls silent. Loaded on demand (the audio cache dedups by path; MAX_SOUNDS raised to fit). Suspended in the intro / pocket / mask dimensions |
 
+## Memory model (the black-world postmortem)
+
+The port once decoded every preloaded sound to PCM at boot (>100 MB),
+running the 220 MB newlib heap to ~230 MB used / <1 MB free in-game.
+Under that pressure allocations failed all over: sound decodes
+(dec-fail), texture decodes (texfail), and - fatally - room-template
+loads, which `templateEnsureStep` latched dead silently, so
+`activeCount` stayed 0 and the whole 3D pass was skipped: black world
+with a live HUD. Hardware-bisected with the on-screen `bld=` tag and
+memory HUD; fixed by decoding sounds lazily on first play (boot heap
+now ~42-67 MB used), retrying + logging template failures to
+`ux0:data/scpcb-ue/render_log.txt`, and freeing the loading-screen art
+after boot. First play of a long sound costs a one-time decode hitch.
+
+## Room-streaming performance
+
+The fps used to drop ~5 and stay unstable for a few seconds whenever a
+new room streamed in. Profiled (static analysis + host measurement of
+the real loaders, adversarially verified): texture steps decoded PNGs
+2 batches per frame at ~13-60 ms each on the Vita CPU, every cache miss
+also paid an unindexed readdir scan of 300+ entry directories, state 0
+did mesh parse + all props + collision in one frame (150-450 ms), the
+VBO upload burst added 10-40 ms, and entering a room with a new sound
+emitter full-decoded its OGG on the main thread (a 30 s ambience loop =
+1-3 s frozen). Fixes: per-directory listing cache in textureResolve;
+the load pipeline split into small per-call units (mesh, one prop,
+collision, one texture batch, 8 VBOs) driven by a ~3 ms per-frame
+budget; sound PCM decodes on a low-priority decoder thread (ambience
+starts when ready via audioService; small hot SFX pre-decode at boot so
+first plays stay instant). Frames stalling >8 ms in the loader log to
+render_log.txt, and the debug HUD shows the worst frame ms per window.
+Second round (the on-device log then showed 25-171 ms texture batches,
+8-209 ms props and 50-210 ms mesh parses still landing on the render
+thread): all decode/parse work moved to a dedicated low-priority loader
+thread - mesh+scene build, prop B3D parse, texture PNG decode, with a
+few batches queued ahead so the worker pipelines - and the render
+thread only consumes results, uploading at most two textures per frame.
+The spawn area now loads behind a "LOADING AREA" screen instead of
+freezing the first gameplay frame for ~5 s.
+Third round (the log then showed one 17-133 ms hitch per room - the
+collision grid build - plus a 9 s prewarm dominated by PNG decode):
+collision builds moved to the loader thread too, and the data packager
+now writes world textures as pre-decoded raw RGBA ("VTEX" content under
+the original filenames; textureLoadFile sniffs the magic like DDS), so
+the device never runs a PNG/JPG decoder for them. Requires re-running
+the package-data job and reinstalling the data (~90 MB larger raw);
+old PNG data still works, just slower.
+
 ## Known visual gaps
 
 - Green-tinted windows reported on device; repo data verified neutral
