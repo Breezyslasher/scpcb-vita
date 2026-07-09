@@ -389,23 +389,26 @@ static int decoderLoop(SceSize argSize, void *argp) {
 
 void audioPredecodeSmall(unsigned maxFileBytes, unsigned maxTotalPcmBytes) {
     /* Boot-time warmup for the small, hot SFX (steps, doors, buttons):
-     * their first play must not wait on the decoder thread. Bounded by
-     * file size and by a total PCM budget so this can never recreate
-     * the decode-everything heap exhaustion. */
-    unsigned total = 0;
-    for (int i = 0; i < soundCount && total < maxTotalPcmBytes; i++) {
-        if (sounds[i].pcm || sounds[i].failed) continue;
+     * queue them on the decoder thread so they decode during the boot
+     * videos / menu instead of blocking the loading screen. Bounded by
+     * file size and an estimated PCM budget (OGG expands ~12x) so this
+     * can never recreate the decode-everything heap exhaustion. */
+    unsigned estTotal = 0;
+    int queued = 0;
+    for (int i = 0; i < soundCount && estTotal < maxTotalPcmBytes; i++) {
+        if (sounds[i].pcm || sounds[i].failed || sounds[i].wanted) continue;
         FILE *f = fopen(sounds[i].path, "rb");
         if (!f) continue;
         fseek(f, 0, SEEK_END);
         long sz = ftell(f);
         fclose(f);
         if (sz <= 0 || (unsigned)sz > maxFileBytes) continue;
-        if (decodeSoundNow(i)) {
-            total += sounds[i].frames * (unsigned)sounds[i].channels * 2u;
-        }
+        estTotal += (unsigned)sz * 12u;
+        sounds[i].wanted = 1;
+        queued++;
     }
-    alog("predecode: %u KB PCM resident", total / 1024);
+    alog("predecode: queued %d sounds (~%u KB PCM)", queued,
+         estTotal / 1024);
 }
 
 int audioLoad(const char *path) {

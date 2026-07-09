@@ -53,7 +53,7 @@ unsigned int _newlib_heap_size_user = 220 * 1024 * 1024;
 
 #define DATA_ROOT "ux0:data/scpcb-ue"
 /* Shown in the debug HUD so a stale VPK install is instantly visible. */
-#define PORT_BUILD_TAG "perf6-cull"
+#define PORT_BUILD_TAG "perf7-bootwarm"
 
 /* Diagnostic switch: set to 1 to skip ALL video playback (boot clips
  * and intro). The diag2-novid device test proved the video player was
@@ -10862,6 +10862,8 @@ static void enterMenu(void) {
  * sceAvPlayer. Gated by the "Startup videos" option (opt\PlayStartup);
  * like the source's PlayMovie, a clip that will not open is simply
  * skipped - there is no title-card substitute. */
+static void bgLoadTick(void); /* defined with the intro video */
+
 static void playStartupVideos(void) {
 #if DIAG_DISABLE_VIDEOS
     return;
@@ -10870,11 +10872,13 @@ static void playStartupVideos(void) {
     static const char *CLIPS[4] = {
         "startup_Undertow", "startup_TSS", "startup_UET", "startup_Warning",
     };
+    videoSetIdleCallback(bgLoadTick);
     for (int i = 0; i < 4; i++) {
         char vp[256];
         snprintf(vp, sizeof(vp), MENU_DIR "/%s.mp4", CLIPS[i]);
         videoPlayFile(vp);
     }
+    videoSetIdleCallback(NULL);
 }
 
 /* ---- loading screen (Menu_Core RenderLoading) ----
@@ -10990,9 +10994,27 @@ static void prewarmSpawnArea(void) {
  * cutscene, so feed the loader and step the spawn ring's templates
  * under a small budget - by the time the video ends the area is mostly
  * resident and the follow-up prewarm is nearly a no-op. */
+static const char *BOOT_WARM_MODELS[] = {
+    "guard.b3d",       "class_d.b3d",   "scp_008_1.b3d", "scp_049.b3d",
+    "scp_049_2.b3d",   "scp_096.b3d",   "scp_106.b3d",   "scp_1499_1.b3d",
+    "scp_205_demon.b3d", "scp_372.b3d", "scp_513_1.b3d", "scp_860_2.b3d",
+    "scp_939.b3d",     "scp_966.b3d",
+};
+
 static void bgLoadTick(void) {
     loaderPump();
-    if (!worldReady) return;
+    if (!worldReady) {
+        /* Boot videos: warm the NPC models the post-video load needs
+         * (cache hits or in-flight requests are no-ops, so calling
+         * every tick just retries what the job ring couldn't fit). */
+        for (unsigned i = 0;
+             i < sizeof(BOOT_WARM_MODELS) / sizeof(BOOT_WARM_MODELS[0]);
+             i++) {
+            int pending = 0;
+            (void)propModelGetAsync(BOOT_WARM_MODELS[i], &pending);
+        }
+        return;
+    }
     int px = (int)floorf(camPos[0] / ROOM_SPACING + 0.5f);
     int py = (int)floorf(camPos[2] / ROOM_SPACING + 0.5f);
     uint64_t t0 = sceKernelGetProcessTimeWide();
@@ -11150,11 +11172,17 @@ int main(void) {
         if (audioOk) optionsApply();
         srand((unsigned)sceKernelGetProcessTimeWide());
         pendingSeed = (uint32_t)(sceKernelGetProcessTimeWide() & 0xFFFFFF) | 1u;
-        /* Play the boot videos now, before the door/NPC/texture/sound
-         * load fills the heap: sceAvPlayer needs a few MB of contiguous
-         * CPU RAM for its demux/decode buffers, so give it the emptiest
-         * heap of the session (sounds now decode lazily, but the door/
-         * NPC/texture load below still costs real memory). */
+        /* Register sounds and queue the small hot set on the decoder
+         * thread BEFORE the boot videos: registration is just fopen
+         * probes, and the decodes then overlap the ~40 s of video. */
+        if (audioOk) {
+            loadSounds();
+            audioPredecodeSmall(160 * 1024, 24 * 1024 * 1024);
+        }
+        /* Play the boot videos now, before the door/NPC/texture load
+         * fills the heap: sceAvPlayer needs a few MB of contiguous CPU
+         * RAM for its demux/decode buffers. Between video frames the
+         * idle callback warms the NPC/door model cache. */
         playStartupVideos();
         /* Heavy asset + audio load, behind the loading screen so the
          * player sees progress instead of a black screen. */
@@ -11168,13 +11196,7 @@ int main(void) {
         texButtonRed = textureGet("keypad_locked.png");
         pdThroneTex = textureGet("scp_106_eyes.png");
         renderLoadingScreen("LOADING SOUNDS", 70);
-        if (audioOk) {
-            loadSounds();
-            /* Warm the small, hot SFX so first plays are instant; big
-             * files (voice lines, stingers, ambience) decode on the
-             * decoder thread when first triggered. */
-            audioPredecodeSmall(160 * 1024, 24 * 1024 * 1024);
-        }
+        /* (sounds registered + queued before the boot videos) */
         renderLoadingScreen("LOADING DECALS", 90);
         decalsInit();
         renderLoadingScreen("DONE", 100);
