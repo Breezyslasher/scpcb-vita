@@ -53,7 +53,7 @@ unsigned int _newlib_heap_size_user = 220 * 1024 * 1024;
 
 #define DATA_ROOT "ux0:data/scpcb-ue"
 /* Shown in the debug HUD so a stale VPK install is instantly visible. */
-#define PORT_BUILD_TAG "blur1-1499"
+#define PORT_BUILD_TAG "radio-hands"
 
 /* Diagnostic switch: set to 1 to skip ALL video playback (boot clips
  * and intro). The diag2-novid device test proved the video player was
@@ -8737,8 +8737,123 @@ static void updateAmbientSfx(void) {
     ambSfxTimer = 900.0f + (float)(rand() % 1800); /* ~15-45 s at 60 fps */
 }
 
-/* Radio Transceiver: SCPRadio stations stream where the zone music
- * normally plays; switching it off restores the music. */
+/* Radio Transceiver, the source's four channels (Main_Core 5420-5700)
+ * on the streamed-music path:
+ *   CH1 alarm broadcast: RadioAlarm0 x4 then RadioAlarm1, repeating.
+ *   CH2 on-site radio show: jingle SCPRadio0 alternating with segments
+ *       SCPRadio1..8 (state cycles 1..16).
+ *   CH3 static; once the facility is on alert it carries the MTF
+ *       chatter escalation Random0..6, each line once (the source keys
+ *       on MTFTimer; with no MTF squad ported this keys on the player
+ *       having left the LCZ).
+ *   CH4 static with the one-time story chatter: Chatter2 first (the
+ *       remote-door hint), then OhGod (while 106 roams) / Chatter1 /
+ *       Franklin0 / Chatter3 / 035Help0 / Chatter0 / Franklin1 /
+ *       035Help1 / Franklin2 / Franklin3 on a randomly-advancing
+ *       counter, mirroring the source's Case ladder.
+ * During the SCP-079/895 broadcast every channel degrades to
+ * Static895, like the source's CoffinEffect. */
+static int radioSt1;        /* CH1 alarm loop counter */
+static int radioSt2;        /* CH2 show state, cycles 1..16 */
+static float radioSt3;      /* CH3 chatter counter */
+static int radioOnce3[7];   /* CH3 one-time latches */
+static float radioSt4;      /* CH4 chatter counter */
+static int radioOnce4[10];  /* CH4 one-time latches */
+static int radioCh4Intro;   /* CH4's first-time Chatter2 played */
+static int radioIdleStatic; /* the current stream is the static bed */
+
+static void radioStream(const char *file, int loop) {
+    char path[256];
+    snprintf(path, sizeof(path), DATA_ROOT "/SFX/Radio/%s", file);
+    audioStreamMusic(path, 0.75f, loop);
+    radioIdleStatic = loop; /* only the static bed loops */
+}
+
+static void radioService(void) {
+    if (radioChannel < 0) return;
+    /* Broadcast static overrides everything (source CoffinEffect). */
+    static int wasBroadcast;
+    int broadcast = leftFirstZone && scp895Ok;
+    if (broadcast != wasBroadcast) {
+        wasBroadcast = broadcast;
+        radioStream(broadcast ? "Static895.ogg" : "Static.ogg", 1);
+        return;
+    }
+    if (broadcast) return;
+
+    /* Chatter channels: while the static bed loops, tick the event
+     * counters; an event interrupts the bed with a one-shot line and
+     * the bed resumes when it ends. */
+    int idle = !audioMusicPlaying();
+    if (radioChannel == 2) {
+        if (leftFirstZone && (rand() % 10) == 0) {
+            static const char *MTF[7] = {
+                "MTFRandom0.ogg", "MTFRandom1.ogg", "MTFRandom2.ogg",
+                "MTFRandom3.ogg", "MTFRandom4.ogg", "MTFRandom5.ogg",
+                "MTFRandom6.ogg",
+            };
+            int step = (int)radioSt3;
+            if (step < 7 && !radioOnce3[step] && radioIdleStatic) {
+                radioOnce3[step] = 1;
+                radioSt3 += 1.0f;
+                radioStream(MTF[step], 0);
+                return;
+            }
+        }
+        if (idle) radioStream("Static.ogg", 1);
+        return;
+    }
+    if (radioChannel == 3) {
+        if (radioIdleStatic) {
+            if (!radioCh4Intro) {
+                radioCh4Intro = 1;
+                radioStream("Chatter2.ogg", 0);
+                return;
+            }
+            radioSt4 += (float)(rand() % 12 == 0);
+            static const struct { int at; const char *file; } LADDER[10] = {
+                { 10, "OhGod.ogg" },     { 100, "Chatter1.ogg" },
+                { 158, "Franklin0.ogg" },{ 200, "Chatter3.ogg" },
+                { 260, "035Help0.ogg" }, { 300, "Chatter0.ogg" },
+                { 350, "Franklin1.ogg" },{ 400, "035Help1.ogg" },
+                { 450, "Franklin2.ogg" },{ 500, "Franklin3.ogg" },
+            };
+            for (int i = 0; i < 10; i++) {
+                if ((int)radioSt4 == LADDER[i].at && !radioOnce4[i]) {
+                    /* OhGod only while 106 is loose, like the source. */
+                    if (i == 0 && !npc106Active) {
+                        radioSt4 += 1.0f;
+                        break;
+                    }
+                    radioOnce4[i] = 1;
+                    radioSt4 += 1.0f;
+                    radioStream(LADDER[i].file, 0);
+                    return;
+                }
+            }
+        }
+        if (idle) radioStream("Static.ogg", 1);
+        return;
+    }
+    if (!idle) return;
+    if (radioChannel == 0) {
+        radioSt1++;
+        radioStream(radioSt1 % 5 == 0 ? "RadioAlarm1.ogg" : "RadioAlarm0.ogg",
+                    0);
+    } else { /* channel 1: the radio show */
+        radioSt2++;
+        if (radioSt2 >= 17) radioSt2 = 1;
+        if ((radioSt2 & 1) == 0) {
+            char seg[32];
+            snprintf(seg, sizeof(seg), "SCPRadio%d.ogg", radioSt2 / 2);
+            radioStream(seg, 0);
+        } else {
+            radioStream("SCPRadio0.ogg", 0);
+        }
+    }
+}
+
+/* Switching it off restores the game music. */
 static void radioSetChannel(int ch) {
     radioChannel = ch;
     if (ch < 0) {
@@ -8746,9 +8861,8 @@ static void radioSetChannel(int ch) {
         gameMusicStart();
         return;
     }
-    char path[256];
-    snprintf(path, sizeof(path), DATA_ROOT "/SFX/Radio/SCPRadio%d.ogg", ch);
-    audioStreamMusic(path, 0.75f, 1);
+    audioStopMusic();
+    radioIdleStatic = 0; /* radioService picks the channel's next clip */
 }
 
 /* ---- named saves ---- */
@@ -11119,13 +11233,23 @@ static void drawNav(void) {
     float ox = SCREEN_W - PANEL - 18.0f, oy = SCREEN_H - PANEL - 60.0f;
     float cell = PANEL / (float)(2 * R + 1);
 
+    /* The device itself (source: navigator.png held in hand), its
+     * screen area backing the map cells. */
+    GLuint navTex = textureGet("navigator.png");
+    if (navTex) {
+        float dev = PANEL * 1.62f;
+        drawTexQuad(ox + PANEL * 0.5f - dev * 0.5f,
+                    oy + PANEL * 0.5f - dev * 0.44f, dev, dev, navTex, 1.0f);
+    }
     drawQuad(ox - 5, oy - 5, PANEL + 10, PANEL + 10, 0, 0.02f, 0.08f, 0.02f,
              0.88f);
-    float bc = 0.1f, bg = 0.75f;
-    drawQuad(ox - 5, oy - 5, PANEL + 10, 2, 0, bc, bg, bc, 1.0f);
-    drawQuad(ox - 5, oy + PANEL + 3, PANEL + 10, 2, 0, bc, bg, bc, 1.0f);
-    drawQuad(ox - 5, oy - 5, 2, PANEL + 10, 0, bc, bg, bc, 1.0f);
-    drawQuad(ox + PANEL + 3, oy - 5, 2, PANEL + 10, 0, bc, bg, bc, 1.0f);
+    if (!navTex) {
+        float bc = 0.1f, bg = 0.75f;
+        drawQuad(ox - 5, oy - 5, PANEL + 10, 2, 0, bc, bg, bc, 1.0f);
+        drawQuad(ox - 5, oy + PANEL + 3, PANEL + 10, 2, 0, bc, bg, bc, 1.0f);
+        drawQuad(ox - 5, oy - 5, 2, PANEL + 10, 0, bc, bg, bc, 1.0f);
+        drawQuad(ox + PANEL + 3, oy - 5, 2, PANEL + 10, 0, bc, bg, bc, 1.0f);
+    }
 
     float pgx = camPos[0] / ROOM_SPACING;
     float pgy = camPos[2] / ROOM_SPACING;
@@ -11653,6 +11777,7 @@ int main(void) {
             introUpdate();
             if (introPhase < 0 && !inPocket) {
                 updateZoneMusic();
+                radioService();
                 updateRoomAmbience();
                 updateAmbientSfx();
                 updateRoomEvents();
@@ -11935,7 +12060,13 @@ int main(void) {
             glTranslatef(-camPos[0], -camPos[1], -camPos[2]);
 
             glColor4f(1, 1, 1, 1);
+            /* Skip rooms entirely behind the camera (a generous margin
+             * keeps anything that could bleed into the periphery). */
+            float cullFx = sinf(camYaw), cullFz = -cosf(camYaw);
             for (int i = 0; i < activeCount; i++) {
+                float rdx = activeRooms[i]->gridX * ROOM_SPACING - camPos[0];
+                float rdz = activeRooms[i]->gridY * ROOM_SPACING - camPos[2];
+                if (rdx * cullFx + rdz * cullFz < -ROOM_SPACING) continue;
                 drawRoomBatches(activeRooms[i], 0);
             }
             if (introCellGL && inIntroBounds(camPos[0], camPos[2])) {
@@ -11976,6 +12107,9 @@ int main(void) {
             drawIntroHumans(camPos);
             glDisable(GL_CULL_FACE);
             for (int i = 0; i < activeCount; i++) {
+                float rdx = activeRooms[i]->gridX * ROOM_SPACING - camPos[0];
+                float rdz = activeRooms[i]->gridY * ROOM_SPACING - camPos[2];
+                if (rdx * cullFx + rdz * cullFz < -ROOM_SPACING) continue;
                 drawRoomBatches(activeRooms[i], 1);
             }
             if (introCellGL && inIntroBounds(camPos[0], camPos[2])) {
@@ -12025,6 +12159,39 @@ int main(void) {
             glDrawArrays(GL_TRIANGLES, 0, 6);
             glDisable(GL_BLEND);
             glColor4f(1, 1, 1, 1);
+        }
+        /* Wearable overlays (the source's GFX/Overlays fullscreen art):
+         * the goggle housing over the NVG tint, the mask/hazmat visor
+         * whenever one is worn (SCP-1499 is a gas mask too). */
+        if (haveData && !invOpen && !pauseOpen && deathTimer == 0) {
+            if (wearNVG) {
+                drawTexQuad(0, 0, SCREEN_W, SCREEN_H,
+                            textureGet("night_vision_goggles_overlay.png"),
+                            1.0f);
+            }
+            if (wearGasMask || inMask) {
+                drawTexQuad(0, 0, SCREEN_W, SCREEN_H,
+                            textureGet("gas_mask_overlay.png"), 1.0f);
+            } else if (wearHazmat) {
+                drawTexQuad(0, 0, SCREEN_W, SCREEN_H,
+                            textureGet("hazmat_suit_overlay.png"), 1.0f);
+            }
+        }
+        /* The held radio (source: radio.png in-hand image with the
+         * channel display) sits bottom-left while it is on. */
+        if (haveData && radioChannel >= 0 && !invOpen && !pauseOpen
+            && deathTimer == 0) {
+            float rs = 230.0f;
+            float rx = -26.0f, ry = SCREEN_H - rs + 30.0f;
+            drawTexQuad(rx, ry, rs, rs, textureGet("radio.png"), 1.0f);
+            glPushMatrix();
+            glScalef(1.4f, 1.4f, 1.0f);
+            glColor4f(0.9f, 0.4f, 0.2f, 1.0f);
+            char chTxt[8];
+            snprintf(chTxt, sizeof(chTxt), "CH %d", radioChannel + 1);
+            drawText((rx + 92.0f) / 1.4f, (ry + 96.0f) / 1.4f, chTxt);
+            glColor4f(1, 1, 1, 1);
+            glPopMatrix();
         }
         /* Bleeding: a red vignette that deepens with bloodloss, plus
          * a flash when damage lands. */
