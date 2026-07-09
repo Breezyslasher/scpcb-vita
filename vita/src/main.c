@@ -1819,6 +1819,8 @@ static void setupMaintenanceTunnel(void) {
 static const RoomPlacement *activeRooms[16];
 static int activeCount;
 
+static int playerRoomLookup(const float pos[3]); /* defined w/ roomNameAt */
+
 static void updateActiveRooms(const float pos[3]) {
     int px = (int)floorf(pos[0] / ROOM_SPACING + 0.5f);
     int py = (int)floorf(pos[2] / ROOM_SPACING + 0.5f);
