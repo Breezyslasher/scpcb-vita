@@ -53,7 +53,7 @@ unsigned int _newlib_heap_size_user = 220 * 1024 * 1024;
 
 #define DATA_ROOT "ux0:data/scpcb-ue"
 /* Shown in the debug HUD so a stale VPK install is instantly visible. */
-#define PORT_BUILD_TAG "perf4diag"
+#define PORT_BUILD_TAG "diag5-room"
 
 /* Diagnostic switch: set to 1 to skip ALL video playback (boot clips
  * and intro). The diag2-novid device test proved the video player was
@@ -1883,14 +1883,32 @@ static void updateActiveRooms(const float pos[3]) {
 
 static int inIntroBounds(float x, float z);
 
-static const char *roomNameAt(const float pos[3]) {
-    if (inIntroBounds(pos[0], pos[2])) return "cont1_173_intro";
+/* The player's room, with the source's UpdateRooms semantics:
+ * PlayerRoom only changes when another room's cell claims the player,
+ * and PERSISTS while they are over unplaced cells - oversized meshes
+ * like the 173 chamber physically extend across neighbor cells that
+ * carry no placement (verified with seed 959: the start room's exits
+ * cross three empty cells), and recomputing from scratch there made
+ * the HUD read "(void)" and zone/music/ambience fall back to defaults. */
+static int playerRoomIdx = -1;
+
+static int playerRoomLookup(const float pos[3]) {
     int px = (int)floorf(pos[0] / ROOM_SPACING + 0.5f);
     int py = (int)floorf(pos[2] / ROOM_SPACING + 0.5f);
     for (uint32_t i = 0; i < map.roomCount; i++) {
         if (map.rooms[i].gridX == px && map.rooms[i].gridY == py) {
-            return tplList.items[map.rooms[i].templateIndex].name;
+            playerRoomIdx = (int)i;
+            return (int)i;
         }
+    }
+    return playerRoomIdx; /* keep the last claimed room */
+}
+
+static const char *roomNameAt(const float pos[3]) {
+    if (inIntroBounds(pos[0], pos[2])) return "cont1_173_intro";
+    int idx = playerRoomLookup(pos);
+    if (idx >= 0) {
+        return tplList.items[map.rooms[idx].templateIndex].name;
     }
     return "(void)";
 }
@@ -1902,13 +1920,8 @@ static const char *roomNameAt(const float pos[3]) {
  * Defaults to LCZ. */
 static int zoneAt(const float pos[3]) {
     if (inIntroBounds(pos[0], pos[2])) return 1;
-    int px = (int)floorf(pos[0] / ROOM_SPACING + 0.5f);
-    int py = (int)floorf(pos[2] / ROOM_SPACING + 0.5f);
-    for (uint32_t i = 0; i < map.roomCount; i++) {
-        if (map.rooms[i].gridX == px && map.rooms[i].gridY == py) {
-            return mapZoneOf(map.rooms[i].gridY);
-        }
-    }
+    int idx = playerRoomLookup(pos);
+    if (idx >= 0) return mapZoneOf(map.rooms[idx].gridY);
     return 1;
 }
 
@@ -2217,6 +2230,7 @@ static void spawn035(void);
 static void regenerateMap(uint32_t seed) {
     memset(roomVisited, 0, sizeof(roomVisited));
     currentMusicZone = -1;
+    playerRoomIdx = -1; /* the old map's rooms are gone */
     currentAmbienceId = 0;
     inPocket = 0;
     inMask = 0;
