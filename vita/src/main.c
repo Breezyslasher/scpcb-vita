@@ -53,7 +53,7 @@ unsigned int _newlib_heap_size_user = 220 * 1024 * 1024;
 
 #define DATA_ROOT "ux0:data/scpcb-ue"
 /* Shown in the debug HUD so a stale VPK install is instantly visible. */
-#define PORT_BUILD_TAG "mirror1"
+#define PORT_BUILD_TAG "blur1"
 
 /* Diagnostic switch: set to 1 to skip ALL video playback (boot clips
  * and intro). The diag2-novid device test proved the video player was
@@ -2380,6 +2380,11 @@ static void applyDebugState(void) {
  * for the debug HUD: at 8 fps the question is CPU draw-call overhead vs
  * GPU fill, and this is the draw-call half of the answer. */
 static int drawCallsFrame, drawCallsShown;
+/* Per-frame attribution for the SCP-106 fps question: the screen-blur
+ * post-process (full-screen glCopyTexImage2D + 4 blended fullscreen
+ * quads while 106 is near) and the 106 CPU skinning. */
+static unsigned blurUsFrame, skinUsFrame;
+static unsigned blurUsShown, skinUsShown;
 
 static void drawBatchSet(const Scene *scene, const BatchGL *gl, int alphaPass) {
     if (!alphaPass) {
@@ -6807,7 +6812,9 @@ static void draw106(const float viewPos[3]) {
     /* Re-skin at ~30 Hz. */
     static int poseTick;
     if (!posed106 || ((poseTick++) & 1) == 0) {
+        uint64_t st0 = sceKernelGetProcessTimeWide();
         skinnedEval(skin106, npc106Frame);
+        skinUsFrame += (unsigned)(sceKernelGetProcessTimeWide() - st0);
         uint32_t vc;
         const SceneVertex *verts = skinnedVertices(skin106, &vc);
         glBindBuffer(GL_ARRAY_BUFFER, vbo106);
@@ -10001,7 +10008,9 @@ static void endHud2D(void) {
 static GLuint blurTex;
 static void drawScreenBlur(void) {
     if (blurAmount <= 0.02f) return;
+    uint64_t t0 = sceKernelGetProcessTimeWide();
     float amt = blurAmount > 0.9f ? 0.9f : blurAmount;
+    int firstUse = !blurTex;
     if (!blurTex) {
         glGenTextures(1, &blurTex);
         glBindTexture(GL_TEXTURE_2D, blurTex);
@@ -10010,8 +10019,15 @@ static void drawScreenBlur(void) {
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
     }
-    glBindTexture(GL_TEXTURE_2D, blurTex);
-    glCopyTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, 0, 0, SCREEN_W, SCREEN_H, 0);
+    /* The full-screen copy stalls the GPU pipeline; refreshing the
+     * smear source every other frame is imperceptible and halves the
+     * cost (measured as the main suspect in 106's fps drop). */
+    static int copyTick;
+    if (firstUse || ((copyTick++) & 1) == 0) {
+        glBindTexture(GL_TEXTURE_2D, blurTex);
+        glCopyTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, 0, 0, SCREEN_W, SCREEN_H,
+                         0);
+    }
 
     beginHud2D();
     glEnable(GL_TEXTURE_2D);
@@ -10039,6 +10055,7 @@ static void drawScreenBlur(void) {
     glDisable(GL_BLEND);
     glColor4f(1, 1, 1, 1);
     endHud2D();
+    blurUsFrame += (unsigned)(sceKernelGetProcessTimeWide() - t0);
 }
 
 /* Design-space mapping: Menu_Core.bb lays the menu out in 1280x960. */
@@ -11257,6 +11274,9 @@ int main(void) {
         }
         drawCallsShown = drawCallsFrame;
         drawCallsFrame = 0;
+        blurUsShown = blurUsFrame;
+        skinUsShown = skinUsFrame;
+        blurUsFrame = skinUsFrame = 0;
 
         inputUpdate();
 
@@ -12142,9 +12162,10 @@ int main(void) {
                 if (tEnd - lastSlowLog > 1000000) {
                     lastSlowLog = tEnd;
                     plog("slowframe upd=%ums draw=%ums swap=%ums dc=%d "
-                         "act=%d",
+                         "act=%d blur=%ums skin=%ums",
                          (unsigned)(u / 1000), (unsigned)(d / 1000),
-                         (unsigned)(s / 1000), drawCallsShown, activeCount);
+                         (unsigned)(s / 1000), drawCallsShown, activeCount,
+                         blurUsShown / 1000, skinUsShown / 1000);
                 }
             }
         }
