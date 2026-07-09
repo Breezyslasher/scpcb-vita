@@ -61,6 +61,12 @@ int sceneAppendB3D(Scene *scene, const B3DModel *model,
                    const float pos[3], const float eulerDeg[3],
                    const float scale[3], const char *textureOverride);
 
+/* Collapse batches sharing (diffuse, lightmap, alpha pass) into single
+ * draw units under the 16-bit index limit. Prop-heavy rooms otherwise
+ * reach 250+ batches (measured 657 draws/frame = ~60 ms of CPU on the
+ * Vita); call once after all appends, before GL buffers exist. */
+void sceneMergeBatches(Scene *scene);
+
 void sceneFree(Scene *scene);
 
 #endif

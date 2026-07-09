@@ -53,7 +53,7 @@ unsigned int _newlib_heap_size_user = 220 * 1024 * 1024;
 
 #define DATA_ROOT "ux0:data/scpcb-ue"
 /* Shown in the debug HUD so a stale VPK install is instantly visible. */
-#define PORT_BUILD_TAG "diag5-room"
+#define PORT_BUILD_TAG "perf5-merge"
 
 /* Diagnostic switch: set to 1 to skip ALL video playback (boot clips
  * and intro). The diag2-novid device test proved the video player was
@@ -298,6 +298,9 @@ static int loaderLoop(SceSize argSize, void *argp) {
             } else if (j->type == LOADJOB_MODEL) {
                 j->model = b3dLoadFile(j->path, j->err, sizeof(j->err));
             } else if (j->type == LOADJOB_COLLISION) {
+                /* Merge first so collision and the GL buffers both see
+                 * the collapsed batch list. */
+                sceneMergeBatches(j->scene);
                 j->col = collisionBuild(j->scene, j->mesh);
             } else {
                 j->mesh = rmeshLoadFile(j->path, j->err, sizeof(j->err));
@@ -724,6 +727,7 @@ static int templateEnsureStep(int idx, int allowAsync) {
             rt->state = 7;
             return 1;
         }
+        sceneMergeBatches(rt->scene);
         rt->col = collisionBuild(rt->scene, rt->mesh);
         rmeshFree(rt->mesh);
         rt->mesh = NULL;
@@ -1819,6 +1823,26 @@ static void updateActiveRooms(const float pos[3]) {
     int px = (int)floorf(pos[0] / ROOM_SPACING + 0.5f);
     int py = (int)floorf(pos[2] / ROOM_SPACING + 0.5f);
     loaderPump(); /* land finished decodes (a couple of ms at most) */
+    /* Oversized meshes (the 173 chamber spans three unplaced cells)
+     * put the player over cells with no placement; centre the ring on
+     * the room that still claims them or activeCount hits 0 at the
+     * mesh's far end and the whole 3D pass goes black (reported at the
+     * chamber's office door). */
+    int claimed = playerRoomLookup(pos);
+    if (claimed >= 0 && (map.rooms[claimed].gridX != px
+                         || map.rooms[claimed].gridY != py)) {
+        int hasRoom = 0;
+        for (uint32_t i = 0; i < map.roomCount; i++) {
+            if (map.rooms[i].gridX == px && map.rooms[i].gridY == py) {
+                hasRoom = 1;
+                break;
+            }
+        }
+        if (!hasRoom) {
+            px = map.rooms[claimed].gridX;
+            py = map.rooms[claimed].gridY;
+        }
+    }
     activeCount = 0;
     /* One loading increment per frame: the room under the player
      * loads to completion (it is the floor), everything else -
