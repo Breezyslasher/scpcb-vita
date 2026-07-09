@@ -21,4 +21,8 @@ int videoInit(void);
  * render loop and calls inputUpdate() each frame. */
 int videoPlayFile(const char *path);
 
+/* Optional per-frame hook run inside videoPlayFile's loop, so idle
+ * video time (the ~14 s intro) can feed background asset loading. */
+void videoSetIdleCallback(void (*fn)(void));
+
 #endif

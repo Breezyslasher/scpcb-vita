@@ -53,7 +53,7 @@ unsigned int _newlib_heap_size_user = 220 * 1024 * 1024;
 
 #define DATA_ROOT "ux0:data/scpcb-ue"
 /* Shown in the debug HUD so a stale VPK install is instantly visible. */
-#define PORT_BUILD_TAG "diag5-room"
+#define PORT_BUILD_TAG "mirror1"
 
 /* Diagnostic switch: set to 1 to skip ALL video playback (boot clips
  * and intro). The diag2-novid device test proved the video player was
@@ -298,6 +298,9 @@ static int loaderLoop(SceSize argSize, void *argp) {
             } else if (j->type == LOADJOB_MODEL) {
                 j->model = b3dLoadFile(j->path, j->err, sizeof(j->err));
             } else if (j->type == LOADJOB_COLLISION) {
+                /* Merge first so collision and the GL buffers both see
+                 * the collapsed batch list. */
+                sceneMergeBatches(j->scene);
                 j->col = collisionBuild(j->scene, j->mesh);
             } else {
                 j->mesh = rmeshLoadFile(j->path, j->err, sizeof(j->err));
@@ -724,6 +727,7 @@ static int templateEnsureStep(int idx, int allowAsync) {
             rt->state = 7;
             return 1;
         }
+        sceneMergeBatches(rt->scene);
         rt->col = collisionBuild(rt->scene, rt->mesh);
         rmeshFree(rt->mesh);
         rt->mesh = NULL;
@@ -1815,10 +1819,32 @@ static void setupMaintenanceTunnel(void) {
 static const RoomPlacement *activeRooms[16];
 static int activeCount;
 
+static int playerRoomLookup(const float pos[3]); /* defined w/ roomNameAt */
+
 static void updateActiveRooms(const float pos[3]) {
     int px = (int)floorf(pos[0] / ROOM_SPACING + 0.5f);
     int py = (int)floorf(pos[2] / ROOM_SPACING + 0.5f);
     loaderPump(); /* land finished decodes (a couple of ms at most) */
+    /* Oversized meshes (the 173 chamber spans three unplaced cells)
+     * put the player over cells with no placement; centre the ring on
+     * the room that still claims them or activeCount hits 0 at the
+     * mesh's far end and the whole 3D pass goes black (reported at the
+     * chamber's office door). */
+    int claimed = playerRoomLookup(pos);
+    if (claimed >= 0 && (map.rooms[claimed].gridX != px
+                         || map.rooms[claimed].gridY != py)) {
+        int hasRoom = 0;
+        for (uint32_t i = 0; i < map.roomCount; i++) {
+            if (map.rooms[i].gridX == px && map.rooms[i].gridY == py) {
+                hasRoom = 1;
+                break;
+            }
+        }
+        if (!hasRoom) {
+            px = map.rooms[claimed].gridX;
+            py = map.rooms[claimed].gridY;
+        }
+    }
     activeCount = 0;
     /* One loading increment per frame: the room under the player
      * loads to completion (it is the floor), everything else -
@@ -2356,6 +2382,18 @@ static void applyDebugState(void) {
 static int drawCallsFrame, drawCallsShown;
 
 static void drawBatchSet(const Scene *scene, const BatchGL *gl, int alphaPass) {
+    if (!alphaPass) {
+        /* Backface-cull the opaque room geometry: measured CCW-outward
+         * across the shipped meshes (floor-normal and signed-volume
+         * tests on host), and drawing double-sided cost ~2x GPU fill -
+         * the profiler showed sustained 150-190 ms GPU-bound frames.
+         * Alpha surfaces (glass) stay double-sided like the source. */
+        glEnable(GL_CULL_FACE);
+        glCullFace(GL_BACK);
+        /* Data is CCW-outward (measured); the view's screen-X mirror
+         * flips apparent winding, so the front face is CW on screen. */
+        glFrontFace(GL_CW);
+    }
     for (uint32_t i = 0; i < scene->batchCount; i++) {
         const SceneBatch *b = &scene->batches[i];
         if (b->alphaClip != alphaPass) continue;
@@ -2415,6 +2453,7 @@ static void drawBatchSet(const Scene *scene, const BatchGL *gl, int alphaPass) {
             glDisable(GL_BLEND);
         }
     }
+    if (!alphaPass) glDisable(GL_CULL_FACE);
     glBindBuffer(GL_ARRAY_BUFFER, 0);
     glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
 }
@@ -9257,6 +9296,7 @@ static void renderCameraFeed(void) {
     glFrustum(-t, t, -t, t, zn, zf);
     glMatrixMode(GL_MODELVIEW);
     glLoadIdentity();
+    glScalef(-1.0f, 1.0f, 1.0f); /* match the main view's chirality fix */
     glRotatef(pitch, 1, 0, 0);
     glRotatef(yaw, 0, 1, 0);
     glTranslatef(-c->x, -eyeY, -c->z);
@@ -9316,11 +9356,14 @@ static void drawMonitors(const float viewPos[3]) {
             -62.0f,  46.0f, 0.0f,  62.0f, -46.0f, 0.0f, -62.0f, -46.0f, 0.0f,
         };
         if (lit) {
-            /* The capture is bottom-up; flip V. Under the SCP-895/079
-             * broadcast the feed jitters and bleeds red. */
+            /* The capture is bottom-up (flip V) and already
+             * chirality-correct, so the view's screen-X mirror would
+             * flip it again on the quad: flip U to compensate. Under
+             * the SCP-895/079 broadcast the feed jitters and bleeds
+             * red. */
             float j = broadcast ? ((rand() % 20) - 10) / 100.0f : 0.0f;
-            GLfloat uv[12] = { 0, 1 + j, 1, 1 + j, 1, j,
-                               0, 1 + j, 1, j, 0, j };
+            GLfloat uv[12] = { 1, 1 + j, 0, 1 + j, 0, j,
+                               1, 1 + j, 0, j, 1, j };
             glEnable(GL_TEXTURE_2D);
             glBindTexture(GL_TEXTURE_2D, monFeedTex);
             glEnableClientState(GL_TEXTURE_COORD_ARRAY);
@@ -10301,7 +10344,10 @@ static int startNewGame(void) {
         introPhase = -1;
         gameMusicStart();
     }
-    prewarmSpawnArea();
+    /* With the intro cutscene queued, the spawn area loads in the
+     * background while it plays (bgLoadTick); otherwise load it now
+     * behind the loading screen. */
+    if (!pendingIntroVideo) prewarmSpawnArea();
     return 1;
 }
 
@@ -10822,6 +10868,8 @@ static void enterMenu(void) {
  * sceAvPlayer. Gated by the "Startup videos" option (opt\PlayStartup);
  * like the source's PlayMovie, a clip that will not open is simply
  * skipped - there is no title-card substitute. */
+static void bgLoadTick(void); /* defined with the intro video */
+
 static void playStartupVideos(void) {
 #if DIAG_DISABLE_VIDEOS
     return;
@@ -10830,11 +10878,13 @@ static void playStartupVideos(void) {
     static const char *CLIPS[4] = {
         "startup_Undertow", "startup_TSS", "startup_UET", "startup_Warning",
     };
+    videoSetIdleCallback(bgLoadTick);
     for (int i = 0; i < 4; i++) {
         char vp[256];
         snprintf(vp, sizeof(vp), MENU_DIR "/%s.mp4", CLIPS[i]);
         videoPlayFile(vp);
     }
+    videoSetIdleCallback(NULL);
 }
 
 /* ---- loading screen (Menu_Core RenderLoading) ----
@@ -10946,15 +10996,57 @@ static void prewarmSpawnArea(void) {
  * (three sequential fragments), which sceAvPlayer hardware-decodes.
  * Deferred to the first game frame via this flag so it runs outside the
  * menu's HUD 2D scope. */
+/* Runs between intro-video frames: the player watches ~14 s of
+ * cutscene, so feed the loader and step the spawn ring's templates
+ * under a small budget - by the time the video ends the area is mostly
+ * resident and the follow-up prewarm is nearly a no-op. */
+static const char *BOOT_WARM_MODELS[] = {
+    "guard.b3d",       "class_d.b3d",   "scp_008_1.b3d", "scp_049.b3d",
+    "scp_049_2.b3d",   "scp_096.b3d",   "scp_106.b3d",   "scp_1499_1.b3d",
+    "scp_205_demon.b3d", "scp_372.b3d", "scp_513_1.b3d", "scp_860_2.b3d",
+    "scp_939.b3d",     "scp_966.b3d",
+};
+
+static void bgLoadTick(void) {
+    loaderPump();
+    if (!worldReady) {
+        /* Boot videos: warm the NPC models the post-video load needs
+         * (cache hits or in-flight requests are no-ops, so calling
+         * every tick just retries what the job ring couldn't fit). */
+        for (unsigned i = 0;
+             i < sizeof(BOOT_WARM_MODELS) / sizeof(BOOT_WARM_MODELS[0]);
+             i++) {
+            int pending = 0;
+            (void)propModelGetAsync(BOOT_WARM_MODELS[i], &pending);
+        }
+        return;
+    }
+    int px = (int)floorf(camPos[0] / ROOM_SPACING + 0.5f);
+    int py = (int)floorf(camPos[2] / ROOM_SPACING + 0.5f);
+    uint64_t t0 = sceKernelGetProcessTimeWide();
+    for (uint32_t i = 0; i < map.roomCount; i++) {
+        const RoomPlacement *p = &map.rooms[i];
+        int adx = abs(p->gridX - px), ady = abs(p->gridY - py);
+        if ((adx > ady ? adx : ady) > 1) continue;
+        TemplateRT *rt = &tplRT[p->templateIndex];
+        while (rt->state != 1 && rt->state != -1) {
+            if (!templateEnsureStep(p->templateIndex, 1)) break;
+            if (sceKernelGetProcessTimeWide() - t0 > 2000) return;
+        }
+    }
+}
+
 static void playIntroVideo(void) {
 #if DIAG_DISABLE_VIDEOS
     return;
 #endif
     if (!videoInit()) return;
     audioStopMusic();
+    videoSetIdleCallback(bgLoadTick);
     videoPlayFile(MENU_DIR "/startup_Intro1.mp4");
     videoPlayFile(MENU_DIR "/startup_Intro2.mp4");
     videoPlayFile(MENU_DIR "/startup_Intro3.mp4");
+    videoSetIdleCallback(NULL);
 }
 
 /* Pause menu: the game's pause_menu.png panel with its button column
@@ -11013,14 +11105,15 @@ static void drawNav(void) {
         float dxc = map.rooms[i].gridX - pgx;
         float dyc = map.rooms[i].gridY - pgy;
         if (fabsf(dxc) > R || fabsf(dyc) > R) continue;
-        float cx = cx0 + dxc * cell, cy = cy0 + dyc * cell;
+        /* World +x appears to the LEFT under the mirrored view. */
+        float cx = cx0 - dxc * cell, cy = cy0 + dyc * cell;
         drawQuad(cx - cell * 0.40f, cy - cell * 0.40f, cell * 0.80f,
                  cell * 0.80f, 0, 0.05f, 0.45f, 0.08f, 0.95f);
     }
 
     /* Player: bright blip with a heading dot ("north" = -z, up). */
     drawQuad(cx0 - 4, cy0 - 4, 8, 8, 0, 0.5f, 1.0f, 0.5f, 1.0f);
-    float hx = cx0 + sinf(camYaw) * cell * 0.45f;
+    float hx = cx0 - sinf(camYaw) * cell * 0.45f;
     float hy = cy0 - cosf(camYaw) * cell * 0.45f;
     drawQuad(hx - 2, hy - 2, 4, 4, 0, 0.8f, 1.0f, 0.8f, 1.0f);
 
@@ -11031,7 +11124,7 @@ static void drawNav(void) {
         float dxc = npc173Pos[0] / ROOM_SPACING - pgx;
         float dyc = npc173Pos[2] / ROOM_SPACING - pgy;
         if (fabsf(dxc) <= R && fabsf(dyc) <= R) {
-            float cx = cx0 + dxc * cell, cy = cy0 + dyc * cell;
+            float cx = cx0 - dxc * cell, cy = cy0 + dyc * cell;
             drawQuad(cx - 3, cy - 3, 6, 6, 0, 1.0f, 0.15f, 0.1f, 1.0f);
         }
     }
@@ -11086,11 +11179,17 @@ int main(void) {
         if (audioOk) optionsApply();
         srand((unsigned)sceKernelGetProcessTimeWide());
         pendingSeed = (uint32_t)(sceKernelGetProcessTimeWide() & 0xFFFFFF) | 1u;
-        /* Play the boot videos now, before the door/NPC/texture/sound
-         * load fills the heap: sceAvPlayer needs a few MB of contiguous
-         * CPU RAM for its demux/decode buffers, so give it the emptiest
-         * heap of the session (sounds now decode lazily, but the door/
-         * NPC/texture load below still costs real memory). */
+        /* Register sounds and queue the small hot set on the decoder
+         * thread BEFORE the boot videos: registration is just fopen
+         * probes, and the decodes then overlap the ~40 s of video. */
+        if (audioOk) {
+            loadSounds();
+            audioPredecodeSmall(160 * 1024, 24 * 1024 * 1024);
+        }
+        /* Play the boot videos now, before the door/NPC/texture load
+         * fills the heap: sceAvPlayer needs a few MB of contiguous CPU
+         * RAM for its demux/decode buffers. Between video frames the
+         * idle callback warms the NPC/door model cache. */
         playStartupVideos();
         /* Heavy asset + audio load, behind the loading screen so the
          * player sees progress instead of a black screen. */
@@ -11104,13 +11203,7 @@ int main(void) {
         texButtonRed = textureGet("keypad_locked.png");
         pdThroneTex = textureGet("scp_106_eyes.png");
         renderLoadingScreen("LOADING SOUNDS", 70);
-        if (audioOk) {
-            loadSounds();
-            /* Warm the small, hot SFX so first plays are instant; big
-             * files (voice lines, stingers, ambience) decode on the
-             * decoder thread when first triggered. */
-            audioPredecodeSmall(160 * 1024, 24 * 1024 * 1024);
-        }
+        /* (sounds registered + queued before the boot videos) */
         renderLoadingScreen("LOADING DECALS", 90);
         decalsInit();
         renderLoadingScreen("DONE", 100);
@@ -11183,6 +11276,7 @@ int main(void) {
         if (haveData && pendingIntroVideo) {
             pendingIntroVideo = 0;
             playIntroVideo();
+            prewarmSpawnArea(); /* mop up what the video time missed */
         }
 
         if (haveData && inputHit(ACTION_MENU)) {
@@ -11619,7 +11713,12 @@ int main(void) {
             look.x = look.y = 0.0f;
             move.x = move.y = 0.0f;
         }
-        camYaw += look.x * 0.04f * optLookSens;
+        /* Under the mirrored view, increasing yaw pans the DISPLAYED
+         * view left, and the world right-vector appears leftward: flip
+         * the horizontal look and strafe signs so controls feel
+         * unchanged. */
+        camYaw -= look.x * 0.04f * optLookSens;
+        move.x = -move.x;
         camPitch += look.y * 0.03f * optLookSens * (optInvertY ? -1.0f : 1.0f);
         if (camPitch > 1.5f) camPitch = 1.5f;
         if (camPitch < -1.5f) camPitch = -1.5f;
@@ -11790,6 +11889,13 @@ int main(void) {
                 shP = sinf(fpsFrames * 1.7f) * camShake;
                 shY = sinf(fpsFrames * 2.3f) * camShake;
             }
+            /* Blitz3D data is left-handed; drawn by this right-handed
+             * pipeline verbatim, the whole world (layouts, sign text)
+             * rendered as its mirror image. A screen-X mirror restores
+             * the original chirality; world/sim coordinates stay
+             * untouched, and the handedness consumers (winding, look/
+             * strafe signs, audio pan, S-NAV) are flipped to match. */
+            glScalef(-1.0f, 1.0f, 1.0f);
             glRotatef(camPitch * 180.0f / 3.14159265f + shP, 1, 0, 0);
             glRotatef(camYaw * 180.0f / 3.14159265f + shY, 0, 1, 0);
             glTranslatef(-camPos[0], -camPos[1], -camPos[2]);

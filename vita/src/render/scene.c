@@ -377,3 +377,101 @@ void sceneFree(Scene *sc) {
     free(sc->batches);
     free(sc);
 }
+
+/* Merge batches that share the same texture pair + pass into single
+ * draw units (respecting the 16-bit index limit). Room props are
+ * appended one batch per B3D triangle-set, so a furnished room reaches
+ * 250+ batches drawn twice per frame (diffuse + lightmap pass); on the
+ * Vita the per-draw CPU overhead alone was measured at ~60 ms/frame
+ * (657 glDrawElements). Heavy rooms use only a few dozen distinct
+ * textures, so merging collapses the count by roughly an order of
+ * magnitude. Call after every append, before GL buffers are built. */
+static int batchKeyEq(const SceneBatch *a, const SceneBatch *b) {
+    if (a->alphaClip != b->alphaClip) return 0;
+    if ((a->diffuseName == NULL) != (b->diffuseName == NULL)) return 0;
+    if (a->diffuseName && strcmp(a->diffuseName, b->diffuseName) != 0)
+        return 0;
+    if ((a->lightmapName == NULL) != (b->lightmapName == NULL)) return 0;
+    if (a->lightmapName && strcmp(a->lightmapName, b->lightmapName) != 0)
+        return 0;
+    return 1;
+}
+
+void sceneMergeBatches(Scene *sc) {
+    if (!sc || sc->batchCount < 2) return;
+    uint32_t n = sc->batchCount;
+    uint8_t *used = (uint8_t *)calloc(n, 1);
+    SceneBatch *out = (SceneBatch *)calloc(n, sizeof(SceneBatch));
+    if (!used || !out) {
+        free(used);
+        free(out);
+        return; /* merging is an optimization; skip on OOM */
+    }
+    uint32_t outCount = 0;
+    for (uint32_t i = 0; i < n; i++) {
+        if (used[i]) continue;
+        used[i] = 1;
+        /* Sum the group that fits one 16-bit index space. */
+        uint32_t verts = sc->batches[i].vertexCount;
+        uint32_t idxs = sc->batches[i].indexCount;
+        for (uint32_t j = i + 1; j < n; j++) {
+            if (used[j] || !batchKeyEq(&sc->batches[i], &sc->batches[j]))
+                continue;
+            if (verts + sc->batches[j].vertexCount > 65535) continue;
+            verts += sc->batches[j].vertexCount;
+            idxs += sc->batches[j].indexCount;
+            used[j] = 2; /* claimed by this group */
+        }
+        SceneBatch *dst = &out[outCount];
+        *dst = sc->batches[i]; /* takes name ownership */
+        if (verts > sc->batches[i].vertexCount) {
+            SceneVertex *nv =
+                (SceneVertex *)malloc((size_t)verts * sizeof(SceneVertex));
+            uint16_t *ni = (uint16_t *)malloc((size_t)idxs * sizeof(uint16_t));
+            if (!nv || !ni) {
+                free(nv);
+                free(ni);
+                /* leave this batch unmerged; release group claims */
+                for (uint32_t j = i + 1; j < n; j++) {
+                    if (used[j] == 2) used[j] = 0;
+                }
+                outCount++;
+                continue;
+            }
+            uint32_t vOff = 0, iOff = 0;
+            memcpy(nv, sc->batches[i].vertices,
+                   (size_t)sc->batches[i].vertexCount * sizeof(SceneVertex));
+            memcpy(ni, sc->batches[i].indices,
+                   (size_t)sc->batches[i].indexCount * sizeof(uint16_t));
+            vOff = sc->batches[i].vertexCount;
+            iOff = sc->batches[i].indexCount;
+            for (uint32_t j = i + 1; j < n; j++) {
+                if (used[j] != 2) continue;
+                used[j] = 1;
+                const SceneBatch *src = &sc->batches[j];
+                memcpy(nv + vOff, src->vertices,
+                       (size_t)src->vertexCount * sizeof(SceneVertex));
+                for (uint32_t k = 0; k < src->indexCount; k++) {
+                    ni[iOff + k] = (uint16_t)(src->indices[k] + vOff);
+                }
+                vOff += src->vertexCount;
+                iOff += src->indexCount;
+                free(src->vertices);
+                free(src->indices);
+                free(src->diffuseName);
+                free(src->lightmapName);
+            }
+            free(sc->batches[i].vertices);
+            free(sc->batches[i].indices);
+            dst->vertices = nv;
+            dst->indices = ni;
+            dst->vertexCount = verts;
+            dst->indexCount = idxs;
+        }
+        outCount++;
+    }
+    free(sc->batches);
+    sc->batches = out;
+    sc->batchCount = outCount;
+    free(used);
+}
