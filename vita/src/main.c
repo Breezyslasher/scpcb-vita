@@ -53,7 +53,7 @@ unsigned int _newlib_heap_size_user = 220 * 1024 * 1024;
 
 #define DATA_ROOT "ux0:data/scpcb-ue"
 /* Shown in the debug HUD so a stale VPK install is instantly visible. */
-#define PORT_BUILD_TAG "blur1"
+#define PORT_BUILD_TAG "blur1-1499"
 
 /* Diagnostic switch: set to 1 to skip ALL video playback (boot clips
  * and intro). The diag2-novid device test proved the video player was
@@ -1213,6 +1213,11 @@ static int npc1499Type[MAX_1499];      /* 0 citizen 1 king-guard 2 king
                                           3 front-guard */
 static int npc1499Active[MAX_1499];
 static int npc1499Aggro[MAX_1499];     /* this member has turned hostile */
+static float npc1499Scream[MAX_1499];  /* frames left of the scream that
+                                          precedes the chase (source sets
+                                          frame 203 / State 2 first, so a
+                                          roused ring never kills before
+                                          the player can react) */
 static float npc1499Frame[MAX_1499];   /* per-member animation phase */
 static int npc1499Chat[MAX_1499];      /* citizen's conversation partner, -1 none */
 static int npc1499Count;
@@ -6074,6 +6079,7 @@ static void mask1499Place(int k, float x, float z, int type, float yaw) {
     npc1499Type[k] = type;
     npc1499Yaw[k] = yaw;
     npc1499Aggro[k] = 0;
+    npc1499Scream[k] = 0.0f;
     npc1499Chat[k] = -1;
     npc1499Frame[k] = type == 2 ? 509.0f : 296.0f;
     npc1499Active[k] = 1;
@@ -6119,6 +6125,8 @@ static void enterMaskDimension(void) {
         for (int k = 0; k < npc1499Count; k++) {
             if (npc1499Type[k] == 0) {
                 npc1499Aggro[k] = 1;
+                npc1499Scream[k] = 90.0f; /* scream first, like the
+                                             source's State-2 ring */
                 npc1499Frame[k] = (k & 1) ? 100.0f : 1.0f;
             }
         }
@@ -6147,6 +6155,7 @@ static void leaveMaskDimension(void) {
 static void mask1499Rouse(int k) {
     if (npc1499Aggro[k]) return;
     npc1499Aggro[k] = 1;
+    npc1499Scream[k] = 90.0f; /* ~1.5 s scream before the chase */
     npc1499Frame[k] = (k & 1) ? 100.0f : 1.0f;
     audioPlay3D(snd1499Trig, npc1499Pos[k], camPos, camYaw, 4000.0f);
     if (npc1499Type[k] == 0) {
@@ -6156,6 +6165,7 @@ static void mask1499Rouse(int k) {
             float ez = npc1499Pos[j][2] - npc1499Pos[k][2];
             if (ex * ex + ez * ez < 1600.0f * 1600.0f && !npc1499Aggro[j]) {
                 npc1499Aggro[j] = 1;
+                npc1499Scream[j] = 90.0f;
                 npc1499Frame[j] = (j & 1) ? 100.0f : 1.0f;
             }
         }
@@ -6200,7 +6210,11 @@ static void update1499(void) {
             } else {
                 if (npc1499Frame[k] > 167.0f) npc1499Frame[k] = 100.0f;
             }
-            if (type == 2) {
+            if (npc1499Scream[k] > 0.0f) {
+                /* Screaming: rooted, facing the player - the source's
+                 * warning window before the chase begins. */
+                npc1499Scream[k] -= 1.0f;
+            } else if (type == 2) {
                 /* The king stays enthroned; he only glares. */
             } else {
                 if (d < 200.0f) {
