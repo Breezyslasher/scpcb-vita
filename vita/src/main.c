@@ -53,7 +53,7 @@ unsigned int _newlib_heap_size_user = 220 * 1024 * 1024;
 
 #define DATA_ROOT "ux0:data/scpcb-ue"
 /* Shown in the debug HUD so a stale VPK install is instantly visible. */
-#define PORT_BUILD_TAG "radio-hands"
+#define PORT_BUILD_TAG "lm1pass"
 
 /* Diagnostic switch: set to 1 to skip ALL video playback (boot clips
  * and intro). The diag2-novid device test proved the video player was
@@ -2421,6 +2421,22 @@ static void drawBatchSet(const Scene *scene, const BatchGL *gl, int alphaPass) {
         } else {
             glDisable(GL_TEXTURE_2D);
         }
+        /* Lightmap on the second texture unit, added in the SAME pass
+         * (env GL_ADD). The old second additive draw doubled both the
+         * draw-call count (~0.25 ms of CPU each in vitaGL) and the
+         * fill over every lit pixel - the two measured fps walls. */
+        GLuint lightmap = alphaPass ? 0 : gl[i].lightmap;
+        if (lightmap) {
+            glActiveTexture(GL_TEXTURE1);
+            glEnable(GL_TEXTURE_2D);
+            glBindTexture(GL_TEXTURE_2D, lightmap);
+            glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_ADD);
+            glClientActiveTexture(GL_TEXTURE1);
+            glEnableClientState(GL_TEXTURE_COORD_ARRAY);
+            glTexCoordPointer(2, GL_FLOAT, sizeof(SceneVertex), VTX_OFF(lu));
+            glClientActiveTexture(GL_TEXTURE0);
+            glActiveTexture(GL_TEXTURE0);
+        }
         if (alphaPass) {
             /* The game alpha-blends these surfaces with the texture's
              * alpha (glass is ~0.13-0.7); a mask-style alpha test only
@@ -2434,34 +2450,20 @@ static void drawBatchSet(const Scene *scene, const BatchGL *gl, int alphaPass) {
         drawCallsFrame++;
         glDrawElements(GL_TRIANGLES, (GLsizei)b->indexCount,
                        GL_UNSIGNED_SHORT, NULL);
+        if (lightmap) {
+            glActiveTexture(GL_TEXTURE1);
+            glDisable(GL_TEXTURE_2D);
+            glClientActiveTexture(GL_TEXTURE1);
+            glDisableClientState(GL_TEXTURE_COORD_ARRAY);
+            glClientActiveTexture(GL_TEXTURE0);
+            glActiveTexture(GL_TEXTURE0);
+        }
         if (alphaPass) {
             glDisable(GL_ALPHA_TEST);
             glDisable(GL_BLEND);
             glDepthMask(GL_TRUE);
         }
 
-        GLuint lightmap = gl[i].lightmap;
-        if (lightmap && !alphaPass) {
-            glEnable(GL_TEXTURE_2D);
-            glBindTexture(GL_TEXTURE_2D, lightmap);
-            glTexCoordPointer(2, GL_FLOAT, sizeof(SceneVertex), VTX_OFF(lu));
-            glEnable(GL_BLEND);
-            /* Additive lightmap. A modulate2x pass (GL_DST_COLOR,
-             * GL_SRC_COLOR) is mathematically closer to the source's
-             * 2 * diffuse * (ambient + lightmap), but on device it
-             * darkened the world to near-black: the RMESH vertex colours
-             * are baked into BOTH passes (the colour array stays bound,
-             * so the result is 2 * diffuse * lm * vc^2) and the port has
-             * no AmbientLightRoomTex floor, so dim lightmaps multiply to
-             * black. Bisected on hardware to the modulate change; keep
-             * the known-good additive until a corrected modulate (single
-             * vc + ambient floor) can be tested on device. */
-            glBlendFunc(GL_ONE, GL_ONE);
-            drawCallsFrame++;
-            glDrawElements(GL_TRIANGLES, (GLsizei)b->indexCount,
-                           GL_UNSIGNED_SHORT, NULL);
-            glDisable(GL_BLEND);
-        }
     }
     if (!alphaPass) glDisable(GL_CULL_FACE);
     glBindBuffer(GL_ARRAY_BUFFER, 0);
