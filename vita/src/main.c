@@ -53,7 +53,7 @@ unsigned int _newlib_heap_size_user = 220 * 1024 * 1024;
 
 #define DATA_ROOT "ux0:data/scpcb-ue"
 /* Shown in the debug HUD so a stale VPK install is instantly visible. */
-#define PORT_BUILD_TAG "perf5-merge"
+#define PORT_BUILD_TAG "perf6-cull"
 
 /* Diagnostic switch: set to 1 to skip ALL video playback (boot clips
  * and intro). The diag2-novid device test proved the video player was
@@ -2382,6 +2382,16 @@ static void applyDebugState(void) {
 static int drawCallsFrame, drawCallsShown;
 
 static void drawBatchSet(const Scene *scene, const BatchGL *gl, int alphaPass) {
+    if (!alphaPass) {
+        /* Backface-cull the opaque room geometry: measured CCW-outward
+         * across the shipped meshes (floor-normal and signed-volume
+         * tests on host), and drawing double-sided cost ~2x GPU fill -
+         * the profiler showed sustained 150-190 ms GPU-bound frames.
+         * Alpha surfaces (glass) stay double-sided like the source. */
+        glEnable(GL_CULL_FACE);
+        glCullFace(GL_BACK);
+        glFrontFace(GL_CCW);
+    }
     for (uint32_t i = 0; i < scene->batchCount; i++) {
         const SceneBatch *b = &scene->batches[i];
         if (b->alphaClip != alphaPass) continue;
@@ -2441,6 +2451,7 @@ static void drawBatchSet(const Scene *scene, const BatchGL *gl, int alphaPass) {
             glDisable(GL_BLEND);
         }
     }
+    if (!alphaPass) glDisable(GL_CULL_FACE);
     glBindBuffer(GL_ARRAY_BUFFER, 0);
     glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
 }
@@ -10327,7 +10338,10 @@ static int startNewGame(void) {
         introPhase = -1;
         gameMusicStart();
     }
-    prewarmSpawnArea();
+    /* With the intro cutscene queued, the spawn area loads in the
+     * background while it plays (bgLoadTick); otherwise load it now
+     * behind the loading screen. */
+    if (!pendingIntroVideo) prewarmSpawnArea();
     return 1;
 }
 
@@ -10972,15 +10986,39 @@ static void prewarmSpawnArea(void) {
  * (three sequential fragments), which sceAvPlayer hardware-decodes.
  * Deferred to the first game frame via this flag so it runs outside the
  * menu's HUD 2D scope. */
+/* Runs between intro-video frames: the player watches ~14 s of
+ * cutscene, so feed the loader and step the spawn ring's templates
+ * under a small budget - by the time the video ends the area is mostly
+ * resident and the follow-up prewarm is nearly a no-op. */
+static void bgLoadTick(void) {
+    loaderPump();
+    if (!worldReady) return;
+    int px = (int)floorf(camPos[0] / ROOM_SPACING + 0.5f);
+    int py = (int)floorf(camPos[2] / ROOM_SPACING + 0.5f);
+    uint64_t t0 = sceKernelGetProcessTimeWide();
+    for (uint32_t i = 0; i < map.roomCount; i++) {
+        const RoomPlacement *p = &map.rooms[i];
+        int adx = abs(p->gridX - px), ady = abs(p->gridY - py);
+        if ((adx > ady ? adx : ady) > 1) continue;
+        TemplateRT *rt = &tplRT[p->templateIndex];
+        while (rt->state != 1 && rt->state != -1) {
+            if (!templateEnsureStep(p->templateIndex, 1)) break;
+            if (sceKernelGetProcessTimeWide() - t0 > 2000) return;
+        }
+    }
+}
+
 static void playIntroVideo(void) {
 #if DIAG_DISABLE_VIDEOS
     return;
 #endif
     if (!videoInit()) return;
     audioStopMusic();
+    videoSetIdleCallback(bgLoadTick);
     videoPlayFile(MENU_DIR "/startup_Intro1.mp4");
     videoPlayFile(MENU_DIR "/startup_Intro2.mp4");
     videoPlayFile(MENU_DIR "/startup_Intro3.mp4");
+    videoSetIdleCallback(NULL);
 }
 
 /* Pause menu: the game's pause_menu.png panel with its button column
@@ -11209,6 +11247,7 @@ int main(void) {
         if (haveData && pendingIntroVideo) {
             pendingIntroVideo = 0;
             playIntroVideo();
+            prewarmSpawnArea(); /* mop up what the video time missed */
         }
 
         if (haveData && inputHit(ACTION_MENU)) {

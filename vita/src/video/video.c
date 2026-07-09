@@ -261,6 +261,12 @@ static int skipPressed(void) {
 
 /* ---- play one file ---- */
 
+static void (*gIdleCb)(void);
+
+void videoSetIdleCallback(void (*fn)(void)) {
+    gIdleCb = fn;
+}
+
 int videoPlayFile(const char *path) {
     vlog("---- videoPlayFile [build: fileReplacement+cbdiag]: %s", path);
     if (!videoInit()) { vlog("  videoInit failed"); return 0; }
@@ -342,6 +348,7 @@ int videoPlayFile(const char *path) {
     uint64_t nextLogUs = startUs + 1000000ull;
     while (sceAvPlayerIsActive(gPlayer)) {
         loops++;
+        if (gIdleCb) gIdleCb(); /* e.g. background asset loading */
         inputUpdate();
         if (skipPressed()) { skipped = 1; break; }
 
