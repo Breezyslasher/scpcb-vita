@@ -53,7 +53,7 @@ unsigned int _newlib_heap_size_user = 220 * 1024 * 1024;
 
 #define DATA_ROOT "ux0:data/scpcb-ue"
 /* Shown in the debug HUD so a stale VPK install is instantly visible. */
-#define PORT_BUILD_TAG "perf7-bootwarm"
+#define PORT_BUILD_TAG "mirror1"
 
 /* Diagnostic switch: set to 1 to skip ALL video playback (boot clips
  * and intro). The diag2-novid device test proved the video player was
@@ -2390,7 +2390,9 @@ static void drawBatchSet(const Scene *scene, const BatchGL *gl, int alphaPass) {
          * Alpha surfaces (glass) stay double-sided like the source. */
         glEnable(GL_CULL_FACE);
         glCullFace(GL_BACK);
-        glFrontFace(GL_CCW);
+        /* Data is CCW-outward (measured); the view's screen-X mirror
+         * flips apparent winding, so the front face is CW on screen. */
+        glFrontFace(GL_CW);
     }
     for (uint32_t i = 0; i < scene->batchCount; i++) {
         const SceneBatch *b = &scene->batches[i];
@@ -9294,6 +9296,7 @@ static void renderCameraFeed(void) {
     glFrustum(-t, t, -t, t, zn, zf);
     glMatrixMode(GL_MODELVIEW);
     glLoadIdentity();
+    glScalef(-1.0f, 1.0f, 1.0f); /* match the main view's chirality fix */
     glRotatef(pitch, 1, 0, 0);
     glRotatef(yaw, 0, 1, 0);
     glTranslatef(-c->x, -eyeY, -c->z);
@@ -9353,11 +9356,14 @@ static void drawMonitors(const float viewPos[3]) {
             -62.0f,  46.0f, 0.0f,  62.0f, -46.0f, 0.0f, -62.0f, -46.0f, 0.0f,
         };
         if (lit) {
-            /* The capture is bottom-up; flip V. Under the SCP-895/079
-             * broadcast the feed jitters and bleeds red. */
+            /* The capture is bottom-up (flip V) and already
+             * chirality-correct, so the view's screen-X mirror would
+             * flip it again on the quad: flip U to compensate. Under
+             * the SCP-895/079 broadcast the feed jitters and bleeds
+             * red. */
             float j = broadcast ? ((rand() % 20) - 10) / 100.0f : 0.0f;
-            GLfloat uv[12] = { 0, 1 + j, 1, 1 + j, 1, j,
-                               0, 1 + j, 1, j, 0, j };
+            GLfloat uv[12] = { 1, 1 + j, 0, 1 + j, 0, j,
+                               1, 1 + j, 0, j, 1, j };
             glEnable(GL_TEXTURE_2D);
             glBindTexture(GL_TEXTURE_2D, monFeedTex);
             glEnableClientState(GL_TEXTURE_COORD_ARRAY);
@@ -11099,14 +11105,15 @@ static void drawNav(void) {
         float dxc = map.rooms[i].gridX - pgx;
         float dyc = map.rooms[i].gridY - pgy;
         if (fabsf(dxc) > R || fabsf(dyc) > R) continue;
-        float cx = cx0 + dxc * cell, cy = cy0 + dyc * cell;
+        /* World +x appears to the LEFT under the mirrored view. */
+        float cx = cx0 - dxc * cell, cy = cy0 + dyc * cell;
         drawQuad(cx - cell * 0.40f, cy - cell * 0.40f, cell * 0.80f,
                  cell * 0.80f, 0, 0.05f, 0.45f, 0.08f, 0.95f);
     }
 
     /* Player: bright blip with a heading dot ("north" = -z, up). */
     drawQuad(cx0 - 4, cy0 - 4, 8, 8, 0, 0.5f, 1.0f, 0.5f, 1.0f);
-    float hx = cx0 + sinf(camYaw) * cell * 0.45f;
+    float hx = cx0 - sinf(camYaw) * cell * 0.45f;
     float hy = cy0 - cosf(camYaw) * cell * 0.45f;
     drawQuad(hx - 2, hy - 2, 4, 4, 0, 0.8f, 1.0f, 0.8f, 1.0f);
 
@@ -11117,7 +11124,7 @@ static void drawNav(void) {
         float dxc = npc173Pos[0] / ROOM_SPACING - pgx;
         float dyc = npc173Pos[2] / ROOM_SPACING - pgy;
         if (fabsf(dxc) <= R && fabsf(dyc) <= R) {
-            float cx = cx0 + dxc * cell, cy = cy0 + dyc * cell;
+            float cx = cx0 - dxc * cell, cy = cy0 + dyc * cell;
             drawQuad(cx - 3, cy - 3, 6, 6, 0, 1.0f, 0.15f, 0.1f, 1.0f);
         }
     }
@@ -11706,7 +11713,12 @@ int main(void) {
             look.x = look.y = 0.0f;
             move.x = move.y = 0.0f;
         }
-        camYaw += look.x * 0.04f * optLookSens;
+        /* Under the mirrored view, increasing yaw pans the DISPLAYED
+         * view left, and the world right-vector appears leftward: flip
+         * the horizontal look and strafe signs so controls feel
+         * unchanged. */
+        camYaw -= look.x * 0.04f * optLookSens;
+        move.x = -move.x;
         camPitch += look.y * 0.03f * optLookSens * (optInvertY ? -1.0f : 1.0f);
         if (camPitch > 1.5f) camPitch = 1.5f;
         if (camPitch < -1.5f) camPitch = -1.5f;
@@ -11877,6 +11889,13 @@ int main(void) {
                 shP = sinf(fpsFrames * 1.7f) * camShake;
                 shY = sinf(fpsFrames * 2.3f) * camShake;
             }
+            /* Blitz3D data is left-handed; drawn by this right-handed
+             * pipeline verbatim, the whole world (layouts, sign text)
+             * rendered as its mirror image. A screen-X mirror restores
+             * the original chirality; world/sim coordinates stay
+             * untouched, and the handedness consumers (winding, look/
+             * strafe signs, audio pan, S-NAV) are flipped to match. */
+            glScalef(-1.0f, 1.0f, 1.0f);
             glRotatef(camPitch * 180.0f / 3.14159265f + shP, 1, 0, 0);
             glRotatef(camYaw * 180.0f / 3.14159265f + shY, 0, 1, 0);
             glTranslatef(-camPos[0], -camPos[1], -camPos[2]);

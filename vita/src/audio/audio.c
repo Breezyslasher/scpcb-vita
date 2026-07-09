@@ -495,7 +495,9 @@ void audioPlay3D(int sound, const float pos[3], const float listener[3],
     float fx = sinf(yaw), fz = -cosf(yaw);
     float rx = -fz, rz = fx; /* right vector */
     float pan = dist > 1.0f ? (dx * rx + dz * rz) / dist : 0.0f;
-    audioPlay(sound, vol, pan * 0.7f);
+    /* The view renders with a screen-X mirror (chirality fix), so the
+     * world right-vector appears on the LEFT of the screen: flip pan. */
+    audioPlay(sound, vol, -pan * 0.7f);
 }
 
 /* Ambience whose PCM is still decoding: remembered here and started by

@@ -166,6 +166,20 @@ the device never runs a PNG/JPG decoder for them. Requires re-running
 the package-data job and reinstalling the data (~90 MB larger raw);
 old PNG data still works, just slower.
 
+## Chirality (the mirrored-world fix)
+
+Blitz3D data is left-handed; the port drew it verbatim through a
+right-handed GL pipeline, so the ENTIRE world rendered as its mirror
+image (room layouts flipped versus the original game, sign text
+backwards) - internally consistent, which is why gameplay worked, but
+unfaithful. Fixed at the display level: the 3D views (main + camera
+feed) apply a screen-X mirror, restoring original chirality without
+touching any world/sim coordinate, and the handedness consumers flip to
+match - front-face winding (CW under the mirror), horizontal look and
+strafe input signs, 3D audio pan, the S-NAV map's X axis and heading
+dot, and the monitor feed quad's U (its texture is already
+chirality-correct screen pixels). Saves remain compatible.
+
 ## Known visual gaps
 
 - Green-tinted windows reported on device; repo data verified neutral
