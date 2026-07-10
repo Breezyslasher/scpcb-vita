@@ -183,7 +183,5 @@ chirality-correct screen pixels). Saves remain compatible.
 
 ## Known visual gaps
 
-- Green-tinted windows reported on device; repo data verified neutral
-  (suspect stale texture on the memory card).
 - No dynamic lights, flicker, or shadows (source flickers room lights).
-- No startup splash videos (WMV unsupported on Vita).
+
