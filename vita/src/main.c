@@ -53,7 +53,7 @@ unsigned int _newlib_heap_size_user = 220 * 1024 * 1024;
 
 #define DATA_ROOT "ux0:data/scpcb-ue"
 /* Shown in the debug HUD so a stale VPK install is instantly visible. */
-#define PORT_BUILD_TAG "deathmenu"
+#define PORT_BUILD_TAG "deathfix"
 
 /* Diagnostic switch: set to 1 to skip ALL video playback (boot clips
  * and intro). The diag2-novid device test proved the video player was
@@ -2383,6 +2383,12 @@ static void regenerateMap(uint32_t seed) {
     for (uint32_t i = 0; i < tplList.count; i++) {
         templateUnload(&tplRT[i]);
     }
+    /* activeRooms[] points into map.rooms, which mapFree releases:
+     * empty the list or the rest of the load frame (room ambience,
+     * lookups) walks freed placements. Symbolized from a device
+     * psp2core: updateRoomAmbience faulted on tplRT[rp->templateIndex]
+     * right after a death-menu LOAD GAME. */
+    activeCount = 0;
     mapFree(&map);
     doorsFree(&doors);
     mapSeed = seed;
@@ -2797,7 +2803,7 @@ static void loadSounds(void) {
 static ModelRT doorFrameRT, doorPanelRT, heavy1RT, heavy2RT;
 static ModelRT elevatorRT, big1RT, big2RT, bigFrameRT;
 static ModelRT officeRT, officeFrameRT, woodenRT, woodenFrameRT;
-static ModelRT oneSidedRT, door914RT;
+static ModelRT oneSidedRT, door914RT, cellRT;
 static ModelRT buttonRT, buttonKeycardRT;
 static ModelRT buttonKeypadRT, buttonScannerRT, buttonElevatorRT;
 static ModelRT leverBaseRT, leverHandleRT;
@@ -2936,6 +2942,10 @@ static void buildDoorAssets(void) {
     buildModelRT(&oneSidedRT, "Door02.b3d", 203.0f, 313.0f, 15.0f, NULL);
     buildModelRT(&door914RT, "Door02.b3d", 203.0f, 313.0f, 15.0f,
                  "Door01_914.png");
+    /* The intro cell doors (FillRoom retextures the default panel
+     * with Door02.jpg and frees OBJ2, leaving one leaf). */
+    buildModelRT(&cellRT, "Door01.b3d", 203.0f, 313.0f, 15.0f,
+                 "Door02.jpg");
     buildModelRT(&elevatorRT, "ElevatorDoor.b3d", 0, 0, 0, NULL);
     buildModelRT(&big1RT, "contdoorleft.b3d", 0, 0, 0, NULL);
     big1RT.scale[0] = big1RT.scale[1] = big1RT.scale[2] = 55.0f;
@@ -9268,7 +9278,7 @@ static void drawDoors(const float viewPos[3]) {
         float dx = d->x - viewPos[0], dz = d->z - viewPos[2];
         if (dx * dx + dz * dz > VIEW_RANGE * VIEW_RANGE) continue;
 
-        GLuint corr = d->corroded
+        GLuint corr = (d->corroded || d->type == 10 || d->type == 11)
                     ? (d->type == 2 ? doorCorrHeavyTex : doorCorrTex) : 0;
 
         glPushMatrix();
@@ -9288,6 +9298,10 @@ static void drawDoors(const float viewPos[3]) {
             case 5: frame = &woodenFrameRT; p1 = &woodenRT; hinged = 1; break;
             case 6: p1 = &oneSidedRT; single = 1; break;
             case 7: p1 = &door914RT; single = 1; break;
+            case 8: single = 1; break; /* OBJ2 freed in FillRoom */
+            case 9: p1 = &cellRT; single = 1; break; /* intro cell */
+            case 10: break;                    /* corrosive default */
+            case 11: p1 = &oneSidedRT; single = 1; break; /* corr 1-sided */
             default: break;
         }
         drawDoorPart(frame, corr);
@@ -11537,10 +11551,13 @@ int main(void) {
             if (inputDpadDownHit() && deathSel < 1) deathSel++;
             if (deathMenuNoLoad) deathSel = 1;
             int dact = inputHit(ACTION_INTERACT) ? deathSel : -1;
-            float dw = 660.0f, dbx = (SCREEN_W - dw) * 0.5f;
-            float dby = SCREEN_H * 0.5f + 116.0f;
+            /* Tap zones match the drawn buttons (pause-panel layout). */
+            float dph = 470.0f, dpw = dph * (600.0f / 673.0f);
+            float dpx = (SCREEN_W - dpw) * 0.5f;
+            float dpy = (SCREEN_H - dph) * 0.5f;
             for (int i = 0; menuTapped && i < 2; i++) {
-                if (tapIn(dbx + 20.0f + i * 320.0f, dby, 300.0f, 54.0f)) {
+                if (tapIn(dpx + 36.0f, dpy + 130.0f + i * 78.0f,
+                          dpw - 72.0f, 54.0f)) {
                     deathSel = i;
                     dact = i;
                 }
@@ -11551,6 +11568,9 @@ int main(void) {
                     deathTimer = 0;
                     snprintf(toastMsg, sizeof(toastMsg), "GAME LOADED");
                     toastTimer = 150;
+                    /* Restart the loop: the rest of this frame still
+                     * holds pre-load state. */
+                    continue;
                 } else {
                     snprintf(toastMsg, sizeof(toastMsg), "NO SAVE FOUND");
                     toastTimer = 150;
@@ -12044,15 +12064,17 @@ int main(void) {
             }
 
             /* Blink: meter drains; empty or R closes the eyes. New
-             * blinks don't start while a menu is open. */
-            if (!invOpen && !pauseOpen && wearNVG != 2) {
+             * blinks don't start while a menu is open or the player
+             * is dead (the death fade owns the screen). */
+            if (!invOpen && !pauseOpen && deathTimer == 0 && wearNVG != 2) {
                 blinkTimer -= 100.0f / 600.0f;
             }
-            if (!invOpen && !pauseOpen && inputHit(ACTION_BLINK)) {
+            if (!invOpen && !pauseOpen && deathTimer == 0
+                && inputHit(ACTION_BLINK)) {
                 blinkTimer = 0.0f;
             }
-            if (!invOpen && !pauseOpen && blinkTimer <= 0.0f
-                && blinkFrames == 0) {
+            if (!invOpen && !pauseOpen && deathTimer == 0
+                && blinkTimer <= 0.0f && blinkFrames == 0) {
                 blinkFrames = 18;
             }
 
@@ -12437,25 +12459,42 @@ int main(void) {
                 glColor4f(1, 1, 1, 1);
                 glPopMatrix();
             } else {
-                /* The source's post-death report: the [death] entry for
-                 * the killer, then Load Game / Quit to Menu. */
-                float dw = 660.0f, dh = 330.0f;
-                float dx = (SCREEN_W - dw) * 0.5f;
-                float dy = (SCREEN_H - dh) * 0.5f - 40.0f;
-                drawFrame(dx, dy, dw, dh, 0);
-                mtextC(SCREEN_W * 0.5f, dy + 22.0f, 2.4f, 0.85f, 0.12f,
-                       0.12f, "GAME OVER");
-                mtextWrap(dx + 26.0f, dy + 64.0f, dw - 52.0f, 1.3f,
+                /* The source's death menu: the pause-menu panel art
+                 * with YOU DIED, the difficulty/save/seed lines, the
+                 * two buttons, then the mortuary report below them. */
+                float ph = 470.0f, pw = ph * (600.0f / 673.0f);
+                float px = (SCREEN_W - pw) * 0.5f;
+                float py = (SCREEN_H - ph) * 0.5f;
+                if (pausePanelTex) {
+                    drawTexQuad(px, py, pw, ph, pausePanelTex, 1.0f);
+                } else {
+                    drawQuad(px, py, pw, ph, 0, 0.05f, 0.05f, 0.05f,
+                             0.95f);
+                }
+                mtext(px + 36.0f, py + 24.0f, 2.0f, 1, 1, 1, "YOU DIED");
+                char info[96];
+                snprintf(info, sizeof(info), "Difficulty: %s",
+                         DIFFICULTIES[gameDiff].name);
+                mtext(px + 36.0f, py + 64.0f, 1.1f, 0.8f, 0.8f, 0.8f,
+                      info);
+                snprintf(info, sizeof(info), "Save: %s", curSaveName);
+                mtext(px + 36.0f, py + 82.0f, 1.1f, 0.8f, 0.8f, 0.8f,
+                      info);
+                snprintf(info, sizeof(info), "Map seed: %u",
+                         (unsigned)mapSeed);
+                mtext(px + 36.0f, py + 100.0f, 1.1f, 0.8f, 0.8f, 0.8f,
+                      info);
+                drawMenuButton(px + 36.0f, py + 130.0f, pw - 72.0f,
+                               54.0f, "LOAD GAME",
+                               deathSel == 0 && !deathMenuNoLoad);
+                if (deathMenuNoLoad) {
+                    drawQuad(px + 36.0f, py + 130.0f, pw - 72.0f, 54.0f,
+                             0, 0.0f, 0.0f, 0.0f, 0.55f);
+                }
+                drawMenuButton(px + 36.0f, py + 208.0f, pw - 72.0f,
+                               54.0f, "QUIT TO MENU", deathSel == 1);
+                mtextWrap(px + 36.0f, py + 286.0f, pw - 72.0f, 1.1f,
                           deathReport);
-                float dby = SCREEN_H * 0.5f + 116.0f;
-                drawFrame(dx + 20.0f, dby, 300.0f, 54.0f,
-                          deathSel == 0 && !deathMenuNoLoad);
-                float lg = deathMenuNoLoad ? 0.35f : 1.0f;
-                mtextC(dx + 170.0f, dby + 20.0f, 1.7f, lg, lg, lg,
-                       "LOAD GAME");
-                drawFrame(dx + 340.0f, dby, 300.0f, 54.0f, deathSel == 1);
-                mtextC(dx + 490.0f, dby + 20.0f, 1.7f, 1, 1, 1,
-                       "QUIT TO MENU");
             }
         }
 
@@ -12476,8 +12515,9 @@ int main(void) {
             glColor4f(1, 1, 1, 1);
             glPopMatrix();
         }
-        /* Eyes closed: solid black, but never over an open menu. */
-        if (blinkFrames > 0 && !invOpen && !pauseOpen) {
+        /* Eyes closed: solid black, but never over an open menu or
+         * the death screen. */
+        if (blinkFrames > 0 && !invOpen && !pauseOpen && deathTimer == 0) {
             drawQuad(0, 0, SCREEN_W, SCREEN_H, 0, 0.0f, 0.0f, 0.0f, 1.0f);
         }
         glEnableClientState(GL_COLOR_ARRAY);
