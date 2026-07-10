@@ -53,7 +53,7 @@ unsigned int _newlib_heap_size_user = 220 * 1024 * 1024;
 
 #define DATA_ROOT "ux0:data/scpcb-ue"
 /* Shown in the debug HUD so a stale VPK install is instantly visible. */
-#define PORT_BUILD_TAG "events3"
+#define PORT_BUILD_TAG "fogblend"
 
 /* Diagnostic switch: set to 1 to skip ALL video playback (boot clips
  * and intro). The diag2-novid device test proved the video player was
@@ -2517,6 +2517,13 @@ static void setPerspective(void) {
     glFrustum(-right, right, -top, top, zNear, zFar);
 }
 
+/* The source fog model (UpdateZoneColor): linear fog from
+ * 0.1..me\CameraFogDist world units, coloured per zone/context, with
+ * per-area overrides. Computed each frame by updateFogModel(). */
+static float fogDistW = 6.0f;   /* me\CameraFogDist, world units */
+static float fogNearW = 0.1f;
+static float fogRGB[3] = { 5.0f / 255.0f, 5.0f / 255.0f, 5.0f / 255.0f };
+
 static void applyDebugState(void) {
     if (cullMode == 0) {
         glDisable(GL_CULL_FACE);
@@ -2527,14 +2534,14 @@ static void applyDebugState(void) {
     }
 
     if (fogOn) {
-        /* Game fog: ~0.1..6 world units (Main_Core.bb), here in raw
-         * units against 8-unit rooms. */
-        GLfloat fogColor[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
+        /* CameraFogRange(0.1, CameraFogDist) in world units, 256 raw
+         * each, coloured by zone (updateFogModel). */
+        GLfloat fogColor[4] = { fogRGB[0], fogRGB[1], fogRGB[2], 1.0f };
         glEnable(GL_FOG);
         glFogf(GL_FOG_MODE, GL_LINEAR);
         glFogfv(GL_FOG_COLOR, fogColor);
-        glFogf(GL_FOG_START, 100.0f);
-        glFogf(GL_FOG_END, VIEW_RANGE * 0.75f);
+        glFogf(GL_FOG_START, fogNearW * 256.0f);
+        glFogf(GL_FOG_END, fogDistW * 256.0f);
     } else {
         glDisable(GL_FOG);
     }
@@ -2573,28 +2580,42 @@ static void drawBatchSet(const Scene *scene, const BatchGL *gl, int alphaPass) {
         glColorPointer(4, GL_UNSIGNED_BYTE, sizeof(SceneVertex), VTX_OFF(r));
 
         GLuint diffuse = gl[i].diffuse;
-        if (diffuse) {
-            glEnable(GL_TEXTURE_2D);
-            glBindTexture(GL_TEXTURE_2D, diffuse);
-            glTexCoordPointer(2, GL_FLOAT, sizeof(SceneVertex), VTX_OFF(du));
-        } else {
-            glDisable(GL_TEXTURE_2D);
-        }
-        /* Lightmap on the second texture unit, added in the SAME pass
-         * (env GL_ADD). The old second additive draw doubled both the
-         * draw-call count (~0.25 ms of CPU each in vitaGL) and the
-         * fill over every lit pixel - the two measured fps walls. */
         GLuint lightmap = alphaPass ? 0 : gl[i].lightmap;
-        if (lightmap) {
-            glActiveTexture(GL_TEXTURE1);
+        if (lightmap && diffuse) {
+            /* The source composite (Map_Core: TextureBlend 3 on the
+             * _lm layer, TextureBlend 5 on the diffuse):
+             *   2 * diffuse * (vertex ambient + lightmap)
+             * in one pass: unit 0 ADDs the lightmap onto the baked
+             * vertex colour, unit 1 modulates by the diffuse doubled
+             * (COMBINE with RGB_SCALE 2). */
             glEnable(GL_TEXTURE_2D);
             glBindTexture(GL_TEXTURE_2D, lightmap);
             glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_ADD);
+            glTexCoordPointer(2, GL_FLOAT, sizeof(SceneVertex), VTX_OFF(lu));
+            glActiveTexture(GL_TEXTURE1);
+            glEnable(GL_TEXTURE_2D);
+            glBindTexture(GL_TEXTURE_2D, diffuse);
+            glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_COMBINE);
+            glTexEnvi(GL_TEXTURE_ENV, GL_COMBINE_RGB, GL_MODULATE);
+            glTexEnvi(GL_TEXTURE_ENV, GL_SRC0_RGB, GL_PREVIOUS);
+            glTexEnvi(GL_TEXTURE_ENV, GL_SRC1_RGB, GL_TEXTURE);
+            glTexEnvf(GL_TEXTURE_ENV, GL_RGB_SCALE, 2.0f);
+            glTexEnvi(GL_TEXTURE_ENV, GL_COMBINE_ALPHA, GL_REPLACE);
+            glTexEnvi(GL_TEXTURE_ENV, GL_SRC0_ALPHA, GL_PREVIOUS);
             glClientActiveTexture(GL_TEXTURE1);
             glEnableClientState(GL_TEXTURE_COORD_ARRAY);
-            glTexCoordPointer(2, GL_FLOAT, sizeof(SceneVertex), VTX_OFF(lu));
+            glTexCoordPointer(2, GL_FLOAT, sizeof(SceneVertex), VTX_OFF(du));
             glClientActiveTexture(GL_TEXTURE0);
             glActiveTexture(GL_TEXTURE0);
+        } else if (diffuse) {
+            glEnable(GL_TEXTURE_2D);
+            glBindTexture(GL_TEXTURE_2D, diffuse);
+            glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_MODULATE);
+            glTexCoordPointer(2, GL_FLOAT, sizeof(SceneVertex), VTX_OFF(du));
+            lightmap = 0;
+        } else {
+            glDisable(GL_TEXTURE_2D);
+            lightmap = 0;
         }
         if (alphaPass) {
             /* The game alpha-blends these surfaces with the texture's
@@ -2612,10 +2633,13 @@ static void drawBatchSet(const Scene *scene, const BatchGL *gl, int alphaPass) {
         if (lightmap) {
             glActiveTexture(GL_TEXTURE1);
             glDisable(GL_TEXTURE_2D);
+            glTexEnvf(GL_TEXTURE_ENV, GL_RGB_SCALE, 1.0f);
             glClientActiveTexture(GL_TEXTURE1);
             glDisableClientState(GL_TEXTURE_COORD_ARRAY);
             glClientActiveTexture(GL_TEXTURE0);
             glActiveTexture(GL_TEXTURE0);
+            /* Unit 0 back to plain modulate for everything else. */
+            glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_MODULATE);
         }
         if (alphaPass) {
             glDisable(GL_ALPHA_TEST);
@@ -10552,6 +10576,48 @@ static void updateRoomEvents2(void) {
 }
 
 /* Called each gameplay frame: swap the track when the zone changes. */
+/* UpdateZoneColor: fog colour and distance per zone and context (the
+ * Main_Core FogColor* constants, "RRRGGGBBB" strings). */
+static void updateFogModel(void) {
+    float r = 5.0f, g = 5.0f, b = 5.0f;     /* FogColorLCZ */
+    float dist = 6.0f, near = 0.1f;
+    int zone = zoneAt(camPos);
+    if (zone == 2) { r = 7.0f; g = 2.0f; b = 2.0f; }        /* HCZ */
+    else if (zone == 3) { r = 7.0f; g = 7.0f; b = 12.0f; }  /* EZ */
+    const char *nm = NULL;
+    int cell = playerRoomLookup(camPos);
+    if (cell >= 0) nm = tplList.items[map.rooms[cell].templateIndex].name;
+    if (introPhase >= 0 || inIntroBounds(camPos[0], camPos[2])) {
+        /* IsOutSide includes cont1_173_intro: white, far fog. */
+        r = g = b = 255.0f;
+        dist = 60.0f;
+        near = 5.0f;
+    } else if (inPocket) {
+        r = g = b = 0.0f;                     /* FogColorPD */
+    } else if (inMask) {
+        r = 96.0f; g = 97.0f; b = 104.0f;     /* FogColorDimension_1499 */
+        dist = 80.0f;
+        near = 40.0f;
+    } else if (nm && !strcmp(nm, "cont2_860_1")) {
+        r = 98.0f; g = 133.0f; b = 162.0f;    /* FogColorForest */
+        dist = 8.0f;
+    } else if (nm && (!strcmp(nm, "gate_a") || !strcmp(nm, "gate_b"))) {
+        r = g = b = 255.0f;                   /* FogColorOutside */
+        dist = 60.0f;
+        near = 5.0f;
+    } else if (nm && !strcmp(nm, "room3_storage")
+               && camPos[1] < -4100.0f) {
+        r = 2.0f; g = 7.0f; b = 0.0f;         /* FogColorStorageTunnels */
+    } else if (ecBlackout) {
+        dist = 4.0f;                          /* 6.0 - 2.0 * IsBlackOut */
+    }
+    fogRGB[0] = r / 255.0f;
+    fogRGB[1] = g / 255.0f;
+    fogRGB[2] = b / 255.0f;
+    fogDistW = dist;
+    fogNearW = near;
+}
+
 static void updateZoneMusic(void) {
     if (radioChannel >= 0 || !worldReady) return;
     const char *path = desiredMusicPath();
@@ -13878,6 +13944,7 @@ int main(void) {
         if (haveData) {
             updateActiveRooms(camPos);
             markRoomVisited(camPos);
+            updateFogModel();
         }
 
         float fwdX = sinf(camYaw), fwdZ = -cosf(camYaw);
@@ -14058,10 +14125,14 @@ int main(void) {
             /* Skip rooms entirely behind the camera (a generous margin
              * keeps anything that could bleed into the periphery). */
             float cullFx = sinf(camYaw), cullFz = -cosf(camYaw);
+            float fogCull = fogDistW * 256.0f + 1700.0f;
             for (int i = 0; i < activeCount; i++) {
                 float rdx = activeRooms[i]->gridX * ROOM_SPACING - camPos[0];
                 float rdz = activeRooms[i]->gridY * ROOM_SPACING - camPos[2];
                 if (rdx * cullFx + rdz * cullFz < -ROOM_SPACING) continue;
+                /* Fully past the fog wall: invisible, skip the fill. */
+                if (fogOn && rdx * rdx + rdz * rdz > fogCull * fogCull)
+                    continue;
                 drawRoomBatches(activeRooms[i], 0);
             }
             if (introCellGL && inIntroBounds(camPos[0], camPos[2])) {
@@ -14107,6 +14178,8 @@ int main(void) {
                 float rdx = activeRooms[i]->gridX * ROOM_SPACING - camPos[0];
                 float rdz = activeRooms[i]->gridY * ROOM_SPACING - camPos[2];
                 if (rdx * cullFx + rdz * cullFz < -ROOM_SPACING) continue;
+                if (fogOn && rdx * rdx + rdz * rdz > fogCull * fogCull)
+                    continue;
                 drawRoomBatches(activeRooms[i], 1);
             }
             if (introCellGL && inIntroBounds(camPos[0], camPos[2])) {
