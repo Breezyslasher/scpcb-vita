@@ -8854,6 +8854,9 @@ static void updatePlayerCondition(void) {
  * from a world-positioned prop pool. Timings follow the source's
  * 70-tick seconds. */
 
+static int ambienceSound(int id); /* defined with the ambience system */
+static void drawModelRTTinted(const ModelRT *rt, GLuint texOverride);
+
 #define MAX_EVENT_HUMANS 16
 static IntroHuman eventHumans[MAX_EVENT_HUMANS];
 static int eventHumanUsed[MAX_EVENT_HUMANS];
@@ -9015,9 +9018,6 @@ static void spawnZombieAtWorld(float x, float y, float z) {
 }
 
 #define EVSND(path) audioLoad(SFX_DIR path)
-
-static int ambienceSound(int id); /* defined with the ambience system */
-static void drawModelRTTinted(const ModelRT *rt, GLuint texOverride);
 
 /* Room-local -> world (the same transform as doors/items). */
 static void evLocal(const RoomPlacement *p, float x, float y, float z,
