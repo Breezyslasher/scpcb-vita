@@ -25,6 +25,10 @@ DOOR_TYPES = {
     "OFFICE_DOOR": 4, "WOODEN_DOOR": 5, "ONE_SIDED_DOOR": 6,
     "SCP_914_DOOR": 7,
 }
+# Extra types derived from FillRoom follow-up lines (see below):
+# 8 = default door with OBJ2 freed (single leaf), 9 = cell door
+# (single leaf retextured Door02.jpg), 10 = corrosive default,
+# 11 = corrosive one-sided (Door01_Corrosive.png on panel+frame).
 # Items_Core.bb: KEY_CARD_n constants; negative KEY_* are special
 # scanners the port cannot open, mapped to locked.
 KEYCARDS = {
@@ -38,6 +42,8 @@ LOCKED_KEYS = {"KEY_HAND_WHITE", "KEY_HAND_BLACK", "KEY_HAND_YELLOW",
 case_re = re.compile(r'^\s*Case\s+(r_[\w, \t]+)')
 door_re = re.compile(r'CreateDoor\(\s*r\s*,([^)]*)\)')
 num_expr = re.compile(r'^[0-9+\-*/. ()\t]+$')
+tex_re = re.compile(
+    r'Tex\s*=\s*LoadTexture_Strict\("GFX\\Map\\Textures\\([^"]+)"\)')
 
 
 def eval_coord(expr):
@@ -75,13 +81,18 @@ def single_line_if(text):
 
 
 lines = open(ROOMS, encoding="latin-1").readlines()
+cur_tex = None
 for li, line in enumerate(lines):
     cm = case_re.match(line)
     if cm:
         rooms = [r.strip()[2:] for r in cm.group(1).split(",")
                  if r.strip().startswith("r_")]
         if_stack = []
+        cur_tex = None
         continue
+    tm = tex_re.search(line)
+    if tm:
+        cur_tex = tm.group(1)
     if if_re.match(line) and not single_line_if(line):
         named = [m[2:] for m in roomid_re.findall(line)]
         if_stack.append(named or None)
@@ -136,16 +147,35 @@ for li, line in enumerate(lines):
             if code_id == 0:
                 locked = 1
     # Follow-up lines on the assigned door: `d\Locked = 1` locks it,
-    # FreeEntity(d\Buttons[..]) removes its buttons.
+    # FreeEntity(d\Buttons[..]) removes its buttons, FreeEntity(d\OBJ2)
+    # leaves a single leaf, EntityTexture(d\OBJ, ...) retextures it
+    # (the intro cell door's Door02.jpg, the corrosive 049/Dr. L
+    # doors). A texture may be loaded just before the CreateDoor.
     nobuttons = 0
+    single = 0
+    tex = cur_tex
+    door_tex = None
     if "=" in line.split("CreateDoor")[0]:
-        for follow in lines[li + 1:li + 7]:
+        for follow in lines[li + 1:li + 11]:
             if case_re.match(follow) or "CreateDoor" in follow:
                 break
             if re.search(r'\\Locked\s*=\s*1', follow):
                 locked = 1
             if re.search(r'FreeEntity\(d\\Buttons', follow):
                 nobuttons = 1
+            if re.search(r'FreeEntity\(d\\OBJ2\)', follow):
+                single = 1
+            tm = tex_re.search(follow)
+            if tm:
+                tex = tm.group(1)
+            if re.search(r'EntityTexture\(d\\OBJ\b', follow):
+                door_tex = tex
+    if door_tex and door_tex.lower() == "door02.jpg" and dtype == 0:
+        dtype = 9
+    elif door_tex and door_tex.lower() == "door01_corrosive.png":
+        dtype = 11 if dtype == 6 else 10
+    elif dtype == 0 and single:
+        dtype = 8
     for room in active:
         doors.append((room, x, y, z, ang % 360.0, is_open, dtype,
                       keycard, locked, nobuttons, code_id))
@@ -163,7 +193,9 @@ with open(OUT, "w") as f:
             " * Room-internal doors from FillRoom's literal-coordinate\n"
             " * CreateDoor calls in Rooms_Core.bb (room-local raw units;\n"
             " * type: 0 default 1 elevator 2 heavy 3 big 4 office 5 wooden\n"
-            " * 6 one-sided 7 SCP-914). */\n"
+            " * 6 one-sided 7 SCP-914 8 single-leaf default 9 cell door\n"
+            " * (Door02.jpg) 10 corrosive default 11 corrosive\n"
+            " * one-sided). */\n"
             "#ifndef VITA_GAME_ROOM_DOORS_H\n"
             "#define VITA_GAME_ROOM_DOORS_H\n\n"
             "typedef struct {\n"

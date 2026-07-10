@@ -53,7 +53,7 @@ unsigned int _newlib_heap_size_user = 220 * 1024 * 1024;
 
 #define DATA_ROOT "ux0:data/scpcb-ue"
 /* Shown in the debug HUD so a stale VPK install is instantly visible. */
-#define PORT_BUILD_TAG "deathmenu"
+#define PORT_BUILD_TAG "fogblend"
 
 /* Diagnostic switch: set to 1 to skip ALL video playback (boot clips
  * and intro). The diag2-novid device test proved the video player was
@@ -939,10 +939,65 @@ static void spawnRoomDoors(void) {
 }
 
 /* ---- per-room event system (Events_Core) ---- */
-enum { EV_NONE = 0, EV_173_APPEAR, EV_TRICK, EV_682_ROAR };
+enum {
+    EV_NONE = 0, EV_173_APPEAR, EV_TRICK, EV_682_ROAR,
+    /* the FillRoom-scripted room events (UpdateEvents cases) */
+    EV_DEADEND_106,   /* janitor dragged off by 106 in the LCZ dead end */
+    EV_DEADEND_GUARD, /* guard seals the EZ shelter behind you */
+    EV_CLOSETS,       /* 173 kills the two staff hiding in the closets */
+    EV_CAFETERIA,     /* pizza fridge + the broken SCP-294 */
+    EV_ELEVATOR,      /* guard rides the broken elevator down, screams */
+    EV_IC_CORPSE,     /* Gonzales corpse + blood in the LCZ office */
+    EV_FAN,           /* the ceiling fan cycles on and off */
+    EV_DUCK,          /* PA-duck teleports while you blink */
+    EV_EZ_035,        /* 035 victim + tentacle after 035 is loose */
+    EV_SMOKE_HCZ,     /* decontamination gas floods room2_6_hcz */
+    EV_HCZ_106,       /* 106 rises through the floor of an HCZ hall */
+    EV_TEST_LCZ_173,  /* 173 in the LCZ test chamber window */
+    EV_VICTIM_106,    /* corpse 106 left behind */
+    EV_SINKHOLE,      /* the corrosion sinkhole into the pocket dim */
+    EV_GW2,           /* gas leak in the greenhouse-window hall */
+    EV_GUARD_HCZ,     /* dead guard slumped in room3_2_hcz */
+    EV_1048,          /* SCP-1048 doodle scampers by */
+    EV_STORAGE3,      /* room3_storage lockup */
+    EV_DOOR_CLOSING,  /* a far door slams as you approach */
+    EV_789J,          /* the butt ghost in the EZ toilets */
+    EV_EZ_GUARD,      /* dead guard in the EZ hall */
+    EV_MEDIBAY,       /* medibay corpse + pickups */
+    EV_SHAFT,         /* the dead guard in the elevator shaft */
+    EV_SL,            /* Dr. L's server-room lockdown */
+    EV_STORAGE1,      /* room1_storage cameo */
+    EV_ROOM4_IC,      /* room4_ic corpse */
+    EV_500_1499,      /* Emily's scream behind the corroded door */
+    EV_409,           /* the 409 crystal chamber victim */
+    EV_008,           /* the 008 chamber: alarm, spores, infection */
+    EV_1162ARC,       /* the hole in the wall that trades items */
+    EV_SCIENTISTS2,   /* Dr. L's office corpses */
+    EV_066,           /* SCP-066 rolls about, humming its notes */
+    EV_EC,            /* the electrical centre: remote door + blackout */
+    EV_GATE_ENT,      /* gate entrances: remote-door gating, 106 laugh */
+    EV_1123,          /* touching the skull brings the flashback */
+    EV_GATEWAY,       /* the greenhouse airlock cycle */
+    EV_CHECKPOINT,    /* doors/monitors mirror the room2_sl power */
+    EV_STORAGE_970,   /* the SCP-970 looping corridor */
+    EV_SERVERS_HCZ,   /* the HCZ server-room 939 scare */
+    EV_TEST_HCZ,      /* room2_test_hcz skull/сameo */
+    EV_ROOM4_2_D      /* dead Class-D in room4_2_hcz */
+};
 #define MAX_EVENT_ROOMS 1024
 static int roomEventId[MAX_EVENT_ROOMS];
 static float roomEventState[MAX_EVENT_ROOMS];
+/* The FillRoom-scripted events run in their own two slots per room (a
+ * room can carry two: room3_hcz has both the saxophone duck and the
+ * 1048 doodle), each with three state floats and two cameo handles. */
+static unsigned char evId[MAX_EVENT_ROOMS][2];
+static float evSt[MAX_EVENT_ROOMS][2][3];
+static signed char evNpc[MAX_EVENT_ROOMS][2][2];
+static float lightBlinkT;        /* the source's me\LightBlink flicker */
+static int facilityPower;        /* the room2_sl generator lever */
+static int remoteDoorOn;         /* room2c_ec's remote door control */
+static int ecBlackout;           /* the electrical centre lights are cut */
+static void eventHumansClear(void);
 static float camShake;          /* decays; jitters the view rotation */
 static float cameraZoom;         /* FOV narrowing (deg) - 106's dread pulse */
 static float blurAmount;         /* 0..1 screen blur (me\BlurVolume) */
@@ -987,6 +1042,7 @@ typedef struct {
     int dir;            /* sweep direction */
     float headYaw, headPitch; /* animated head orientation (world) */
     int screen;         /* feeds a monitor */
+    int checkpoint;     /* checkpoint room: mirrors facilityPower */
     float mx, my, mz;   /* monitor world position */
     float myaw, mpitch; /* monitor facing (world) */
 } WorldCamera;
@@ -1029,6 +1085,7 @@ static void spawnRoomCameras(void) {
             c->headYaw = c->yawBase;
             c->headPitch = cd->pitch;
             c->screen = cd->screen;
+            c->checkpoint = strstr(nm, "checkpoint") != NULL;
             if (cd->screen) {
                 float ml[3] = { cd->mx, cd->my, cd->mz }, mw[3];
                 localToWorld(p, ml, mw);
@@ -2220,6 +2277,7 @@ static float npc173WanderYawDeg;
 static int deathTimer;          /* >0: death screen counting down */
 static int deathMenuOpen;       /* the source's post-death report menu */
 static int deathMenuNoLoad;     /* permadeath: the save is gone */
+static int deathHaveSave;       /* a save file exists (source GameSaved) */
 static int deathSel;
 static char deathReport[640];
 
@@ -2287,6 +2345,8 @@ static void deathBuildReport(void) {
         { "SCP-914", "914" },
         { "SCP-012", "012" },
         { "SCP-895", "895" },
+        { "SCP-1162-ARC", "1162" },
+        { "DECONTAMINATION GAS", "smoke" },
     };
     const char *fmt = NULL;
     for (unsigned i = 0; i < sizeof(MAP) / sizeof(MAP[0]); i++) {
@@ -2383,6 +2443,13 @@ static void regenerateMap(uint32_t seed) {
     for (uint32_t i = 0; i < tplList.count; i++) {
         templateUnload(&tplRT[i]);
     }
+    /* activeRooms[] points into map.rooms, which mapFree releases:
+     * empty the list or the rest of the load frame (room ambience,
+     * lookups) walks freed placements. Symbolized from a device
+     * psp2core: updateRoomAmbience faulted on tplRT[rp->templateIndex]
+     * right after a death-menu LOAD GAME. */
+    activeCount = 0;
+    eventHumansClear();
     mapFree(&map);
     doorsFree(&doors);
     mapSeed = seed;
@@ -2450,6 +2517,13 @@ static void setPerspective(void) {
     glFrustum(-right, right, -top, top, zNear, zFar);
 }
 
+/* The source fog model (UpdateZoneColor): linear fog from
+ * 0.1..me\CameraFogDist world units, coloured per zone/context, with
+ * per-area overrides. Computed each frame by updateFogModel(). */
+static float fogDistW = 6.0f;   /* me\CameraFogDist, world units */
+static float fogNearW = 0.1f;
+static float fogRGB[3] = { 5.0f / 255.0f, 5.0f / 255.0f, 5.0f / 255.0f };
+
 static void applyDebugState(void) {
     if (cullMode == 0) {
         glDisable(GL_CULL_FACE);
@@ -2460,14 +2534,14 @@ static void applyDebugState(void) {
     }
 
     if (fogOn) {
-        /* Game fog: ~0.1..6 world units (Main_Core.bb), here in raw
-         * units against 8-unit rooms. */
-        GLfloat fogColor[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
+        /* CameraFogRange(0.1, CameraFogDist) in world units, 256 raw
+         * each, coloured by zone (updateFogModel). */
+        GLfloat fogColor[4] = { fogRGB[0], fogRGB[1], fogRGB[2], 1.0f };
         glEnable(GL_FOG);
         glFogf(GL_FOG_MODE, GL_LINEAR);
         glFogfv(GL_FOG_COLOR, fogColor);
-        glFogf(GL_FOG_START, 100.0f);
-        glFogf(GL_FOG_END, VIEW_RANGE * 0.75f);
+        glFogf(GL_FOG_START, fogNearW * 256.0f);
+        glFogf(GL_FOG_END, fogDistW * 256.0f);
     } else {
         glDisable(GL_FOG);
     }
@@ -2506,28 +2580,42 @@ static void drawBatchSet(const Scene *scene, const BatchGL *gl, int alphaPass) {
         glColorPointer(4, GL_UNSIGNED_BYTE, sizeof(SceneVertex), VTX_OFF(r));
 
         GLuint diffuse = gl[i].diffuse;
-        if (diffuse) {
-            glEnable(GL_TEXTURE_2D);
-            glBindTexture(GL_TEXTURE_2D, diffuse);
-            glTexCoordPointer(2, GL_FLOAT, sizeof(SceneVertex), VTX_OFF(du));
-        } else {
-            glDisable(GL_TEXTURE_2D);
-        }
-        /* Lightmap on the second texture unit, added in the SAME pass
-         * (env GL_ADD). The old second additive draw doubled both the
-         * draw-call count (~0.25 ms of CPU each in vitaGL) and the
-         * fill over every lit pixel - the two measured fps walls. */
         GLuint lightmap = alphaPass ? 0 : gl[i].lightmap;
-        if (lightmap) {
-            glActiveTexture(GL_TEXTURE1);
+        if (lightmap && diffuse) {
+            /* The source composite (Map_Core: TextureBlend 3 on the
+             * _lm layer, TextureBlend 5 on the diffuse):
+             *   2 * diffuse * (vertex ambient + lightmap)
+             * in one pass: unit 0 ADDs the lightmap onto the baked
+             * vertex colour, unit 1 modulates by the diffuse doubled
+             * (COMBINE with RGB_SCALE 2). */
             glEnable(GL_TEXTURE_2D);
             glBindTexture(GL_TEXTURE_2D, lightmap);
             glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_ADD);
+            glTexCoordPointer(2, GL_FLOAT, sizeof(SceneVertex), VTX_OFF(lu));
+            glActiveTexture(GL_TEXTURE1);
+            glEnable(GL_TEXTURE_2D);
+            glBindTexture(GL_TEXTURE_2D, diffuse);
+            glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_COMBINE);
+            glTexEnvi(GL_TEXTURE_ENV, GL_COMBINE_RGB, GL_MODULATE);
+            glTexEnvi(GL_TEXTURE_ENV, GL_SRC0_RGB, GL_PREVIOUS);
+            glTexEnvi(GL_TEXTURE_ENV, GL_SRC1_RGB, GL_TEXTURE);
+            glTexEnvf(GL_TEXTURE_ENV, GL_RGB_SCALE, 2.0f);
+            glTexEnvi(GL_TEXTURE_ENV, GL_COMBINE_ALPHA, GL_REPLACE);
+            glTexEnvi(GL_TEXTURE_ENV, GL_SRC0_ALPHA, GL_PREVIOUS);
             glClientActiveTexture(GL_TEXTURE1);
             glEnableClientState(GL_TEXTURE_COORD_ARRAY);
-            glTexCoordPointer(2, GL_FLOAT, sizeof(SceneVertex), VTX_OFF(lu));
+            glTexCoordPointer(2, GL_FLOAT, sizeof(SceneVertex), VTX_OFF(du));
             glClientActiveTexture(GL_TEXTURE0);
             glActiveTexture(GL_TEXTURE0);
+        } else if (diffuse) {
+            glEnable(GL_TEXTURE_2D);
+            glBindTexture(GL_TEXTURE_2D, diffuse);
+            glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_MODULATE);
+            glTexCoordPointer(2, GL_FLOAT, sizeof(SceneVertex), VTX_OFF(du));
+            lightmap = 0;
+        } else {
+            glDisable(GL_TEXTURE_2D);
+            lightmap = 0;
         }
         if (alphaPass) {
             /* The game alpha-blends these surfaces with the texture's
@@ -2545,10 +2633,13 @@ static void drawBatchSet(const Scene *scene, const BatchGL *gl, int alphaPass) {
         if (lightmap) {
             glActiveTexture(GL_TEXTURE1);
             glDisable(GL_TEXTURE_2D);
+            glTexEnvf(GL_TEXTURE_ENV, GL_RGB_SCALE, 1.0f);
             glClientActiveTexture(GL_TEXTURE1);
             glDisableClientState(GL_TEXTURE_COORD_ARRAY);
             glClientActiveTexture(GL_TEXTURE0);
             glActiveTexture(GL_TEXTURE0);
+            /* Unit 0 back to plain modulate for everything else. */
+            glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_MODULATE);
         }
         if (alphaPass) {
             glDisable(GL_ALPHA_TEST);
@@ -2797,7 +2888,10 @@ static void loadSounds(void) {
 static ModelRT doorFrameRT, doorPanelRT, heavy1RT, heavy2RT;
 static ModelRT elevatorRT, big1RT, big2RT, bigFrameRT;
 static ModelRT officeRT, officeFrameRT, woodenRT, woodenFrameRT;
-static ModelRT oneSidedRT, door914RT;
+static ModelRT oneSidedRT, door914RT, cellRT;
+/* Event props: the joke ducks and the SCP-1048 doodle. */
+static ModelRT duckRT, rubberDuckRT, doodle1048RT;
+static ModelRT scp066RT, naziRT;
 static ModelRT buttonRT, buttonKeycardRT;
 static ModelRT buttonKeypadRT, buttonScannerRT, buttonElevatorRT;
 static ModelRT leverBaseRT, leverHandleRT;
@@ -2936,6 +3030,10 @@ static void buildDoorAssets(void) {
     buildModelRT(&oneSidedRT, "Door02.b3d", 203.0f, 313.0f, 15.0f, NULL);
     buildModelRT(&door914RT, "Door02.b3d", 203.0f, 313.0f, 15.0f,
                  "Door01_914.png");
+    /* The intro cell doors (FillRoom retextures the default panel
+     * with Door02.jpg and frees OBJ2, leaving one leaf). */
+    buildModelRT(&cellRT, "Door01.b3d", 203.0f, 313.0f, 15.0f,
+                 "Door02.jpg");
     buildModelRT(&elevatorRT, "ElevatorDoor.b3d", 0, 0, 0, NULL);
     buildModelRT(&big1RT, "contdoorleft.b3d", 0, 0, 0, NULL);
     big1RT.scale[0] = big1RT.scale[1] = big1RT.scale[2] = 55.0f;
@@ -2950,6 +3048,13 @@ static void buildDoorAssets(void) {
     woodenRT.scale[1] = 44.0f;
     woodenRT.scale[2] = 46.0f;
     buildModelRT(&woodenFrameRT, "DoorWoodenFrame.b3d", 0, 0, 0, NULL);
+    /* Event props: ducks sized like the source's 0.07 NPC-model scale
+     * (about knee height), the 1048 doodle at its half-metre. */
+    buildModelRT(&duckRT, "duck.b3d", 0, 40.0f, 0, NULL);
+    buildModelRT(&rubberDuckRT, "rubber_duck.b3d", 0, 0, 0, NULL);
+    buildModelRT(&doodle1048RT, "scp_1048.b3d", 0, 120.0f, 0, NULL);
+    buildModelRT(&scp066RT, "scp_066.b3d", 0, 70.0f, 0, NULL);
+    buildModelRT(&naziRT, "nazi_officer.b3d", 0, 440.0f, 0, NULL);
     /* CreateButton scales to 0.03 world units = 7.68 raw. */
     buildModelRT(&buttonRT, "Button.b3d", 0, 0, 0, NULL);
     buttonRT.scale[0] = buttonRT.scale[1] = buttonRT.scale[2] = 7.68f;
@@ -3613,10 +3718,75 @@ static void spawnRoomEvents(void) {
         { "room2_5_ez",    EV_682_ROAR,   50 },
     };
     int n = (int)(sizeof(TABLE) / sizeof(TABLE[0]));
+    /* The FillRoom-scripted events, by events_MC.ini's room list. */
+    static const struct { const char *room; unsigned char ev; } TABLE2[] = {
+        { "room1_dead_end_lcz", EV_DEADEND_106 },
+        { "room1_dead_end_ez",  EV_DEADEND_GUARD },
+        { "room2_closets",      EV_CLOSETS },
+        { "room2_2_lcz",        EV_FAN },
+        { "room2_ic",           EV_IC_CORPSE },
+        { "room2_2_ez",         EV_DUCK },
+        { "room3_hcz",          EV_DUCK },
+        { "room3_hcz",          EV_1048 },
+        { "room1_storage",      EV_STORAGE1 },
+        { "room2_6_ez",         EV_789J },
+        { "room2_6_ez",         EV_EZ_GUARD },
+        { "room2_medibay",      EV_MEDIBAY },
+        { "room2_sl",           EV_SL },
+        { "room2_shaft",        EV_SHAFT },
+        { "room3_lcz",          EV_DOOR_CLOSING },
+        { "room3_2_lcz",        EV_DOOR_CLOSING },
+        { "room3_lcz",          EV_VICTIM_106 },
+        { "room3_2_lcz",        EV_SINKHOLE },
+        { "room4_lcz",          EV_SINKHOLE },
+        { "room2_6_hcz",        EV_SMOKE_HCZ },
+        { "room2_2_hcz",        EV_HCZ_106 },
+        { "room2_5_hcz",        EV_HCZ_106 },
+        { "room3_2_hcz",        EV_GUARD_HCZ },
+        { "room4_2_hcz",        EV_ROOM4_2_D },
+        { "room3_storage",      EV_STORAGE3 },
+        { "room2_servers_hcz",  EV_SERVERS_HCZ },
+        { "cont2_500_1499",     EV_500_1499 },
+        { "cont2_409",          EV_409 },
+        { "cont2_008",          EV_008 },
+        { "cont2c_066_1162_arc", EV_1162ARC },
+        { "room2_scientists_2", EV_SCIENTISTS2 },
+        { "room2_gw_2",         EV_GW2 },
+        { "room2_test_hcz",     EV_TEST_HCZ },
+        { "room2_ez",           EV_EZ_035 },
+        { "room2_elevator",     EV_ELEVATOR },
+        { "room2_cafeteria",    EV_CAFETERIA },
+        { "room2_cafeteria",    EV_066 },
+        { "cont2c_066_1162_arc", EV_066 },
+        { "cont2_1123",         EV_1123 },
+        { "room2_gw",           EV_GATEWAY },
+        { "room3_gw",           EV_GATEWAY },
+        { "room2_checkpoint_lcz_hcz", EV_CHECKPOINT },
+        { "room2_checkpoint_hcz_ez",  EV_CHECKPOINT },
+        { "room2_storage",      EV_STORAGE_970 },
+        { "room2c_ec",          EV_EC },
+        { "gate_a_entrance",    EV_GATE_ENT },
+        { "gate_b_entrance",    EV_GATE_ENT },
+    };
+    int n2 = (int)(sizeof(TABLE2) / sizeof(TABLE2[0]));
+    /* No generator room on this map: the checkpoints stay powered.
+     * Same rule for the electrical centre's remote door control. */
+    facilityPower = 1;
+    remoteDoorOn = 1;
+    ecBlackout = 0;
+    for (uint32_t r = 0; r < map.roomCount; r++) {
+        const char *enm = tplList.items[map.rooms[r].templateIndex].name;
+        if (!strcmp(enm, "room2_sl")) facilityPower = 0;
+        if (!strcmp(enm, "room2c_ec")) remoteDoorOn = 0;
+    }
     uint32_t rng = mapSeed ^ 0x51ED2C0Bu;
     for (uint32_t r = 0; r < map.roomCount && r < MAX_EVENT_ROOMS; r++) {
         roomEventId[r] = EV_NONE;
         roomEventState[r] = 0.0f;
+        evId[r][0] = evId[r][1] = EV_NONE;
+        memset(evSt[r], 0, sizeof(evSt[r]));
+        evNpc[r][0][0] = evNpc[r][0][1] = -1;
+        evNpc[r][1][0] = evNpc[r][1][1] = -1;
         const char *nm = tplList.items[map.rooms[r].templateIndex].name;
         for (int i = 0; i < n; i++) {
             if (strcmp(TABLE[i].room, nm) != 0) continue;
@@ -3625,6 +3795,11 @@ static void spawnRoomEvents(void) {
                 roomEventId[r] = TABLE[i].ev;
             }
             break;
+        }
+        int slot = 0;
+        for (int i = 0; i < n2 && slot < 2; i++) {
+            if (strcmp(TABLE2[i].room, nm) != 0) continue;
+            evId[r][slot++] = TABLE2[i].ev;
         }
     }
 }
@@ -8734,7 +8909,1715 @@ static void updatePlayerCondition(void) {
     health = 100.0f - bloodloss;
 }
 
+/* ============ FillRoom-scripted room events (Events_Core) ============
+ * The UpdateEvents cases attached to specific room templates: corpse
+ * and NPC cameos, scripted scares, hazards. Cameos reuse the intro's
+ * skinned-human machinery; small props (ducks, the 1048 doodle) draw
+ * from a world-positioned prop pool. Timings follow the source's
+ * 70-tick seconds. */
+
+static int ambienceSound(int id); /* defined with the ambience system */
+static void drawModelRTTinted(const ModelRT *rt, GLuint texOverride);
+
+#define MAX_EVENT_HUMANS 16
+static IntroHuman eventHumans[MAX_EVENT_HUMANS];
+static int eventHumanUsed[MAX_EVENT_HUMANS];
+static GLuint eventHumanVbos[MAX_EVENT_HUMANS];
+
+static void evPropsClear(void);
+
+static void eventHumansClear(void) {
+    memset(eventHumanUsed, 0, sizeof(eventHumanUsed));
+    evPropsClear();
+}
+
+static int eventHumanSpawn(int guard, const char *tex, const float w[3],
+                           float yawDeg, float a0, float a1, float speed,
+                           float frame) {
+    SkinnedMesh *skin = guard ? skinGuard : skinClassD;
+    if (!skin) return -1;
+    for (int i = 0; i < MAX_EVENT_HUMANS; i++) {
+        if (eventHumanUsed[i]) continue;
+        IntroHuman *h = &eventHumans[i];
+        memset(h, 0, sizeof(*h));
+        h->rt = guard ? &introGuardRT : &introClassDRT;
+        h->skin = skin;
+        h->skinScale = guard ? skinGuardScale : skinClassDScale;
+        h->x = w[0];
+        h->y = w[1];
+        h->z = w[2];
+        h->yawDeg = yawDeg;
+        h->texOverride = tex;
+        h->animStart = a0;
+        h->animEnd = a1;
+        h->animSpeed = speed;
+        h->frame = frame;
+        if (!eventHumanVbos[i]) glGenBuffers(1, &eventHumanVbos[i]);
+        h->vbo = eventHumanVbos[i];
+        h->posed = 0;
+        eventHumanUsed[i] = 1;
+        return i;
+    }
+    return -1;
+}
+
+static void eventHumanFree(signed char *slot) {
+    if (*slot >= 0 && *slot < MAX_EVENT_HUMANS) {
+        eventHumanUsed[(int)*slot] = 0;
+    }
+    *slot = -1;
+}
+
+/* Freeze a cameo into a corpse pose (the source's SetNPCFrame +
+ * IsDead). */
+static void eventHumanDie(int idx, float frame) {
+    if (idx < 0 || idx >= MAX_EVENT_HUMANS || !eventHumanUsed[idx]) return;
+    eventHumans[idx].animSpeed = 0.0f;
+    eventHumans[idx].frame = frame;
+    eventHumans[idx].posed = 0;
+}
+
+static void drawEventHumans(const float viewPos[3]) {
+    float fwdX = sinf(camYaw), fwdZ = -cosf(camYaw);
+    for (int i = 0; i < MAX_EVENT_HUMANS; i++) {
+        if (!eventHumanUsed[i]) continue;
+        IntroHuman *h = &eventHumans[i];
+        float dx = h->x - viewPos[0], dz = h->z - viewPos[2];
+        float d2 = dx * dx + dz * dz;
+        if (d2 > 3800.0f * 3800.0f) continue;
+        if (d2 > 600.0f * 600.0f
+            && (dx * fwdX + dz * fwdZ) / sqrtf(d2) < -0.25f) {
+            continue;
+        }
+        if (h->skin) {
+            int animating = h->animSpeed != 0.0f;
+            if (animating) {
+                h->frame += h->animSpeed;
+                if (h->frame > h->animEnd) h->frame = h->animStart;
+            }
+            if (!h->posed || (animating && ((gTick + (unsigned)i) & 1) == 0)) {
+                poseHumanVbo(h);
+            }
+        }
+        glPushMatrix();
+        glTranslatef(h->x, h->y, h->z);
+        glRotatef(-h->yawDeg + 180.0f, 0.0f, 1.0f, 0.0f);
+        if (h->skin) {
+            glScalef(h->skinScale, h->skinScale, h->skinScale);
+            drawSkinnedHuman(h);
+        } else {
+            drawModelRT(h->rt);
+        }
+        glPopMatrix();
+    }
+}
+
+/* World-positioned event props (ducks, the 1048 doodle). */
+#define MAX_EVENT_PROPS 8
+static struct {
+    const ModelRT *rt;
+    float x, y, z, yawDeg;
+    GLuint texOverride;
+    int used;
+} eventProps[MAX_EVENT_PROPS];
+
+static void evPropsClear(void) {
+    memset(eventProps, 0, sizeof(eventProps));
+}
+
+static int eventPropSpawn(const ModelRT *rt, const float w[3], float yawDeg,
+                          const char *tex) {
+    for (int i = 0; i < MAX_EVENT_PROPS; i++) {
+        if (eventProps[i].used) continue;
+        eventProps[i].rt = rt;
+        eventProps[i].x = w[0];
+        eventProps[i].y = w[1];
+        eventProps[i].z = w[2];
+        eventProps[i].yawDeg = yawDeg;
+        eventProps[i].texOverride = tex ? textureGet(tex) : 0;
+        eventProps[i].used = 1;
+        return i;
+    }
+    return -1;
+}
+
+static void eventPropFree(signed char *slot) {
+    if (*slot >= 0 && *slot < MAX_EVENT_PROPS) {
+        eventProps[(int)*slot].used = 0;
+    }
+    *slot = -1;
+}
+
+static void drawEventProps(const float viewPos[3]) {
+    for (int i = 0; i < MAX_EVENT_PROPS; i++) {
+        if (!eventProps[i].used || !eventProps[i].rt->ok) continue;
+        float dx = eventProps[i].x - viewPos[0];
+        float dz = eventProps[i].z - viewPos[2];
+        if (dx * dx + dz * dz > 3000.0f * 3000.0f) continue;
+        glPushMatrix();
+        glTranslatef(eventProps[i].x, eventProps[i].y, eventProps[i].z);
+        glRotatef(-eventProps[i].yawDeg, 0.0f, 1.0f, 0.0f);
+        if (eventProps[i].texOverride) {
+            drawModelRTTinted(eventProps[i].rt, eventProps[i].texOverride);
+        } else {
+            drawModelRT(eventProps[i].rt);
+        }
+        glPopMatrix();
+    }
+}
+
+/* An SCP-008 zombie (the refine-hostile chaser) at a world position:
+ * the medibay ambush. */
+static void spawnZombieAtWorld(float x, float y, float z) {
+    if (!skin008 || rhActive) return;
+    rhActive = 1;
+    rhType = 0;
+    rhPos[0] = x;
+    rhPos[1] = y;
+    rhPos[2] = z;
+    rhFrame = 0.0f;
+    rhYaw = 0.0f;
+}
+
+#define EVSND(path) audioLoad(SFX_DIR path)
+
+/* Room-local -> world (the same transform as doors/items). */
+static void evLocal(const RoomPlacement *p, float x, float y, float z,
+                    float w[3]) {
+    float l[3] = { x, y, z };
+    localToWorld(p, l, w);
+}
+
+static float evYaw(const RoomPlacement *p, float localDeg) {
+    float a = localDeg + (float)(p->angle * 90);
+    while (a >= 360.0f) a -= 360.0f;
+    while (a < 0.0f) a += 360.0f;
+    return a;
+}
+
+/* A dead body where FillRoom put one. */
+static int evCorpse(const RoomPlacement *p, int guard, const char *tex,
+                    float lx, float ly, float lz, float yawLocal,
+                    float frame) {
+    float w[3];
+    evLocal(p, lx, ly, lz, w);
+    int idx = eventHumanSpawn(guard, tex, w, evYaw(p, yawLocal),
+                              frame, frame, 0.0f, frame);
+    return idx;
+}
+
+/* Nearest door to a room-local point (for scripted lock/corrode). */
+static Door *evNearestDoor(const RoomPlacement *p, float lx, float ly,
+                           float lz, float maxDist) {
+    float w[3];
+    evLocal(p, lx, ly, lz, w);
+    Door *best = NULL;
+    float bestD2 = maxDist * maxDist;
+    for (uint32_t i = 0; i < doors.count; i++) {
+        Door *d = &doors.items[i];
+        float dx = d->x - w[0], dz = d->z - w[2];
+        float d2 = dx * dx + dz * dz;
+        if (d2 < bestD2) {
+            bestD2 = d2;
+            best = d;
+        }
+    }
+    return best;
+}
+
+/* Nearest fixture lever to a world position (the gw airlock lever,
+ * room2_sl's generator switch). */
+static WorldLever *evLeverNear(float cx, float cz, float radius) {
+    WorldLever *best = NULL;
+    float bestD2 = radius * radius;
+    for (int i = 0; i < worldLeverCount; i++) {
+        float dx = worldLevers[i].x - cx, dz = worldLevers[i].z - cz;
+        float d2 = dx * dx + dz * dz;
+        if (d2 < bestD2) {
+            bestD2 = d2;
+            best = &worldLevers[i];
+        }
+    }
+    return best;
+}
+
+/* The lever standing at a specific room-local fixture spot. */
+static WorldLever *evLeverAt(const RoomPlacement *p, float lx, float ly,
+                             float lz) {
+    float l[3] = { lx, ly, lz }, w[3];
+    localToWorld(p, l, w);
+    WorldLever *best = NULL;
+    float bestD2 = 100.0f * 100.0f;
+    for (int i = 0; i < worldLeverCount; i++) {
+        float dx = worldLevers[i].x - w[0];
+        float dz = worldLevers[i].z - w[2];
+        float d2 = dx * dx + dz * dz;
+        if (d2 < bestD2) {
+            bestD2 = d2;
+            best = &worldLevers[i];
+        }
+    }
+    return best;
+}
+
+/* SCP-294's menu (the port has no drink-name keyboard: a random pour
+ * from the machine's classics, messages from Data/SCP-294.jsonc). */
+static const struct {
+    const char *msg;
+    const char *snd;    /* drink sound within SFX/SCP/294 */
+    int effect;         /* 0 none, 1 coffee, 2 alcohol, 3 empty */
+} EV294_DRINKS[] = {
+    { "\"The drink tastes like fairly strong black coffee.\"",
+      "Slurp", 1 },
+    { "\"Mmm...\"", "Slurp", 0 },
+    { "\"Even in the worst situations, nothing beats a fresh "
+      "cosmopolitan.\"", "Ahh", 0 },
+    { "\"Damn, that's strong.\"", "Ew1", 2 },
+    { "\"There is nothing to drink in the cup.\"", NULL, 3 },
+    { "You hear a voice inside your head.", NULL, 0 },
+};
+
+/* The trade pool for SCP-1162-ARC (arm-in-the-hole): common items the
+ * port's templates all carry. */
+static const char *EV1162_POOL[] = {
+    "Quarter", "Coin", "Playing Card", "Battery", "Eyedrops",
+    "First Aid Kit", "Cigarette", "Level 1 Key Card", "Gas Mask",
+    "Document SCP-173",
+};
+
+static void updateRoomEvents2(void) {
+    if (introPhase >= 0 || deathTimer > 0 || inPocket || inMask) return;
+    if (lightBlinkT > 0.0f) lightBlinkT -= 1.0f / 60.0f;
+    int pcell = cellIndexAt(camPos[0], camPos[2]);
+    for (uint32_t r = 0; r < map.roomCount && r < MAX_EVENT_ROOMS; r++) {
+        if (evId[r][0] == EV_NONE && evId[r][1] == EV_NONE) continue;
+        const RoomPlacement *p = &map.rooms[r];
+        float cx = p->gridX * ROOM_SPACING, cz = p->gridY * ROOM_SPACING;
+        float dx = camPos[0] - cx, dz = camPos[2] - cz;
+        float dist = sqrtf(dx * dx + dz * dz);
+        if (dist > 3.0f * ROOM_SPACING) continue;
+        int inRoom = (pcell == (int)r);
+        for (int s = 0; s < 2; s++) {
+            float *st = evSt[r][s];
+            signed char *np = evNpc[r][s];
+            float w[3];
+            switch (evId[r][s]) {
+                case EV_DEADEND_106:
+                    /* A janitor stands at the shelter door; step in and
+                     * SCP-106 pulls him under (106Abduct), leaving a
+                     * corrosion pool. */
+                    if (st[0] == 0.0f) {
+                        if (dist < 2048.0f && !inRoom) {
+                            evLocal(p, 0.0f, 0.0f, 700.0f, w);
+                            np[0] = (signed char)eventHumanSpawn(0,
+                                "janitor.png", w, evYaw(p, 180.0f),
+                                210.0f, 235.0f, 0.1f, 210.0f);
+                            audioPlay3D(EVSND("/Door/EndroomDoor.ogg"),
+                                        w, camPos, camYaw, 3800.0f);
+                            st[0] = 1.0f;
+                        }
+                    } else if (st[0] == 1.0f) {
+                        if (inRoom) {
+                            audioPlay(
+                                EVSND("/Character/Janitor/106Abduct.ogg"),
+                                1.0f, 0.0f);
+                            st[0] = 2.0f;
+                        } else if (dist < 2048.0f && np[0] >= 0) {
+                            if (st[1] <= 0.0f) {
+                                float pos[3] = { eventHumans[(int)np[0]].x,
+                                                 eventHumans[(int)np[0]].y,
+                                                 eventHumans[(int)np[0]].z };
+                                audioPlay3D(
+                                    EVSND("/Character/Janitor/Idle.ogg"),
+                                    pos, camPos, camYaw, 3800.0f);
+                                st[1] = 260.0f;
+                            }
+                            st[1] -= 1.0f;
+                        }
+                    } else if (st[0] == 2.0f) {
+                        st[1] += 1.0f;
+                        if (st[1] > 85.0f && st[2] == 0.0f) {
+                            Decal *d = decalSpawn(DECAL_CORROSIVE_1, cx,
+                                                  0.5f, cz, 90.0f,
+                                                  (float)(rand() % 360),
+                                                  0.0f, 0.05f * 256.0f,
+                                                  0.9f, 0);
+                            if (d) {
+                                d->sizeChange = 2.0f;
+                                d->maxSize = 300.0f;
+                                d->life = -1.0f;
+                            }
+                            st[2] = 1.0f;
+                        }
+                        if (st[1] > 85.0f && np[0] >= 0) {
+                            /* Dragged under. */
+                            eventHumans[(int)np[0]].y -= 1.2f;
+                            eventHumans[(int)np[0]].animSpeed = 0.0f;
+                        }
+                        if (st[1] > 250.0f) {
+                            eventHumanFree(&np[0]);
+                            if (dist < 640.0f && !npc106Contained) {
+                                npc106Active = 1;
+                                npc106State = N106_SPAWNING;
+                                npc106Pos[0] = cx;
+                                npc106Pos[2] = cz;
+                                npc106Pos[1] = camPos[1] - 280.0f;
+                            }
+                            evId[r][s] = EV_NONE;
+                        }
+                    }
+                    break;
+                case EV_DEADEND_GUARD:
+                    /* A guard on the balcony seals the shelter's upper
+                     * door behind you. */
+                    if (st[0] == 0.0f) {
+                        if (inRoom) {
+                            evLocal(p, -944.0f, 448.0f, 20.0f, w);
+                            np[0] = (signed char)eventHumanSpawn(1, NULL,
+                                w, evYaw(p, 0.0f), 77.0f, 201.0f, 0.4f,
+                                77.0f);
+                            Door *d = evNearestDoor(p, -944.0f, 320.0f,
+                                                    924.0f, 400.0f);
+                            if (d) d->open = 1;
+                            st[0] = 1.0f;
+                        }
+                    } else if (st[0] == 1.0f) {
+                        if (dist < 640.0f) st[0] = 2.0f;
+                    } else {
+                        st[1] += 1.0f;
+                        if (np[0] >= 0) {
+                            /* Walks off along the balcony (guard walk
+                             * cycle, frames 1..38). */
+                            IntroHuman *h = &eventHumans[(int)np[0]];
+                            float tw[3];
+                            evLocal(p, -944.0f, 320.0f, 1460.0f, tw);
+                            float ddx = tw[0] - h->x, ddz = tw[2] - h->z;
+                            float dd = sqrtf(ddx * ddx + ddz * ddz);
+                            if (dd > 4.0f) {
+                                h->x += ddx / dd * 2.2f;
+                                h->z += ddz / dd * 2.2f;
+                                h->yawDeg = atan2f(ddx, ddz)
+                                          * 57.29578f;
+                                if (h->animStart != 1.0f) {
+                                    h->animStart = 1.0f;
+                                    h->animEnd = 38.0f;
+                                    h->animSpeed = 0.45f;
+                                    h->frame = 1.0f;
+                                }
+                            } else if (h->animStart == 1.0f) {
+                                h->animStart = 77.0f;
+                                h->animEnd = 201.0f;
+                                h->animSpeed = 0.4f;
+                                h->frame = 77.0f;
+                            }
+                        }
+                        Door *d = evNearestDoor(p, -944.0f, 320.0f,
+                                                924.0f, 400.0f);
+                        if (st[1] > 252.0f && d && d->open) {
+                            d->open = 0;
+                            d->locked = 1;
+                        }
+                        if (d && !d->open && d->openState <= 0.0f) {
+                            eventHumanFree(&np[0]);
+                            evId[r][s] = EV_NONE;
+                        }
+                    }
+                    break;
+                case EV_CLOSETS:
+                    /* Two staff hide in the closets; SCP-173 gets them
+                     * both the moment the lights die. */
+                    if (st[0] == 0.0f) {
+                        if (inRoom) {
+                            evLocal(p, -1180.0f, -256.0f, 896.0f, w);
+                            np[0] = (signed char)eventHumanSpawn(0,
+                                "maintenance.png", w, evYaw(p, 180.0f),
+                                210.0f, 235.0f, 0.1f, 210.0f);
+                            audioPlay3D(EVSND(
+                                "/Character/Maintenance/EscapeFromClosets.ogg"),
+                                w, camPos, camYaw, 3200.0f);
+                            evLocal(p, -1292.0f, -256.0f, -160.0f, w);
+                            np[1] = (signed char)eventHumanSpawn(0,
+                                "scientist.png", w, evYaw(p, 0.0f),
+                                210.0f, 235.0f, 0.1f, 218.0f);
+                            st[0] = 1.0f;
+                        }
+                    } else {
+                        float prev = st[1];
+                        st[1] += 1.0f;
+                        if (prev <= 203.0f && st[1] > 203.0f) {
+                            audioPlay(EVSND("/Room/Intro/173Vent.ogg"),
+                                      1.0f, 0.0f);
+                        }
+                        if (prev <= 210.0f && st[1] > 210.0f
+                            && np[1] >= 0) {
+                            float pos[3] = { eventHumans[(int)np[1]].x,
+                                             eventHumans[(int)np[1]].y,
+                                             eventHumans[(int)np[1]].z };
+                            audioPlay3D(EVSND(
+                                "/Character/Scientist/EscapeFromClosets.ogg"),
+                                pos, camPos, camYaw, 3200.0f);
+                        }
+                        if (prev <= 455.0f && st[1] > 455.0f) {
+                            audioPlay(sndHorrorClose[0], 1.0f, 0.0f);
+                            lightBlinkT = 10.0f;
+                        }
+                        if (prev <= 525.0f && st[1] > 525.0f
+                            && np[0] >= 0) {
+                            audioPlay(sndNeckSnap[0], 1.0f, 0.0f);
+                            npc173Pos[0] = eventHumans[(int)np[0]].x + 90.0f;
+                            npc173Pos[1] = eventHumans[(int)np[0]].y;
+                            npc173Pos[2] = eventHumans[(int)np[0]].z;
+                            eventHumanDie((int)np[0], 19.0f);
+                        }
+                        if (prev <= 560.0f && st[1] > 560.0f
+                            && np[1] >= 0) {
+                            audioPlay(sndNeckSnap[1], 1.0f, 0.0f);
+                            npc173Pos[0] = eventHumans[(int)np[1]].x + 90.0f;
+                            npc173Pos[1] = eventHumans[(int)np[1]].y;
+                            npc173Pos[2] = eventHumans[(int)np[1]].z;
+                            eventHumanDie((int)np[1], 19.0f);
+                        }
+                        if (prev <= 630.0f && st[1] > 630.0f) {
+                            int t = itemTplFind("Wallet");
+                            evLocal(p, -1065.0f, -380.0f, 50.0f, w);
+                            if (t >= 0) worldItemAdd(t, w[0], w[1], w[2]);
+                            evId[r][s] = EV_NONE; /* corpses persist */
+                        }
+                    }
+                    break;
+                case EV_IC_CORPSE:
+                    if (inRoom) {
+                        evLocal(p, -1200.0f, 51.0f, 0.0f, w);
+                        decalSpawn(DECAL_BLOOD_1 + 1, w[0], w[1] - 50.0f,
+                                   w[2], 90.0f, (float)(rand() % 360),
+                                   0.0f, 128.0f, 1.0f, 0);
+                        evCorpse(p, 0, "Gonzales.png", -1200.0f, 51.0f,
+                                 0.0f, -80.0f, 19.0f);
+                        evId[r][s] = EV_NONE;
+                    }
+                    break;
+                case EV_FAN:
+                    /* The ceiling fan cycles on and off at random. */
+                    if (dist < 4096.0f) {
+                        st[0] -= 1.0f;
+                        if (st[0] <= 0.0f) {
+                            int was = st[1] > 0.0f;
+                            st[1] = (float)(rand() % 2);
+                            int now = st[1] > 0.0f;
+                            if (inRoom && was != now) {
+                                audioPlay3D(now
+                                    ? EVSND("/Ambient/Room ambience/FanOn.ogg")
+                                    : EVSND("/Ambient/Room ambience/FanOff.ogg"),
+                                    (float[3]){ cx, camPos[1], cz },
+                                    camPos, camYaw, 2048.0f);
+                            }
+                            st[0] = 1050.0f + (float)(rand() % 1050);
+                        }
+                        if (st[1] > 0.0f && inRoom) {
+                            st[2] -= 1.0f;
+                            if (st[2] <= 0.0f) {
+                                audioPlay3D(EVSND(
+                                    "/Ambient/Room ambience/Fan.ogg"),
+                                    (float[3]){ cx, camPos[1], cz },
+                                    camPos, camYaw, 1280.0f);
+                                st[2] = 130.0f;
+                            }
+                        }
+                    }
+                    break;
+                case EV_DUCK: {
+                    const char *nm2 =
+                        tplList.items[p->templateIndex].name;
+                    int sax = strcmp(nm2, "room3_hcz") == 0;
+                    if (st[0] == 0.0f) {
+                        if (sax) evLocal(p, 704.0f, 112.0f, -416.0f, w);
+                        else evLocal(p, -808.0f, -72.0f, -40.0f, w);
+                        np[0] = (signed char)eventPropSpawn(&duckRT, w,
+                            (float)(rand() % 360),
+                            sax ? "duck(3).png" : NULL);
+                        st[0] = 1.0f;
+                    } else if (np[0] >= 0 && inRoom) {
+                        if (sax) {
+                            /* Saxophone when nobody is looking. */
+                            float ddx = eventProps[(int)np[0]].x - camPos[0];
+                            float ddz = eventProps[(int)np[0]].z - camPos[2];
+                            float fx = sinf(camYaw), fz = -cosf(camYaw);
+                            int seen = (ddx * fx + ddz * fz) > 0.0f;
+                            if (!seen) {
+                                st[1] += 1.0f;
+                                if (st[1] > 300.0f
+                                    && (rand() % 200) == 1) {
+                                    float pos[3] = {
+                                        eventProps[(int)np[0]].x,
+                                        eventProps[(int)np[0]].y,
+                                        eventProps[(int)np[0]].z };
+                                    audioPlay3D(EVSND(
+                                        "/SCP/Joke/Saxophone.ogg"),
+                                        pos, camPos, camYaw, 1536.0f);
+                                    st[1] = 0.0f;
+                                }
+                            }
+                        } else if (blinkFrames > 0 && st[1] == 0.0f) {
+                            /* Moves while your eyes are shut. */
+                            static const float SPOTS[4][3] = {
+                                { -808.0f, -72.0f, -40.0f },
+                                { -488.0f, 160.0f, 700.0f },
+                                { -488.0f, 160.0f, -700.0f },
+                                { -600.0f, 340.0f, 0.0f },
+                            };
+                            int k = rand() % 4;
+                            evLocal(p, SPOTS[k][0], SPOTS[k][1],
+                                    SPOTS[k][2], w);
+                            eventProps[(int)np[0]].x = w[0];
+                            eventProps[(int)np[0]].y = w[1];
+                            eventProps[(int)np[0]].z = w[2];
+                            eventProps[(int)np[0]].yawDeg =
+                                (float)(rand() % 360);
+                            st[1] = 1.0f;
+                        } else if (blinkFrames == 0) {
+                            st[1] = 0.0f;
+                        }
+                    }
+                    break;
+                }
+                case EV_1048:
+                    /* The origami doodle scampers across and is gone. */
+                    if (st[0] == 0.0f) {
+                        if (dist < 1280.0f) {
+                            evLocal(p, 704.0f, 132.0f, -416.0f, w);
+                            np[0] = (signed char)eventPropSpawn(
+                                &doodle1048RT, w, evYaw(p, 90.0f), NULL);
+                            st[0] = 1.0f;
+                        }
+                    } else if (st[0] == 1.0f) {
+                        st[1] += 1.0f;
+                        if (np[0] >= 0) {
+                            float a = evYaw(p, 90.0f) * 0.01745329f;
+                            eventProps[(int)np[0]].x += sinf(a) * 1.6f;
+                            eventProps[(int)np[0]].z += cosf(a) * 1.6f;
+                        }
+                        if (st[1] > 700.0f) {
+                            eventPropFree(&np[0]);
+                            evId[r][s] = EV_NONE;
+                        }
+                    }
+                    break;
+                case EV_STORAGE1:
+                    if (st[0] == 0.0f) {
+                        evLocal(p, -659.0f, 133.0f, 446.0f, w);
+                        np[0] = (signed char)eventPropSpawn(&rubberDuckRT,
+                            w, evYaw(p, 260.0f), NULL);
+                        st[0] = 1.0f;
+                    } else if (inRoom && np[0] >= 0) {
+                        if (st[1] > 0.0f) st[1] -= 1.0f;
+                        float ddx = eventProps[(int)np[0]].x - camPos[0];
+                        float ddz = eventProps[(int)np[0]].z - camPos[2];
+                        if (ddx * ddx + ddz * ddz < 200.0f * 200.0f
+                            && inputHit(ACTION_INTERACT)
+                            && st[1] <= 0.0f) {
+                            audioPlay(EVSND("/SCP/Joke/Quack.ogg"), 1.0f,
+                                      0.0f);
+                            snprintf(toastMsg, sizeof(toastMsg),
+                                     "You squeezed the ordinary rubber "
+                                     "duck.");
+                            toastTimer = 150;
+                            st[1] = 60.0f;
+                        }
+                    }
+                    break;
+                case EV_789J:
+                    if (st[0] == 0.0f) {
+                        int t = itemTplFind("Document SCP-789-J");
+                        evLocal(p, 502.0f, 128.0f, 83.0f, w);
+                        if (t >= 0) worldItemAdd(t, w[0], w[1], w[2]);
+                        st[0] = 1.0f;
+                    } else if (st[0] == 1.0f && inRoom) {
+                        evLocal(p, 502.0f, 128.0f, 83.0f, w);
+                        float ddx = w[0] - camPos[0], ddz = w[2] - camPos[2];
+                        if (ddx * ddx + ddz * ddz < 384.0f * 384.0f) {
+                            audioPlay3D(EVSND("/SCP/Joke/789J.ogg"), w,
+                                        camPos, camYaw, 2560.0f);
+                            st[0] = 2.0f;
+                            evId[r][s] = EV_NONE;
+                        }
+                    }
+                    break;
+                case EV_EZ_GUARD:
+                    /* The slumped guard and the voice that should not
+                     * still be talking. */
+                    if (st[0] == 0.0f) {
+                        if (dist < 1536.0f) {
+                            np[0] = (signed char)evCorpse(p, 1, NULL,
+                                1322.0f, 52.0f, 491.0f, 90.0f, 287.0f);
+                            evLocal(p, 1322.0f, 2.0f, 491.0f, w);
+                            decalSpawn(DECAL_BLOOD_1 + 1, w[0], w[1] + 0.5f,
+                                       w[2], 90.0f, (float)(rand() % 360),
+                                       0.0f, 77.0f, 1.0f, 0);
+                            st[0] = 1.0f;
+                        }
+                    } else if (st[0] == 1.0f && dist < 1536.0f) {
+                        if (st[1] <= 0.0f && np[0] >= 0) {
+                            float pos[3] = { eventHumans[(int)np[0]].x,
+                                             eventHumans[(int)np[0]].y,
+                                             eventHumans[(int)np[0]].z };
+                            audioPlay3D(EVSND(
+                                "/Character/Guard/SuicideGuard0.ogg"),
+                                pos, camPos, camYaw, 3200.0f);
+                            st[1] = 700.0f;
+                        }
+                        st[1] -= 1.0f;
+                        if (dist < 1024.0f && np[0] >= 0) {
+                            float pos[3] = { eventHumans[(int)np[0]].x,
+                                             eventHumans[(int)np[0]].y,
+                                             eventHumans[(int)np[0]].z };
+                            audioPlay3D(EVSND(
+                                "/Character/Guard/SuicideGuard1.ogg"),
+                                pos, camPos, camYaw, 3200.0f);
+                            st[0] = 2.0f;
+                            evId[r][s] = EV_NONE;
+                        }
+                    }
+                    break;
+                case EV_MEDIBAY:
+                    if (st[0] == 0.0f) {
+                        if (inRoom) st[0] = 1.0f;
+                    } else if (st[0] == 1.0f) {
+                        evLocal(p, -820.0f, 20.0f, -464.0f, w);
+                        float ddx = w[0] - camPos[0], ddz = w[2] - camPos[2];
+                        if (ddx * ddx + ddz * ddz < 400.0f * 400.0f) {
+                            lightBlinkT = 10.0f;
+                            spawnZombieAtWorld(w[0], w[1], w[2]);
+                            st[0] = 2.0f;
+                        }
+                    }
+                    if (st[2] == 0.0f) {
+                        evLocal(p, -910.0f, 144.0f, -778.0f, w);
+                        np[1] = (signed char)eventPropSpawn(&duckRT, w,
+                            evYaw(p, 180.0f), "duck(4).png");
+                        st[2] = 1.0f;
+                    } else if (inRoom && np[1] >= 0) {
+                        if (st[1] > 0.0f) st[1] -= 1.0f;
+                        float ddx = eventProps[(int)np[1]].x - camPos[0];
+                        float ddz = eventProps[(int)np[1]].z - camPos[2];
+                        if (ddx * ddx + ddz * ddz < 200.0f * 200.0f
+                            && inputHit(ACTION_INTERACT)
+                            && st[1] <= 0.0f) {
+                            injuries = injuries > 0.3f
+                                     ? injuries - 0.3f : 0.0f;
+                            bloodloss = 0.0f;
+                            audioPlay(EVSND("/SCP/Joke/Quack.ogg"), 1.0f,
+                                      0.0f);
+                            snprintf(toastMsg, sizeof(toastMsg),
+                                     "You feel a cold breeze next to "
+                                     "your body.");
+                            toastTimer = 150;
+                            st[1] = 60.0f;
+                        }
+                    }
+                    break;
+                case EV_SL: {
+                    /* SCP-049 stalks the server room (his voice
+                     * first); the room's lever is the generator the
+                     * checkpoints mirror. */
+                    if (st[0] == 0.0f && inRoom && npc049Active) {
+                        evLocal(p, 0.0f, 0.0f, -900.0f, w);
+                        npc049Pos[0] = w[0];
+                        npc049Pos[1] = w[1];
+                        npc049Pos[2] = w[2];
+                        npc049State = S049_PURSUE;
+                        audioPlay3D(EVSND("/SCP/049/Room2SL0.ogg"), w,
+                                    camPos, camYaw, 3200.0f);
+                        st[0] = 1.0f;
+                    }
+                    WorldLever *lv = evLeverNear(cx, cz, 1400.0f);
+                    if (lv && lv->on != (int)st[2]) {
+                        st[2] = (float)lv->on;
+                        facilityPower = lv->on;
+                        if (inRoom) {
+                            audioPlay(EVSND("/Room/GeneratorOn.ogg"),
+                                      0.8f, 0.0f);
+                        }
+                    }
+                    break;
+                }
+                case EV_SHAFT:
+                    if (st[0] == 0.0f && dist < 2048.0f) {
+                        evCorpse(p, 1, NULL, 1344.0f, -743.0f, -384.0f,
+                                 180.0f, 286.0f);
+                        st[0] = 1.0f;
+                        evId[r][s] = EV_NONE;
+                    }
+                    break;
+                case EV_DOOR_CLOSING:
+                    if (inRoom && dist < 640.0f) {
+                        float fx = sinf(camYaw), fz = -cosf(camYaw);
+                        for (uint32_t i = 0; i < doors.count; i++) {
+                            Door *d = &doors.items[i];
+                            if (!d->open) continue;
+                            float ddx = d->x - camPos[0];
+                            float ddz = d->z - camPos[2];
+                            if (ddx * ddx + ddz * ddz > 512.0f * 512.0f)
+                                continue;
+                            if (ddx * fx + ddz * fz > 0.0f) continue;
+                            d->open = 0;
+                            d->openState = 0.0f;
+                            blurAmount = 0.6f;
+                            camShake = 3.0f;
+                            evId[r][s] = EV_NONE;
+                            break;
+                        }
+                    }
+                    break;
+                case EV_VICTIM_106:
+                    /* The ceiling corrodes; 106's last victim drops
+                     * through. */
+                    if (npc106Contained) { evId[r][s] = EV_NONE; break; }
+                    if (st[0] == 0.0f) {
+                        if (inRoom) {
+                            decalSpawn(DECAL_CORROSIVE_1, cx, 798.0f, cz,
+                                       -90.0f, (float)(rand() % 360),
+                                       0.0f, 128.0f, 0.8f, 0);
+                            audioPlay(snd106Decay[3], 1.0f, 0.0f);
+                            st[0] = 1.0f;
+                        }
+                    } else if (st[0] == 1.0f) {
+                        st[1] += 1.0f;
+                        if (st[1] > 200.0f && np[0] < 0) {
+                            float pos[3] = { cx, 900.0f, cz };
+                            np[0] = (signed char)eventHumanSpawn(0,
+                                "Maynard.png", pos,
+                                (float)(rand() % 360), 1.0f, 10.0f,
+                                0.12f, 1.0f);
+                            audioPlay(sndHorrorClose[0], 1.0f, 0.0f);
+                            audioPlay(snd106Decay[2], 1.0f, 0.0f);
+                        }
+                        if (np[0] >= 0) {
+                            IntroHuman *h = &eventHumans[(int)np[0]];
+                            if (h->y > 1.0f) {
+                                h->y -= 9.0f;
+                                if (h->y <= 1.0f) {
+                                    h->y = 1.0f;
+                                    eventHumanDie((int)np[0], 19.0f);
+                                    float pos[3] = { h->x, h->y, h->z };
+                                    audioPlay3D(EVSND(
+                                        "/Character/BodyFall.ogg"), pos,
+                                        camPos, camYaw, 2048.0f);
+                                    decalSpawn(DECAL_CORROSIVE_1, cx,
+                                               1.0f, cz, 90.0f,
+                                               (float)(rand() % 360),
+                                               0.0f, 102.0f, 0.8f, 0);
+                                    evId[r][s] = EV_NONE;
+                                }
+                            }
+                        }
+                    }
+                    break;
+                case EV_SINKHOLE:
+                    if (npc106Contained) { evId[r][s] = EV_NONE; break; }
+                    if (st[0] == 0.0f) {
+                        decalSpawn(DECAL_CORROSIVE_1, cx, 0.5f, cz, 90.0f,
+                                   (float)(rand() % 360), 0.0f, 640.0f,
+                                   0.95f, 0);
+                        st[0] = 1.0f;
+                    } else if (inRoom) {
+                        if (st[2] <= 0.0f) {
+                            audioPlay3D(EVSND("/Room/Sinkhole.ogg"),
+                                        (float[3]){ cx, camPos[1], cz },
+                                        camPos, camYaw, 1200.0f);
+                            st[2] = 300.0f;
+                        }
+                        st[2] -= 1.0f;
+                        if (dist < 128.0f || st[1] > 0.0f) {
+                            if (st[1] == 0.0f) {
+                                audioPlay(EVSND("/Room/SinkholeFall.ogg"),
+                                          1.0f, 0.0f);
+                            }
+                            st[1] += 1.0f / 200.0f;
+                            camPos[1] -= st[1] * 3.0f;
+                            blurAmount = st[1] * 0.5f;
+                            lightBlinkT = st[1] * 5.0f;
+                            if (st[1] >= 2.0f) {
+                                enterPocketDimension();
+                                st[1] = 0.0f;
+                                evId[r][s] = EV_NONE;
+                            }
+                        }
+                    } else {
+                        st[1] = 0.0f;
+                    }
+                    break;
+                case EV_SMOKE_HCZ:
+                    /* Decontamination gas floods the hall. */
+                    if (st[0] == 0.0f) {
+                        if (inRoom) {
+                            audioPlay(EVSND("/Room/TunnelBurst.ogg"),
+                                      1.0f, 0.0f);
+                            st[0] = 1.0f;
+                        }
+                    } else if (inRoom && !wearGasMask && !wearHazmat) {
+                        st[1] += 1.0f;
+                        blurAmount = blurAmount < 0.5f ? 0.5f : blurAmount;
+                        bloodloss += 0.03f;
+                        if (bloodloss >= 100.0f) {
+                            bloodloss = 100.0f;
+                            snprintf(deathCause, sizeof(deathCause),
+                                     "DECONTAMINATION GAS");
+                            deathTimer = 180;
+                        }
+                    }
+                    break;
+                case EV_HCZ_106:
+                    /* 106 wells up through this hall once. */
+                    if (npc106Contained) { evId[r][s] = EV_NONE; break; }
+                    if (st[0] == 0.0f && inRoom
+                        && npc106State != N106_CHASING
+                        && npc106State != N106_GRABBING) {
+                        decalSpawn(DECAL_CORROSIVE_1, cx, 0.5f, cz, 90.0f,
+                                   (float)(rand() % 360), 0.0f, 180.0f,
+                                   0.85f, 0);
+                        audioPlay(sndHorrorClose[2], 1.0f, 0.0f);
+                        blurAmount = 0.8f;
+                        npc106Active = 1;
+                        npc106State = N106_SPAWNING;
+                        npc106Pos[0] = cx;
+                        npc106Pos[2] = cz;
+                        npc106Pos[1] = camPos[1] - 280.0f;
+                        st[0] = 1.0f;
+                        evId[r][s] = EV_NONE;
+                    }
+                    break;
+                case EV_GUARD_HCZ:
+                    if (dist < 2048.0f) {
+                        evCorpse(p, 1, NULL, -190.0f, 60.0f, 190.0f,
+                                 170.0f, 288.0f);
+                        evId[r][s] = EV_NONE;
+                    }
+                    break;
+                case EV_ROOM4_2_D:
+                    if (dist < 2048.0f) {
+                        evCorpse(p, 0, "body(2).png", 256.0f, 55.2f,
+                                 256.0f, -30.0f, 19.0f);
+                        evId[r][s] = EV_NONE;
+                    }
+                    break;
+                case EV_STORAGE3:
+                    if (dist < 2048.0f) {
+                        evCorpse(p, 0, "scp_939_victim.png", 3372.0f,
+                                 -5580.8f, 6294.0f, 90.0f, 40.0f);
+                        evCorpse(p, 0, "scp_939_victim(2).png", 1083.0f,
+                                 -5580.8f, 989.0f, 0.0f, 19.0f);
+                        evId[r][s] = EV_NONE;
+                    }
+                    break;
+                case EV_SERVERS_HCZ:
+                    /* SCP-096 sits among the servers; a guard's fate is
+                     * already sealed. */
+                    if (st[0] == 0.0f) {
+                        if (inRoom && npc096Active) {
+                            evLocal(p, -352.0f, 0.0f, 0.0f, w);
+                            npc096Pos[0] = w[0];
+                            npc096Pos[1] = w[1];
+                            npc096Pos[2] = w[2];
+                            npc096State = S096_IDLE;
+                            np[0] = (signed char)eventHumanSpawn(1, NULL,
+                                (float[3]){ w[0] - 250.0f, 0.0f,
+                                            w[2] + 130.0f },
+                                evYaw(p, 90.0f), 77.0f, 201.0f, 0.4f,
+                                100.0f);
+                            audioPlay3D(EVSND(
+                                "/Character/Guard/096ServerRoom0.ogg"),
+                                w, camPos, camYaw, 2560.0f);
+                            for (uint32_t i = 0; i < doors.count; i++) {
+                                Door *d = &doors.items[i];
+                                float ddx = d->x - cx, ddz = d->z - cz;
+                                if (ddx * ddx + ddz * ddz
+                                    < 1100.0f * 1100.0f) {
+                                    d->open = 0;
+                                    d->locked = 1;
+                                }
+                            }
+                            st[0] = 1.0f;
+                        }
+                    } else if (st[0] == 1.0f) {
+                        st[1] += 1.0f;
+                        if ((rand() % 50) == 1 && inRoom) {
+                            lightBlinkT = 1.0f
+                                        + (float)(rand() % 100) * 0.01f;
+                        }
+                        if (npc096State != S096_IDLE || st[1] > 2800.0f) {
+                            if (np[0] >= 0) {
+                                IntroHuman *h = &eventHumans[(int)np[0]];
+                                eventHumanDie((int)np[0], 19.0f);
+                                audioPlay3D(EVSND(
+                                    "/Character/Guard/096ServerRoom1.ogg"),
+                                    (float[3]){ h->x, h->y, h->z },
+                                    camPos, camYaw, 2560.0f);
+                                for (int k = 0; k < 5; k++) {
+                                    decalSpawn(DECAL_BLOOD_1
+                                               + rand() % 2,
+                                        h->x + (float)(rand() % 200)
+                                             - 100.0f,
+                                        h->y + 0.5f,
+                                        h->z + (float)(rand() % 200)
+                                             - 100.0f,
+                                        90.0f, (float)(rand() % 360),
+                                        0.0f, 200.0f, 0.9f, 0);
+                                }
+                                int t = itemTplFind("Level 3 Key Card");
+                                if (t >= 0) {
+                                    worldItemAdd(t, h->x, h->y + 25.0f,
+                                                 h->z);
+                                }
+                            }
+                            for (uint32_t i = 0; i < doors.count; i++) {
+                                Door *d = &doors.items[i];
+                                float ddx = d->x - cx, ddz = d->z - cz;
+                                if (ddx * ddx + ddz * ddz
+                                    < 1100.0f * 1100.0f) {
+                                    d->locked = 0;
+                                }
+                            }
+                            st[0] = 2.0f;
+                            evId[r][s] = EV_NONE;
+                        }
+                    }
+                    break;
+                case EV_500_1499:
+                    /* Emily's scream behind the corroding door. */
+                    if (npc106Contained) {
+                        Door *d = evNearestDoor(p, 0.0f, 0.0f, 0.0f,
+                                                1200.0f);
+                        if (d) d->locked = 0;
+                        evId[r][s] = EV_NONE;
+                        break;
+                    }
+                    if (st[0] == 0.0f) {
+                        if (dist < 1.6f * ROOM_SPACING) {
+                            audioPlay(EVSND(
+                                "/Character/Scientist/EmilyScream.ogg"),
+                                1.0f, 0.0f);
+                            Door *d = evNearestDoor(p, 0.0f, 0.0f, 0.0f,
+                                                    1200.0f);
+                            if (d) {
+                                d->corroded = 1;
+                                d->locked = 1;
+                            }
+                            decalSpawn(DECAL_CORROSIVE_1, cx, 0.5f, cz,
+                                       90.0f, (float)(rand() % 360),
+                                       0.0f, 205.0f, 0.8f, 0);
+                            st[0] = 1.0f;
+                        }
+                    } else if (st[0] == 1.0f) {
+                        st[1] += 1.0f;
+                        if (st[1] > 1300.0f) {
+                            Door *d = evNearestDoor(p, 0.0f, 0.0f, 0.0f,
+                                                    1200.0f);
+                            if (d) d->locked = 0;
+                            evId[r][s] = EV_NONE;
+                        }
+                    }
+                    break;
+                case EV_409:
+                    if (dist < 2048.0f) {
+                        evCorpse(p, 0, "scp_409_victim.png", -4843.8f,
+                                 -4440.8f, 1729.0f, 0.0f, 19.0f);
+                        evLocal(p, -4843.8f, -4440.8f, 1729.0f, w);
+                        decalSpawn(DECAL_409, w[0], w[1] - 55.0f, w[2],
+                                   90.0f, (float)(rand() % 360), 0.0f,
+                                   218.0f, 0.8f, 0);
+                        int t = itemTplFind("Level 5 Key Card");
+                        evLocal(p, -5000.0f, -4409.0f, 1520.0f, w);
+                        if (t >= 0) worldItemAdd(t, w[0], w[1], w[2]);
+                        t = itemTplFind("Document SCP-409");
+                        evLocal(p, -4105.0f, -4336.0f, 2207.0f, w);
+                        if (t >= 0) worldItemAdd(t, w[0], w[1], w[2]);
+                        evId[r][s] = EV_NONE;
+                    }
+                    break;
+                case EV_008:
+                    /* Deep in the 008 chamber: the alarm, the spores. */
+                    if (inRoom && camPos[1] < -4100.0f) {
+                        if (st[2] <= 0.0f) {
+                            audioPlay(ambienceSound(6), 0.8f, 0.0f);
+                            st[2] = 240.0f;
+                        }
+                        st[2] -= 1.0f;
+                        evLocal(p, -448.0f, -4985.0f, 752.0f, w);
+                        float ddx = w[0] - camPos[0];
+                        float ddz = w[2] - camPos[2];
+                        if (st[1] == 0.0f && !wearHazmat
+                            && ddx * ddx + ddz * ddz < 384.0f * 384.0f) {
+                            audioPlay(EVSND("/SCP/008/IamInfected.ogg"),
+                                      1.0f, 0.0f);
+                            audioPlay3D(EVSND("/Room/GlassBreak.ogg"), w,
+                                        camPos, camYaw, 1536.0f);
+                            snprintf(toastMsg, sizeof(toastMsg),
+                                     "The window shattered and a piece "
+                                     "of glass cut your arm.");
+                            toastTimer = 200;
+                            damageFlash = 0.5f;
+                            st[1] = 1.0f;
+                        }
+                    }
+                    if (st[1] > 0.0f) {
+                        /* Infected: it only ends one way. */
+                        bloodloss += 0.012f;
+                        if (bloodloss >= 100.0f) {
+                            bloodloss = 100.0f;
+                            snprintf(deathCause, sizeof(deathCause),
+                                     "SCP-008");
+                            deathTimer = 180;
+                        }
+                    }
+                    break;
+                case EV_1162ARC: {
+                    if (!inRoom) break;
+                    if (st[1] > 0.0f) st[1] -= 1.0f;
+                    evLocal(p, 976.0f, 128.0f, -640.0f, w);
+                    float ddx = w[0] - camPos[0], ddz = w[2] - camPos[2];
+                    if (ddx * ddx + ddz * ddz < 250.0f * 250.0f
+                        && inputHit(ACTION_INTERACT) && st[1] <= 0.0f) {
+                        st[1] = 90.0f;
+                        char sp[96];
+                        if (inventoryCount > 0) {
+                            int k = rand() % inventoryCount;
+                            for (int i = k; i < inventoryCount - 1; i++) {
+                                inventory[i] = inventory[i + 1];
+                            }
+                            inventoryCount--;
+                            int t = itemTplFind(EV1162_POOL[rand()
+                                % (int)(sizeof(EV1162_POOL)
+                                        / sizeof(EV1162_POOL[0]))]);
+                            if (t >= 0) {
+                                worldItemAdd(t, w[0], w[1], w[2]);
+                            }
+                            snprintf(sp, sizeof(sp),
+                                     SFX_DIR "/SCP/1162_ARC/Exchange%d.ogg",
+                                     rand() % 5);
+                            audioPlay(audioLoad(sp), 1.0f, 0.0f);
+                        } else {
+                            /* Empty-handed: it takes flesh instead. */
+                            snprintf(sp, sizeof(sp), SFX_DIR
+                                "/SCP/1162_ARC/BodyHorrorExchange%d.ogg",
+                                rand() % 4);
+                            audioPlay(audioLoad(sp), 1.0f, 0.0f);
+                            damageFlash = 0.8f;
+                            lightBlinkT = 5.0f;
+                            bloodloss += 26.0f;
+                            decalSpawn(DECAL_BLOOD_1 + 1, camPos[0], 0.5f,
+                                       camPos[2], 90.0f,
+                                       (float)(rand() % 360), 0.0f,
+                                       190.0f, 0.9f, 0);
+                            snprintf(toastMsg, sizeof(toastMsg),
+                                     "You feel a sudden overwhelming "
+                                     "pain in your chest.");
+                            toastTimer = 200;
+                            if (bloodloss >= 100.0f) {
+                                bloodloss = 100.0f;
+                                snprintf(deathCause, sizeof(deathCause),
+                                         "SCP-1162-ARC");
+                                deathTimer = 180;
+                            }
+                        }
+                    }
+                    break;
+                }
+                case EV_SCIENTISTS2:
+                    /* Dr. L's office: something is wrong past that
+                     * door. */
+                    if (st[0] == 0.0f && inRoom) {
+                        Door *d = evNearestDoor(p, -352.0f, 0.0f, 0.0f,
+                                                300.0f);
+                        if (d && d->openState > 10.0f) {
+                            audioPlay(sndHorrorSpot[1], 1.0f, 0.0f);
+                            st[0] = 1.0f;
+                        }
+                    } else if (st[0] == 1.0f && inRoom) {
+                        evLocal(p, -808.0f, 150.0f, -72.0f, w);
+                        float ddx = w[0] - camPos[0];
+                        float ddz = w[2] - camPos[2];
+                        if (ddx * ddx + ddz * ddz < 512.0f * 512.0f
+                            && !npc106Contained) {
+                            bloodloss += 0.004f;
+                            if (st[1] <= 0.0f) {
+                                audioPlay3D(sndHorrorSpot[0], w, camPos,
+                                            camYaw, 1280.0f);
+                                st[1] = 400.0f;
+                            }
+                            st[1] -= 1.0f;
+                        }
+                    }
+                    break;
+                case EV_GW2:
+                    if (st[0] == 0.0f) {
+                        if (dist < 1536.0f) {
+                            evCorpse(p, 1, NULL, -156.0f, 55.0f, 121.0f,
+                                     225.0f, 288.0f);
+                            st[0] = 1.0f;
+                        }
+                    } else if (inRoom) {
+                        if (st[1] <= 0.0f) {
+                            audioPlay(ambienceSound(6), 0.5f, 0.0f);
+                            st[1] = 260.0f;
+                        }
+                        st[1] -= 1.0f;
+                    }
+                    break;
+                case EV_TEST_HCZ:
+                    if (st[0] == 0.0f) {
+                        if (inRoom) {
+                            evLocal(p, -720.0f, 25.0f, 816.0f, w);
+                            np[0] = (signed char)eventPropSpawn(
+                                &doodle1048RT, w, evYaw(p, -90.0f), NULL);
+                            st[0] = 1.0f;
+                        }
+                    } else if (st[0] == 1.0f) {
+                        st[1] += 1.0f;
+                        if (st[1] > 735.0f) {
+                            eventPropFree(&np[0]);
+                            evId[r][s] = EV_NONE;
+                        }
+                    }
+                    break;
+                case EV_EZ_035:
+                    /* After the mask has claimed a host, its victim
+                     * turns up here. */
+                    if (!leftFirstZone) break;
+                    if (st[0] == 0.0f && dist < 2048.0f) {
+                        np[0] = (signed char)evCorpse(p, 0,
+                            "scp_035_victim.png", 0.0f, 52.0f, -128.0f,
+                            180.0f, 19.0f);
+                        st[0] = 1.0f;
+                    } else if (st[0] == 1.0f && inRoom && np[0] >= 0) {
+                        float ddx = eventHumans[(int)np[0]].x - camPos[0];
+                        float ddz = eventHumans[(int)np[0]].z - camPos[2];
+                        if (ddx * ddx + ddz * ddz < 640.0f * 640.0f) {
+                            injuries += 0.0015f;
+                        }
+                    }
+                    break;
+                case EV_ELEVATOR:
+                    /* A guard waits by the broken elevator, walks in,
+                     * rides down - and never arrives. */
+                    if (st[0] == 0.0f) {
+                        if (dist < 2048.0f && !inRoom) {
+                            evLocal(p, 0.0f, 0.0f, 0.0f, w);
+                            np[0] = (signed char)eventHumanSpawn(1, NULL,
+                                w, evYaw(p, 270.0f), 77.0f, 201.0f,
+                                0.4f, 120.0f);
+                            st[0] = 1.0f;
+                        }
+                    } else if (st[0] == 1.0f) {
+                        if (dist < 1280.0f) st[0] = 2.0f;
+                    } else if (st[0] == 2.0f) {
+                        if (np[0] < 0) { evId[r][s] = EV_NONE; break; }
+                        IntroHuman *h = &eventHumans[(int)np[0]];
+                        float tw[3];
+                        evLocal(p, 1024.0f, 0.0f, 0.0f, tw);
+                        float ddx = tw[0] - h->x, ddz = tw[2] - h->z;
+                        float dd = sqrtf(ddx * ddx + ddz * ddz);
+                        Door *d = evNearestDoor(p, 448.0f, 0.0f, 0.0f,
+                                                300.0f);
+                        if (dd > 8.0f) {
+                            h->x += ddx / dd * 2.0f;
+                            h->z += ddz / dd * 2.0f;
+                            h->yawDeg = atan2f(ddx, ddz) * 57.29578f;
+                            if (h->animStart != 1.0f) {
+                                h->animStart = 1.0f;
+                                h->animEnd = 38.0f;
+                                h->animSpeed = 0.45f;
+                                h->frame = 1.0f;
+                            }
+                            if (dd < 500.0f && d) d->open = 1;
+                        } else {
+                            audioPlay(EVSND("/Room/ElevatorDeath.ogg"),
+                                      1.0f, 0.0f);
+                            h->animStart = 77.0f;
+                            h->animEnd = 201.0f;
+                            h->animSpeed = 0.4f;
+                            st[0] = 3.0f;
+                            st[1] = 0.0f;
+                        }
+                    } else if (st[0] == 3.0f) {
+                        st[1] += 1.0f;
+                        Door *d = evNearestDoor(p, 448.0f, 0.0f, 0.0f,
+                                                300.0f);
+                        if (st[1] > 60.0f && d && d->open) d->open = 0;
+                        if (st[1] > 130.0f) eventHumanFree(&np[0]);
+                        if (st[1] > 470.0f && st[1] < 520.0f) {
+                            camShake = 7.4f - st[1] / 70.0f;
+                        }
+                        if (st[1] > 600.0f && st[1] < 740.0f) {
+                            camShake = 10.6f - st[1] / 70.0f;
+                        }
+                        if (st[1] > 910.0f) {
+                            if (d) d->locked = 1;
+                            evId[r][s] = EV_NONE;
+                        }
+                    }
+                    break;
+                case EV_CAFETERIA: {
+                    /* SCP-294 wants two quarters; SCP-458 never runs
+                     * out of pizza. */
+                    if (!inRoom) break;
+                    if (st[1] > 0.0f) st[1] -= 1.0f;
+                    evLocal(p, 1779.0f, -165.0f, -308.0f, w);
+                    float mdx = w[0] - camPos[0], mdz = w[2] - camPos[2];
+                    if (mdx * mdx + mdz * mdz < 250.0f * 250.0f
+                        && inputHit(ACTION_INTERACT) && st[1] <= 0.0f) {
+                        st[1] = 60.0f;
+                        int q = itemTplFind("Quarter");
+                        int have = 0;
+                        for (int i = 0; i < inventoryCount; i++) {
+                            if (inventory[i] == q) have++;
+                        }
+                        if (q >= 0 && have >= 2) {
+                            int removed = 0;
+                            for (int i = 0;
+                                 i < inventoryCount && removed < 2;) {
+                                if (inventory[i] == q) {
+                                    for (int k = i;
+                                         k < inventoryCount - 1; k++) {
+                                        inventory[k] = inventory[k + 1];
+                                    }
+                                    inventoryCount--;
+                                    removed++;
+                                } else {
+                                    i++;
+                                }
+                            }
+                            audioPlay(EVSND("/SCP/294/CoinDrop.ogg"),
+                                      1.0f, 0.0f);
+                            char sp[80];
+                            snprintf(sp, sizeof(sp), SFX_DIR
+                                     "/SCP/294/Dispense%d.ogg",
+                                     rand() % 4);
+                            audioPlay(audioLoad(sp), 1.0f, 0.0f);
+                            /* A pour from the machine's classics, its
+                             * message and effects, and the cup left at
+                             * the spout. */
+                            int dk = rand() % (int)(sizeof(EV294_DRINKS)
+                                     / sizeof(EV294_DRINKS[0]));
+                            snprintf(toastMsg, sizeof(toastMsg), "%s",
+                                     EV294_DRINKS[dk].msg);
+                            toastTimer = 260;
+                            if (EV294_DRINKS[dk].snd) {
+                                snprintf(sp, sizeof(sp), SFX_DIR
+                                         "/SCP/294/%s.ogg",
+                                         EV294_DRINKS[dk].snd);
+                                audioPlay(audioLoad(sp), 1.0f, 0.0f);
+                            }
+                            if (EV294_DRINKS[dk].effect == 1) {
+                                stamina = 100.0f;
+                                staminaBlocked = 0;
+                            } else if (EV294_DRINKS[dk].effect == 2) {
+                                blurAmount = 0.8f;
+                            }
+                            int cup = itemTplFind(
+                                EV294_DRINKS[dk].effect == 3
+                                    ? "Empty Cup" : "Cup");
+                            evLocal(p, 1780.0f, -248.0f, -276.0f, w);
+                            if (cup >= 0) {
+                                worldItemAdd(cup, w[0], w[1], w[2]);
+                            }
+                        } else {
+                            snprintf(toastMsg, sizeof(toastMsg),
+                                     "You need to insert Mastercard or "
+                                     "two Quarters in order to use "
+                                     "this machine.");
+                            toastTimer = 200;
+                        }
+                    }
+                    evLocal(p, 0.0f, -192.0f, 833.0f, w);
+                    mdx = w[0] - camPos[0];
+                    mdz = w[2] - camPos[2];
+                    if (mdx * mdx + mdz * mdz < 250.0f * 250.0f
+                        && inputHit(ACTION_INTERACT) && st[1] <= 0.0f) {
+                        st[1] = 60.0f;
+                        int t = itemTplFind("Pizza Slice");
+                        if (t >= 0 && inventoryCount < MAX_INVENTORY) {
+                            inventory[inventoryCount++] = t;
+                            snprintf(toastMsg, sizeof(toastMsg),
+                                     "You take a slice from SCP-458.");
+                        } else {
+                            snprintf(toastMsg, sizeof(toastMsg),
+                                     "You cannot carry any more items.");
+                        }
+                        toastTimer = 200;
+                    }
+                    break;
+                }
+                case EV_066:
+                    /* Eric's ball of yarn rolls about, humming. */
+                    if (st[0] == 0.0f) {
+                        if (dist < 2048.0f) {
+                            evLocal(p, 0.0f, 12.0f, 0.0f, w);
+                            np[0] = (signed char)eventPropSpawn(&scp066RT,
+                                w, (float)(rand() % 360), NULL);
+                            st[0] = 1.0f;
+                            st[1] = 120.0f;
+                            st[2] = (float)(rand() % 360);
+                        }
+                    } else if (np[0] >= 0 && dist < 2048.0f) {
+                        st[1] -= 1.0f;
+                        float px = eventProps[(int)np[0]].x;
+                        float pz = eventProps[(int)np[0]].z;
+                        if (st[1] <= 0.0f) {
+                            st[1] = 240.0f + (float)(rand() % 400);
+                            st[2] = (float)(rand() % 360);
+                            float pos[3] = { px, eventProps[(int)np[0]].y,
+                                             pz };
+                            char sp[72];
+                            float pdx = px - camPos[0];
+                            float pdz = pz - camPos[2];
+                            if (pdx * pdx + pdz * pdz
+                                < 300.0f * 300.0f) {
+                                snprintf(sp, sizeof(sp), SFX_DIR
+                                         "/SCP/066/Eric%d.ogg",
+                                         rand() % 3);
+                            } else if ((rand() % 8) == 0) {
+                                snprintf(sp, sizeof(sp), SFX_DIR
+                                         "/SCP/066/Beethoven.ogg");
+                            } else {
+                                snprintf(sp, sizeof(sp), SFX_DIR
+                                         "/SCP/066/Notes%d.ogg",
+                                         rand() % 6);
+                            }
+                            audioPlay3D(audioLoad(sp), pos, camPos,
+                                        camYaw, 1536.0f);
+                        }
+                        /* Roll toward its heading, staying in the
+                         * room. */
+                        float hdx = px - cx, hdz = pz - cz;
+                        if (hdx * hdx + hdz * hdz > 700.0f * 700.0f) {
+                            st[2] = atan2f(-hdx, -hdz) * 57.29578f;
+                        }
+                        float a = st[2] * 0.01745329f;
+                        eventProps[(int)np[0]].x += sinf(a) * 0.6f;
+                        eventProps[(int)np[0]].z += cosf(a) * 0.6f;
+                        eventProps[(int)np[0]].yawDeg += 4.0f;
+                    }
+                    break;
+                case EV_1123:
+                    /* The pole: touch it and you are somewhere else,
+                     * in someone else's memory. */
+                    if (st[0] == 0.0f) {
+                        int t = itemTplFind("SCP-1123");
+                        if (t < 0) { evId[r][s] = EV_NONE; break; }
+                        st[2] = (float)worldItemCount;
+                        evLocal(p, 912.0f, 170.0f, 857.0f, w);
+                        worldItemAdd(t, w[0], w[1], w[2]);
+                        st[0] = 1.0f;
+                    } else if (st[0] == 1.0f) {
+                        int idx = (int)st[2];
+                        if (idx < (int)worldItemCount
+                            && worldItems[idx].taken) {
+                            audioPlay(EVSND("/SCP/1123/Touch.ogg"),
+                                      1.0f, 0.0f);
+                            audioPlay(EVSND("/SCP/1123/Ambient.ogg"),
+                                      0.8f, 0.0f);
+                            blurAmount = 1.0f;
+                            camShake = 2.0f;
+                            lightBlinkT = 6.0f;
+                            float fx = sinf(camYaw), fz = -cosf(camYaw);
+                            float pos[3] = { camPos[0] + fx * 450.0f,
+                                             camPos[1] - 230.0f,
+                                             camPos[2] + fz * 450.0f };
+                            float hy;
+                            float o[3] = { pos[0], camPos[1] + 100.0f,
+                                           pos[2] };
+                            if (rayDownWorld(o, 900.0f, &hy)) pos[1] = hy;
+                            np[0] = (signed char)eventPropSpawn(&naziRT,
+                                pos, atan2f(-fx, -fz) * 57.29578f, NULL);
+                            audioPlay(EVSND("/SCP/1123/Officer0.ogg"),
+                                      1.0f, 0.0f);
+                            st[0] = 2.0f;
+                            st[1] = 0.0f;
+                        }
+                    } else if (st[0] == 2.0f) {
+                        st[1] += 1.0f;
+                        if (blurAmount < 0.35f) blurAmount = 0.35f;
+                        if (st[1] == 500.0f) {
+                            audioPlay(EVSND("/SCP/1123/Officer1.ogg"),
+                                      1.0f, 0.0f);
+                        }
+                        if (st[1] == 1000.0f) {
+                            audioPlay(EVSND("/SCP/1123/Officer2.ogg"),
+                                      1.0f, 0.0f);
+                        }
+                        if (st[1] >= 1400.0f) {
+                            audioPlay(EVSND("/SCP/1123/Gunshot.ogg"),
+                                      1.0f, 0.0f);
+                            audioPlay(EVSND("/SCP/1123/Horror.ogg"),
+                                      1.0f, 0.0f);
+                            damageFlash = 0.9f;
+                            blurAmount = 1.0f;
+                            lightBlinkT = 8.0f;
+                            blinkFrames = 18;
+                            eventPropFree(&np[0]);
+                            evId[r][s] = EV_NONE;
+                        }
+                    }
+                    break;
+                case EV_GATEWAY: {
+                    /* The greenhouse airlock: step between the doors
+                     * and they seal for the decontamination cycle. */
+                    if (!inRoom && st[0] == 0.0f) break;
+                    Door *d1 = evNearestDoor(p, 339.0f, 0.0f, -461.0f,
+                                             250.0f);
+                    Door *d2 = evNearestDoor(p, 339.0f, 0.0f, 461.0f,
+                                             250.0f);
+                    evLocal(p, 339.0f, 0.0f, 0.0f, w);
+                    float adx = w[0] - camPos[0], adz = w[2] - camPos[2];
+                    float ad2 = adx * adx + adz * adz;
+                    if (st[0] == 0.0f) {
+                        if (ad2 < 205.0f * 205.0f && st[1] == 0.0f) {
+                            audioPlay(EVSND("/Room/Airlock.ogg"), 1.0f,
+                                      0.0f);
+                            audioPlay(EVSND("/Alarm/Alarm3.ogg"), 1.0f,
+                                      0.0f);
+                            if (d1) { d1->open = 0; d1->locked = 1; }
+                            if (d2) { d2->open = 0; d2->locked = 1; }
+                            st[0] = 0.01f;
+                        } else if (ad2 > 590.0f * 590.0f) {
+                            st[1] = 0.0f;
+                        }
+                    } else if (st[0] < 490.0f) {
+                        st[0] += 1.0f;
+                        if (st[0] > 210.0f && st[0] < 420.0f
+                            && !wearGasMask && !wearHazmat
+                            && ad2 < 1024.0f * 1024.0f
+                            && blurAmount < 0.45f) {
+                            blurAmount = 0.45f;
+                        }
+                    } else {
+                        if (d1) { d1->locked = 0; d1->open = 1; }
+                        if (d2) { d2->locked = 0; d2->open = 1; }
+                        st[0] = 0.0f;
+                        st[1] = 1.0f; /* step away before it re-arms */
+                    }
+                    break;
+                }
+                case EV_CHECKPOINT: {
+                    /* The zone gates and their monitors mirror the
+                     * room2_sl generator; a sting on crossing over. */
+                    for (uint32_t i = 0; i < doors.count; i++) {
+                        Door *d = &doors.items[i];
+                        if (d->keycard <= 0) continue;
+                        float ddx = d->x - cx, ddz = d->z - cz;
+                        if (ddx * ddx + ddz * ddz
+                            > 1100.0f * 1100.0f) {
+                            continue;
+                        }
+                        d->locked = facilityPower ? 0 : 1;
+                    }
+                    if (inRoom && st[2] == 0.0f) {
+                        float l[3];
+                        worldToLocal(p, camPos, l);
+                        float side = l[2] >= 0.0f ? 1.0f : -1.0f;
+                        if (st[1] == 0.0f) {
+                            st[1] = side;
+                        } else if (side != st[1]) {
+                            const char *nm2 =
+                                tplList.items[p->templateIndex].name;
+                            audioPlay(strstr(nm2, "hcz_ez")
+                                          ? EVSND("/Ambient/ToZone3.ogg")
+                                          : EVSND("/Ambient/ToZone2.ogg"),
+                                      1.0f, 0.0f);
+                            st[2] = 1.0f;
+                        }
+                    }
+                    break;
+                }
+                case EV_STORAGE_970: {
+                    /* SCP-970: the corridor's far end is its own
+                     * beginning, and each pass takes something. */
+                    if (!inRoom) break;
+                    float l[3];
+                    worldToLocal(p, camPos, l);
+                    float shift = 0.0f;
+                    if (l[0] > 730.0f) shift = -1024.0f;
+                    else if (l[0] < -730.0f) shift = 1024.0f;
+                    if (shift == 0.0f) break;
+                    float lw[3] = { shift, 0.0f, 0.0f }, w1[3], w0[3];
+                    float z0[3] = { 0.0f, 0.0f, 0.0f };
+                    localToWorld(p, z0, w0);
+                    localToWorld(p, lw, w1);
+                    camPos[0] += w1[0] - w0[0];
+                    camPos[2] += w1[2] - w0[2];
+                    /* Loose items ride the loop with you (the source
+                     * mirrors dropped items across the seam). */
+                    for (unsigned wi = 0; wi < worldItemCount; wi++) {
+                        if (worldItems[wi].taken) continue;
+                        float il[3];
+                        float ip[3] = { worldItems[wi].x, 0.0f,
+                                        worldItems[wi].z };
+                        worldToLocal(p, ip, il);
+                        if (il[0] < -1500.0f || il[0] > 1500.0f
+                            || il[2] < -800.0f || il[2] > 800.0f) {
+                            continue;
+                        }
+                        worldItems[wi].x += w1[0] - w0[0];
+                        worldItems[wi].z += w1[2] - w0[2];
+                    }
+                    blinkFrames = 8;
+                    st[0] += 1.0f;
+                    int loop = (int)st[0];
+                    if (loop == 2 && inventoryCount > 0) {
+                        int k = rand() % inventoryCount;
+                        for (int i = k; i < inventoryCount - 1; i++) {
+                            inventory[i] = inventory[i + 1];
+                        }
+                        inventoryCount--;
+                    } else if (loop == 5) {
+                        bloodloss += 8.0f;
+                        damageFlash = 0.4f;
+                    } else if (loop == 10) {
+                        evLocal(p, 760.0f, 1.0f, 0.0f, w);
+                        decalSpawn(DECAL_BLOOD_1 + 1, w[0], w[1], w[2],
+                                   90.0f, (float)(rand() % 360), 0.0f,
+                                   256.0f, 0.9f, 0);
+                    } else if (loop == 14 || loop == 30) {
+                        int t = itemTplFind("Strange Note");
+                        if (t >= 0) {
+                            if (inventoryCount < MAX_INVENTORY) {
+                                inventory[inventoryCount++] = t;
+                                snprintf(toastMsg, sizeof(toastMsg),
+                                         "There is a strange note in "
+                                         "your pocket.");
+                                toastTimer = 200;
+                            } else {
+                                worldItemAdd(t, camPos[0], 80.0f,
+                                             camPos[2]);
+                            }
+                        }
+                    } else if (loop == 18) {
+                        int t = itemTplFind("Strange Note");
+                        evLocal(p, -344.0f, 176.0f, 272.0f, w);
+                        if (t >= 0) worldItemAdd(t, w[0], w[1], w[2]);
+                    } else if (loop == 25) {
+                        evCorpse(p, 0, "class_d(2).png", 760.0f, 82.0f,
+                                 0.0f, 160.0f, 80.0f);
+                    } else if (loop == 35) {
+                        for (int k = 0; k < 4; k++) {
+                            evLocal(p,
+                                    (float)(rand() % 1024) - 512.0f,
+                                    700.0f,
+                                    (float)(rand() % 512) - 256.0f, w);
+                            decalSpawn(DECAL_BLOOD_6, w[0], w[1], w[2],
+                                       -90.0f, (float)(rand() % 360),
+                                       0.0f, 13.0f, 0.9f, 0);
+                        }
+                    } else if (loop == 40) {
+                        audioPlay(EVSND("/Radio/Franklin3.ogg"), 1.0f,
+                                  0.0f);
+                    } else if (loop == 50) {
+                        evLocal(p, -600.0f, 0.0f, 0.0f, w);
+                        np[1] = (signed char)eventHumanSpawn(1, NULL, w,
+                            evYaw(p, 90.0f), 77.0f, 201.0f, 0.4f,
+                            110.0f);
+                    } else if (loop == 52) {
+                        eventHumanFree(&np[1]);
+                    }
+                    break;
+                }
+                case EV_EC: {
+                    /* The electrical centre: the remote-door lever the
+                     * gate entrances mirror, and the lights that do
+                     * not stay on. */
+                    WorldLever *rd = evLeverAt(p, -239.0f, 1104.0f,
+                                               504.0f);
+                    if (rd) remoteDoorOn = rd->on;
+                    WorldLever *sec = evLeverAt(p, -239.0f, 1104.0f,
+                                                568.0f);
+                    if (inRoom && st[0] == 0.0f && sec && sec->on
+                        && (rand() % 200) == 1) {
+                        audioPlay(EVSND("/Horror/Horror7.ogg"), 1.0f,
+                                  0.0f);
+                        audioPlay(EVSND("/Room/Blackout.ogg"), 1.0f,
+                                  0.0f);
+                        sec->on = 0;
+                        st[0] = 1.0f;
+                    }
+                    ecBlackout = inRoom && sec && !sec->on;
+                    break;
+                }
+                case EV_GATE_ENT: {
+                    /* The surface gates: the big door answers only to
+                     * the electrical centre's remote control. Old
+                     * Fickle Fingers has a laugh on the way up Gate
+                     * A. */
+                    const char *nm2 =
+                        tplList.items[p->templateIndex].name;
+                    int gateA = strstr(nm2, "gate_a") != NULL;
+                    Door *big = evNearestDoor(p, 0.0f, 0.0f,
+                                              gateA ? -360.0f : -320.0f,
+                                              250.0f);
+                    if (big) big->locked = remoteDoorOn ? 0 : 1;
+                    if (gateA && inRoom && remoteDoorOn
+                        && !npc106Contained && st[0] == 0.0f) {
+                        float el[3];
+                        evLocal(p, 720.0f, 0.0f, 512.0f, el);
+                        float gdx = el[0] - camPos[0];
+                        float gdz = el[2] - camPos[2];
+                        if (gdx * gdx + gdz * gdz < 300.0f * 300.0f) {
+                            audioPlay(EVSND("/SCP/106/Laugh.ogg"), 1.0f,
+                                      0.0f);
+                            st[0] = 1.0f;
+                        }
+                    }
+                    break;
+                }
+                default:
+                    break;
+            }
+        }
+    }
+}
+
 /* Called each gameplay frame: swap the track when the zone changes. */
+/* UpdateZoneColor: fog colour and distance per zone and context (the
+ * Main_Core FogColor* constants, "RRRGGGBBB" strings). */
+static void updateFogModel(void) {
+    float r = 5.0f, g = 5.0f, b = 5.0f;     /* FogColorLCZ */
+    float dist = 6.0f, near = 0.1f;
+    int zone = zoneAt(camPos);
+    if (zone == 2) { r = 7.0f; g = 2.0f; b = 2.0f; }        /* HCZ */
+    else if (zone == 3) { r = 7.0f; g = 7.0f; b = 12.0f; }  /* EZ */
+    const char *nm = NULL;
+    int cell = playerRoomLookup(camPos);
+    if (cell >= 0) nm = tplList.items[map.rooms[cell].templateIndex].name;
+    if (introPhase >= 0 || inIntroBounds(camPos[0], camPos[2])) {
+        /* IsOutSide includes cont1_173_intro: white, far fog. */
+        r = g = b = 255.0f;
+        dist = 60.0f;
+        near = 5.0f;
+    } else if (inPocket) {
+        r = g = b = 0.0f;                     /* FogColorPD */
+    } else if (inMask) {
+        r = 96.0f; g = 97.0f; b = 104.0f;     /* FogColorDimension_1499 */
+        dist = 80.0f;
+        near = 40.0f;
+    } else if (nm && !strcmp(nm, "cont2_860_1")) {
+        r = 98.0f; g = 133.0f; b = 162.0f;    /* FogColorForest */
+        dist = 8.0f;
+    } else if (nm && (!strcmp(nm, "gate_a") || !strcmp(nm, "gate_b"))) {
+        r = g = b = 255.0f;                   /* FogColorOutside */
+        dist = 60.0f;
+        near = 5.0f;
+    } else if (nm && !strcmp(nm, "room3_storage")
+               && camPos[1] < -4100.0f) {
+        r = 2.0f; g = 7.0f; b = 0.0f;         /* FogColorStorageTunnels */
+    } else if (ecBlackout) {
+        dist = 4.0f;                          /* 6.0 - 2.0 * IsBlackOut */
+    }
+    fogRGB[0] = r / 255.0f;
+    fogRGB[1] = g / 255.0f;
+    fogRGB[2] = b / 255.0f;
+    fogDistW = dist;
+    fogNearW = near;
+}
+
 static void updateZoneMusic(void) {
     if (radioChannel >= 0 || !worldReady) return;
     const char *path = desiredMusicPath();
@@ -9268,7 +11151,7 @@ static void drawDoors(const float viewPos[3]) {
         float dx = d->x - viewPos[0], dz = d->z - viewPos[2];
         if (dx * dx + dz * dz > VIEW_RANGE * VIEW_RANGE) continue;
 
-        GLuint corr = d->corroded
+        GLuint corr = (d->corroded || d->type == 10 || d->type == 11)
                     ? (d->type == 2 ? doorCorrHeavyTex : doorCorrTex) : 0;
 
         glPushMatrix();
@@ -9288,6 +11171,10 @@ static void drawDoors(const float viewPos[3]) {
             case 5: frame = &woodenFrameRT; p1 = &woodenRT; hinged = 1; break;
             case 6: p1 = &oneSidedRT; single = 1; break;
             case 7: p1 = &door914RT; single = 1; break;
+            case 8: single = 1; break; /* OBJ2 freed in FillRoom */
+            case 9: p1 = &cellRT; single = 1; break; /* intro cell */
+            case 10: break;                    /* corrosive default */
+            case 11: p1 = &oneSidedRT; single = 1; break; /* corr 1-sided */
             default: break;
         }
         drawDoorPart(frame, corr);
@@ -9605,6 +11492,17 @@ static void drawMonitors(const float viewPos[3]) {
             glDisable(GL_TEXTURE_2D);
             float f = 0.15f + (rand() % 40) / 100.0f;
             glColor4f(f, 0.02f, 0.02f, 1.0f);
+        } else if (c->checkpoint && !facilityPower) {
+            /* Checkpoint monitors are dead until the room2_sl
+             * generator lever restores power (the source's
+             * TurnCheckpointMonitorsOff). */
+            glDisable(GL_TEXTURE_2D);
+            glColor4f(0.01f, 0.01f, 0.01f, 1.0f);
+        } else if (c->checkpoint) {
+            /* Powered: a faint live glow with a scanline flicker. */
+            glDisable(GL_TEXTURE_2D);
+            float f = 0.05f + (rand() % 8) / 100.0f;
+            glColor4f(f * 0.6f, f, f * 0.8f, 1.0f);
         } else {
             glDisable(GL_TEXTURE_2D);
             glColor4f(0.02f, 0.03f, 0.05f, 1.0f);
@@ -11533,24 +13431,41 @@ int main(void) {
 
         if (deathMenuOpen) {
             menuPollTap();
+            int canLoad = !deathMenuNoLoad && deathHaveSave;
             if (inputHit(ACTION_SAVE) && deathSel > 0) deathSel--;
             if (inputDpadDownHit() && deathSel < 1) deathSel++;
-            if (deathMenuNoLoad) deathSel = 1;
+            if (!canLoad) deathSel = 1;
             int dact = inputHit(ACTION_INTERACT) ? deathSel : -1;
-            float dw = 660.0f, dbx = (SCREEN_W - dw) * 0.5f;
-            float dby = SCREEN_H * 0.5f + 116.0f;
-            for (int i = 0; menuTapped && i < 2; i++) {
-                if (tapIn(dbx + 20.0f + i * 320.0f, dby, 300.0f, 54.0f)) {
-                    deathSel = i;
-                    dact = i;
+            /* Tap zones match the drawn buttons (UpdateMenu geometry:
+             * content at 132/122 of the 600x673 panel art, 430x60
+             * buttons on 75-unit slots; Keter+ drops the LOAD slot). */
+            float dph = 470.0f, dms = dph / 673.0f;
+            float dpw = dph * (600.0f / 673.0f);
+            float dpx = (SCREEN_W - dpw) * 0.5f;
+            float dpy = (SCREEN_H - dph) * 0.5f;
+            float dix = dpx + 132.0f * dms;
+            float dby = dpy + (122.0f + 10.0f + 75.0f) * dms;
+            float dbw = 430.0f * dms, dbh = 60.0f * dms;
+            if (menuTapped) {
+                if (canLoad && tapIn(dix, dby, dbw, dbh)) {
+                    deathSel = 0;
+                    dact = 0;
+                }
+                float qy = dby + (deathMenuNoLoad ? 0.0f : 75.0f * dms);
+                if (tapIn(dix, qy, dbw, dbh)) {
+                    deathSel = 1;
+                    dact = 1;
                 }
             }
-            if (dact == 0 && !deathMenuNoLoad) {
+            if (dact == 0 && canLoad) {
                 if (loadGame()) {
                     deathMenuOpen = 0;
                     deathTimer = 0;
                     snprintf(toastMsg, sizeof(toastMsg), "GAME LOADED");
                     toastTimer = 150;
+                    /* Restart the loop: the rest of this frame still
+                     * holds pre-load state. */
+                    continue;
                 } else {
                     snprintf(toastMsg, sizeof(toastMsg), "NO SAVE FOUND");
                     toastTimer = 150;
@@ -11907,6 +13822,7 @@ int main(void) {
                 updateRoomAmbience();
                 updateAmbientSfx();
                 updateRoomEvents();
+                updateRoomEvents2();
             }
             audioService(); /* start ambience whose PCM just finished */
             updatePocketDimension();
@@ -11960,6 +13876,18 @@ int main(void) {
                     currentSavePath(sp, sizeof(sp));
                     remove(sp);
                     deathMenuNoLoad = 1;
+                }
+                /* Source GameSaved: LOAD GAME greys out without one. */
+                deathHaveSave = 0;
+                if (!deathMenuNoLoad) {
+                    char sp[256];
+                    currentSavePath(sp, sizeof(sp));
+                    FILE *sf = fopen(sp, "r");
+                    if (!sf) sf = fopen(SAVE_PATH, "r");
+                    if (sf) {
+                        fclose(sf);
+                        deathHaveSave = 1;
+                    }
                 }
             }
             if (0) { /* (the old auto-respawn, retired) */
@@ -12016,6 +13944,7 @@ int main(void) {
         if (haveData) {
             updateActiveRooms(camPos);
             markRoomVisited(camPos);
+            updateFogModel();
         }
 
         float fwdX = sinf(camYaw), fwdZ = -cosf(camYaw);
@@ -12044,15 +13973,17 @@ int main(void) {
             }
 
             /* Blink: meter drains; empty or R closes the eyes. New
-             * blinks don't start while a menu is open. */
-            if (!invOpen && !pauseOpen && wearNVG != 2) {
+             * blinks don't start while a menu is open or the player
+             * is dead (the death fade owns the screen). */
+            if (!invOpen && !pauseOpen && deathTimer == 0 && wearNVG != 2) {
                 blinkTimer -= 100.0f / 600.0f;
             }
-            if (!invOpen && !pauseOpen && inputHit(ACTION_BLINK)) {
+            if (!invOpen && !pauseOpen && deathTimer == 0
+                && inputHit(ACTION_BLINK)) {
                 blinkTimer = 0.0f;
             }
-            if (!invOpen && !pauseOpen && blinkTimer <= 0.0f
-                && blinkFrames == 0) {
+            if (!invOpen && !pauseOpen && deathTimer == 0
+                && blinkTimer <= 0.0f && blinkFrames == 0) {
                 blinkFrames = 18;
             }
 
@@ -12194,10 +14125,14 @@ int main(void) {
             /* Skip rooms entirely behind the camera (a generous margin
              * keeps anything that could bleed into the periphery). */
             float cullFx = sinf(camYaw), cullFz = -cosf(camYaw);
+            float fogCull = fogDistW * 256.0f + 1700.0f;
             for (int i = 0; i < activeCount; i++) {
                 float rdx = activeRooms[i]->gridX * ROOM_SPACING - camPos[0];
                 float rdz = activeRooms[i]->gridY * ROOM_SPACING - camPos[2];
                 if (rdx * cullFx + rdz * cullFz < -ROOM_SPACING) continue;
+                /* Fully past the fog wall: invisible, skip the fill. */
+                if (fogOn && rdx * rdx + rdz * rdz > fogCull * fogCull)
+                    continue;
                 drawRoomBatches(activeRooms[i], 0);
             }
             if (introCellGL && inIntroBounds(camPos[0], camPos[2])) {
@@ -12236,11 +14171,15 @@ int main(void) {
             drawPocketPillars();
             drawPocketThrone();
             drawIntroHumans(camPos);
+            drawEventHumans(camPos);
+            drawEventProps(camPos);
             glDisable(GL_CULL_FACE);
             for (int i = 0; i < activeCount; i++) {
                 float rdx = activeRooms[i]->gridX * ROOM_SPACING - camPos[0];
                 float rdz = activeRooms[i]->gridY * ROOM_SPACING - camPos[2];
                 if (rdx * cullFx + rdz * cullFz < -ROOM_SPACING) continue;
+                if (fogOn && rdx * rdx + rdz * rdz > fogCull * fogCull)
+                    continue;
                 drawRoomBatches(activeRooms[i], 1);
             }
             if (introCellGL && inIntroBounds(camPos[0], camPos[2])) {
@@ -12437,31 +14376,76 @@ int main(void) {
                 glColor4f(1, 1, 1, 1);
                 glPopMatrix();
             } else {
-                /* The source's post-death report: the [death] entry for
-                 * the killer, then Load Game / Quit to Menu. */
-                float dw = 660.0f, dh = 330.0f;
-                float dx = (SCREEN_W - dw) * 0.5f;
-                float dy = (SCREEN_H - dh) * 0.5f - 40.0f;
-                drawFrame(dx, dy, dw, dh, 0);
-                mtextC(SCREEN_W * 0.5f, dy + 22.0f, 2.4f, 0.85f, 0.12f,
-                       0.12f, "GAME OVER");
-                mtextWrap(dx + 26.0f, dy + 64.0f, dw - 52.0f, 1.3f,
-                          deathReport);
-                float dby = SCREEN_H * 0.5f + 116.0f;
-                drawFrame(dx + 20.0f, dby, 300.0f, 54.0f,
-                          deathSel == 0 && !deathMenuNoLoad);
-                float lg = deathMenuNoLoad ? 0.35f : 1.0f;
-                mtextC(dx + 170.0f, dby + 20.0f, 1.7f, lg, lg, lg,
-                       "LOAD GAME");
-                drawFrame(dx + 340.0f, dby, 300.0f, 54.0f, deathSel == 1);
-                mtextC(dx + 490.0f, dby + 20.0f, 1.7f, 1, 1, 1,
-                       "QUIT TO MENU");
+                /* RenderMenu's dead state: the pause-panel art, the
+                 * big title centred at panel-centre + 47, the
+                 * difficulty/save/seed block at (132, 122), 430x60
+                 * buttons on 75-unit slots (Keter+ drops LOAD and
+                 * QUIT moves up; LOAD greys without a save), and the
+                 * mortuary report at +175 (+75 more when the LOAD
+                 * slot exists) - the source's 600x673 MenuScale. */
+                float ph = 470.0f, ms = ph / 673.0f;
+                float pw = ph * (600.0f / 673.0f);
+                float px = (SCREEN_W - pw) * 0.5f;
+                float py = (SCREEN_H - ph) * 0.5f;
+                if (pausePanelTex) {
+                    drawTexQuad(px, py, pw, ph, pausePanelTex, 1.0f);
+                } else {
+                    drawQuad(px, py, pw, ph, 0, 0.05f, 0.05f, 0.05f,
+                             0.95f);
+                }
+                mtextC(px + pw * 0.5f + 47.0f * ms,
+                       py + 48.0f * ms - 9.0f, 2.0f, 1, 1, 1,
+                       "YOU DIED");
+                float ix = px + 132.0f * ms;
+                float iy = py + 122.0f * ms;
+                char info[96];
+                snprintf(info, sizeof(info), "Difficulty: %s",
+                         DIFFICULTIES[gameDiff].name);
+                mtext(ix, iy, 1.1f, 0.8f, 0.8f, 0.8f, info);
+                snprintf(info, sizeof(info), "Save: %s",
+                         deathHaveSave || deathMenuNoLoad
+                             ? curSaveName : "[DATA REDACTED]");
+                mtext(ix, iy + 20.0f * ms, 1.1f, 0.8f, 0.8f, 0.8f,
+                      info);
+                snprintf(info, sizeof(info), "Map seed: %u",
+                         (unsigned)mapSeed);
+                mtext(ix, iy + 40.0f * ms, 1.1f, 0.8f, 0.8f, 0.8f,
+                      info);
+                float bw = 430.0f * ms, bh = 60.0f * ms;
+                float by = py + (122.0f + 10.0f + 75.0f) * ms;
+                if (!deathMenuNoLoad) {
+                    drawMenuButton(ix, by, bw, bh, "LOAD GAME",
+                                   deathSel == 0 && deathHaveSave);
+                    if (!deathHaveSave) {
+                        drawQuad(ix, by, bw, bh, 0, 0.0f, 0.0f, 0.0f,
+                                 0.55f);
+                    }
+                    by += 75.0f * ms;
+                }
+                drawMenuButton(ix, by, bw, bh, "QUIT TO MENU",
+                               deathSel == 1);
+                float ry = py + (122.0f + 175.0f
+                                 + (deathMenuNoLoad ? 0.0f : 75.0f))
+                              * ms;
+                mtextWrap(ix, ry, 430.0f * ms, 1.1f, deathReport);
             }
         }
 
         /* Chamber lights cut before the breach. */
         if (introDark && deathTimer == 0) {
             drawQuad(0, 0, SCREEN_W, SCREEN_H, 0, 0.0f, 0.0f, 0.0f, 0.6f);
+        }
+        /* The electrical centre with its lights cut. */
+        if (ecBlackout && deathTimer == 0) {
+            drawQuad(0, 0, SCREEN_W, SCREEN_H, 0, 0.0f, 0.0f, 0.0f,
+                     0.72f);
+        }
+        /* The source's me\LightBlink: the room lights stutter. */
+        if (lightBlinkT > 0.0f && deathTimer == 0) {
+            float fl = 0.45f + 0.45f * sinf((float)gTick * 1.7f);
+            float cap = lightBlinkT > 1.0f ? 1.0f : lightBlinkT;
+            drawQuad(0, 0, SCREEN_W, SCREEN_H, 0, 0.0f, 0.0f, 0.0f,
+                     fl * cap);
         }
         /* The intro opens on a black screen until a button wakes the
          * player up. */
@@ -12476,8 +14460,9 @@ int main(void) {
             glColor4f(1, 1, 1, 1);
             glPopMatrix();
         }
-        /* Eyes closed: solid black, but never over an open menu. */
-        if (blinkFrames > 0 && !invOpen && !pauseOpen) {
+        /* Eyes closed: solid black, but never over an open menu or
+         * the death screen. */
+        if (blinkFrames > 0 && !invOpen && !pauseOpen && deathTimer == 0) {
             drawQuad(0, 0, SCREEN_W, SCREEN_H, 0, 0.0f, 0.0f, 0.0f, 1.0f);
         }
         glEnableClientState(GL_COLOR_ARRAY);
