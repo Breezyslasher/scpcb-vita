@@ -84,6 +84,15 @@ void templatesFree(RoomTemplateList *list);
  * template list lacks a shape needed somewhere on the grid. */
 int mapGenerate(const RoomTemplateList *templates, uint32_t seed,
                 int introEnabled, GeneratedMap *out);
+
+/* Blitz3D's exact RNG, exposed for the other seed-tied systems the
+ * source drives from the same generator (the 106 spawn timer drawn
+ * right after CreateMap, and the maintenance-tunnel maze which the
+ * source reseeds with the map seed). mapGenerate leaves the stream at
+ * the source's post-CreateMap position. */
+void mapSeedRnd(int32_t seed);
+int mapRandInt(int from, int to);
+float mapRandFloat(float from, float to);
 void mapFree(GeneratedMap *map);
 
 #endif

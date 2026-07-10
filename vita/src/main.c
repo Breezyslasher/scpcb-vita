@@ -53,7 +53,7 @@ unsigned int _newlib_heap_size_user = 220 * 1024 * 1024;
 
 #define DATA_ROOT "ux0:data/scpcb-ue"
 /* Shown in the debug HUD so a stale VPK install is instantly visible. */
-#define PORT_BUILD_TAG "pcseed"
+#define PORT_BUILD_TAG "pcseed2"
 
 /* Diagnostic switch: set to 1 to skip ALL video playback (boot clips
  * and intro). The diag2-novid device test proved the video player was
@@ -1482,7 +1482,7 @@ static void pdInstToWorld(const PdInstance *in, const float l[3],
  * off-grid like the intro cell; built once, kept for the run. */
 #define MT_GX -20
 #define MT_GY -24
-#define MT_GRID 15
+#define MT_GRID 19   /* the source MTGridSize */
 #define MT_CELL 512.0f
 #define MT_MESH_MAX 7
 #define MT_INST_MAX 200
@@ -1555,308 +1555,249 @@ enum { MT_M_DEADEND = 0, MT_M_CORR, MT_M_CORNER, MT_M_TEE, MT_M_CROSS,
        MT_M_ELEV, MT_M_GEN };
 
 static void buildMtMaze(void) {
-    if (mtMeshCount) return; /* built once */
-    buildMtMesh(MAP_DIR "/mt1.rmesh");
-    buildMtMesh(MAP_DIR "/mt2.rmesh");
-    buildMtMesh(MAP_DIR "/mt2c.rmesh");
-    buildMtMesh(MAP_DIR "/mt3.rmesh");
-    buildMtMesh(MAP_DIR "/mt4.rmesh");
-    buildMtMesh(MAP_DIR "/mt2_elevator.rmesh");
-    buildMtMesh(MAP_DIR "/mt1_generator.rmesh");
-    if (mtMeshCount < 6) return;
-
-    static signed char grid[MT_GRID * MT_GRID];
-    memset(grid, 0, sizeof(grid));
-    /* Random walk from the centre (deterministic from the seed). */
-    uint32_t rng = mapSeed ^ 0x4D41494Eu;
-    int x = MT_GRID / 2, y = MT_GRID / 2, dir = (int)(rng & 3);
-    grid[x + y * MT_GRID] = 1;
-    int count = 1, target = 26 + (int)((rng >> 8) % 16u);
-    int guard = 0;
-    while (count < target && guard++ < 400) {
-        rng = rng * 1664525u + 1013904223u;
-        int run = 1 + (int)((rng >> 16) % 4u);
-        for (int s = 0; s < run; s++) {
-            int nx = x, ny = y;
-            if (dir == 0) ny--;
-            else if (dir == 1) nx++;
-            else if (dir == 2) ny++;
-            else nx--;
-            if (nx < 1 || nx >= MT_GRID - 1 || ny < 1 || ny >= MT_GRID - 1) {
-                break;
-            }
-            x = nx; y = ny;
-            if (!grid[x + y * MT_GRID]) { grid[x + y * MT_GRID] = 1; count++; }
-        }
-        rng = rng * 1664525u + 1013904223u;
-        dir += ((rng >> 16) & 1u) ? 1 : -1;
-        dir = (dir + 4) & 3;
+    if (!mtMeshCount) {
+        buildMtMesh(MAP_DIR "/mt1.rmesh");
+        buildMtMesh(MAP_DIR "/mt2.rmesh");
+        buildMtMesh(MAP_DIR "/mt2c.rmesh");
+        buildMtMesh(MAP_DIR "/mt3.rmesh");
+        buildMtMesh(MAP_DIR "/mt4.rmesh");
+        buildMtMesh(MAP_DIR "/mt2_elevator.rmesh");
+        buildMtMesh(MAP_DIR "/mt1_generator.rmesh");
     }
-    /* Replace each occupied cell with its orthogonal neighbour count. */
-    static signed char cnt[MT_GRID * MT_GRID];
+    if (mtMeshCount < 6) return;
+    mtArrive[0] = mtArrive[1] = mtArrive[2] = 0.0f;
+
+    /* ---- Blitz-exact MT maze (Events_Core 4292-4439): the source
+     * reseeds with the map seed, so the tunnel layout is part of seed
+     * parity. Grid is Blitz Grid[361]-style flat (19x19). ---- */
+    static int grid[MT_GRID * MT_GRID + 1];
+    memset(grid, 0, sizeof(grid));
+    mapSeedRnd((int32_t)mapSeed);
+
+    int dir = mapRandInt(0, 1) << 1;
+    int ix = MT_GRID / 2 + mapRandInt(-2, 2);
+    int iy = MT_GRID / 2 + mapRandInt(-2, 2);
+    grid[ix + iy * MT_GRID] = 1;
+    grid[(ix + (dir == 2 ? 1 : 0) - (dir != 2 ? 1 : 0)) + iy * MT_GRID] = 1;
+    int count = 2;
+    while (count < 100) {
+        int run = mapRandInt(1, 5) << mapRandInt(1, 2);
+        for (int i = 1; i <= run; i++) {
+            int ok = 1;
+            int par = i % 2;
+            switch (dir) {
+                case 0: if (ix < MT_GRID - 2 - par) ix++; else ok = 0; break;
+                case 1: if (iy < MT_GRID - 2 - par) iy++; else ok = 0; break;
+                case 2: if (ix > 1 + par) ix--; else ok = 0; break;
+                default: if (iy > 1 + par) iy--; else ok = 0; break;
+            }
+            if (!ok) break;
+            if (grid[ix + iy * MT_GRID] == 0) {
+                grid[ix + iy * MT_GRID] = 1;
+                count++;
+            }
+        }
+        dir += (mapRandInt(0, 1) << 1) - 1;
+        while (dir < 0) dir += 4;
+        while (dir > 3) dir -= 4;
+    }
+    /* Connection counts. */
     for (int j = 0; j < MT_GRID; j++) {
         for (int i = 0; i < MT_GRID; i++) {
-            if (!grid[i + j * MT_GRID]) { cnt[i + j * MT_GRID] = 0; continue; }
-            int n = 0;
-            if (j + 1 < MT_GRID && grid[i + (j + 1) * MT_GRID]) n++;
-            if (j - 1 >= 0 && grid[i + (j - 1) * MT_GRID]) n++;
-            if (i + 1 < MT_GRID && grid[(i + 1) + j * MT_GRID]) n++;
-            if (i - 1 >= 0 && grid[(i - 1) + j * MT_GRID]) n++;
-            cnt[i + j * MT_GRID] = (signed char)n;
+            if (grid[i + j * MT_GRID] > 0) {
+                grid[i + j * MT_GRID] =
+                    (grid[i + (j + 1) * MT_GRID] > 0)
+                  + (j > 0 ? (grid[i + (j - 1) * MT_GRID] > 0) : 0)
+                  + ((i + 1) + j * MT_GRID <= MT_GRID * MT_GRID
+                         ? (grid[(i + 1) + j * MT_GRID] > 0) : 0)
+                  + (i > 0 ? (grid[(i - 1) + j * MT_GRID] > 0) : 0);
+            }
         }
     }
-    /* Two straight-corridor cells become the elevators. */
+    /* Generator room pick (draws Rand(0,1) per candidate). */
+    {
+        int maxX = MT_GRID - 1;
+        int canRetry = 0;
+        for (int i2 = 0; i2 <= maxX; i2++) {
+            for (int j2 = 0; j2 < MT_GRID; j2++) {
+                if (grid[(i2 + 1) + j2 * MT_GRID] > 0) {
+                    maxX = i2;
+                    if (grid[(i2 + 1) + (j2 + 1) * MT_GRID] < 3
+                        && (j2 > 0
+                            ? grid[(i2 + 1) + (j2 - 1) * MT_GRID] : 0) < 3) {
+                        canRetry = 1;
+                        if (mapRandInt(0, 1) == 1) {
+                            grid[(i2 + 1) + j2 * MT_GRID] += 1;
+                            grid[i2 + j2 * MT_GRID] = 7; /* MT_GENERATOR */
+                            canRetry = 0;
+                            break;
+                        }
+                    }
+                }
+            }
+            if (canRetry) i2--;
+        }
+    }
+    /* First/last straight corridors become the elevators (no draws). */
     int firstX = -1, firstY = -1, lastX = -1, lastY = -1;
-    for (int j = 1; j < MT_GRID - 1; j++) {
-        for (int i = 1; i < MT_GRID - 1; i++) {
-            if (cnt[i + j * MT_GRID] != 2) continue;
-            int horiz = grid[(i + 1) + j * MT_GRID]
-                     && grid[(i - 1) + j * MT_GRID];
-            int vert = grid[i + (j + 1) * MT_GRID]
-                    && grid[i + (j - 1) * MT_GRID];
-            if (!horiz && !vert) continue;
-            if (firstX < 0) { firstX = i; firstY = j; }
-            else { lastX = i; lastY = j; }
+    for (int j2 = 0; j2 < MT_GRID; j2++) {
+        for (int i2 = 0; i2 < MT_GRID; i2++) {
+            if (grid[i2 + j2 * MT_GRID] != 2) continue;
+            int east = grid[(i2 + 1) + j2 * MT_GRID] > 0;
+            int west = i2 > 0 && grid[(i2 - 1) + j2 * MT_GRID] > 0;
+            int north = grid[i2 + (j2 + 1) * MT_GRID] > 0;
+            int south = j2 > 0 && grid[i2 + (j2 - 1) * MT_GRID] > 0;
+            int straight = (east && west) || (north && south);
+            if (!straight) continue;
+            int okSides = grid[(i2 - 1) + j2 * MT_GRID] < 3
+                       && grid[(i2 + 1) + j2 * MT_GRID] < 3
+                       && (j2 > 0 ? grid[i2 + (j2 - 1) * MT_GRID] : 0) < 3
+                       && grid[i2 + (j2 + 1) * MT_GRID] < 3;
+            int okDiag = grid[(i2 - 1) + (j2 - 1) * MT_GRID] < 1
+                      && grid[(i2 + 1) + (j2 - 1) * MT_GRID] < 1
+                      && grid[(i2 - 1) + (j2 + 1) * MT_GRID] < 1;
+            if (firstX == -1 || firstY == -1) {
+                if (okSides && okDiag) { firstX = i2; firstY = j2; }
+            }
+            if (okSides) { lastX = i2; lastY = j2; }
         }
     }
-    /* Lay the tiles. */
+    if (firstX < 0 || (lastX == firstX && lastY == firstY)) {
+        /* Source RuntimeErrors here; fall back to no maze. */
+        mtInstCount = 0;
+        return;
+    }
+    grid[lastX + lastY * MT_GRID] = 6;      /* MT_SECOND_ELEVATOR */
+    grid[firstX + firstY * MT_GRID] = 5;    /* MT_FIRST_ELEVATOR */
+
+    /* ---- placement draw replay (Events_Core 4440-4709) + per-cell
+     * mesh/yaw. iY outer / iX inner like the source. ---- */
+    static signed char valArr[MT_GRID * MT_GRID];
+    static signed char yawArr[MT_GRID * MT_GRID];
+    memset(valArr, 0, sizeof(valArr));
+    memset(yawArr, 0, sizeof(yawArr));
+    for (int j2 = 0; j2 < MT_GRID; j2++) {
+        for (int i2 = 0; i2 < MT_GRID; i2++) {
+            int v = grid[i2 + j2 * MT_GRID];
+            if (v <= 0) continue;
+            valArr[i2 + j2 * MT_GRID] = (signed char)v;
+            int east = grid[(i2 + 1) + j2 * MT_GRID] > 0;
+            int west = i2 > 0 && grid[(i2 - 1) + j2 * MT_GRID] > 0;
+            int north = grid[i2 + (j2 + 1) * MT_GRID] > 0;
+            int south = j2 > 0 && grid[i2 + (j2 - 1) * MT_GRID] > 0;
+            int yaw = 0;
+            /* AddLight (sprite): 4 draws for every laid tile. */
+            #define MT_L() do { mapRandFloat(0.36f, 0.4f); \
+                mapRandFloat(0.36f, 0.4f); mapRandFloat(0.0f, 360.0f); \
+                mapRandInt(1, 50); } while (0)
+            switch (v) {
+                case 1:
+                    MT_L();
+                    yaw = east ? 1 : west ? 3 : south ? 2 : 0;
+                    break;
+                case 2:
+                case 5:
+                case 6:
+                    if (east && west) {
+                        MT_L();
+                        yaw = mapRandInt(0, 1) * 2 + 1;
+                    } else if (north && south) {
+                        MT_L();
+                        yaw = mapRandInt(0, 1) * 2;
+                    } else {
+                        MT_L();
+                        yaw = (south && east) ? 0 : (south && west) ? 1
+                            : (north && east) ? 3 : 2;
+                    }
+                    if (v == 5 || v == 6) {
+                        MT_L();
+                        mapRandInt(1, 10);          /* elevator DOOR */
+                    }
+                    break;
+                case 3:
+                    MT_L();
+                    yaw = (south && east && west) ? 1
+                        : (north && east && west) ? 3
+                        : (east && north && south) ? 0 : 2;
+                    break;
+                case 4:
+                    MT_L();
+                    yaw = mapRandInt(0, 3);
+                    break;
+                case 7:
+                    /* Generator room: light + the two pickups. */
+                    MT_L();
+                    mapRandFloat(0.0f, 360.0f);
+                    mapRandFloat(0.0f, 360.0f);
+                    yaw = 1;                        /* opening east */
+                    break;
+                default:
+                    break;
+            }
+            #undef MT_L
+            yawArr[i2 + j2 * MT_GRID] = (signed char)yaw;
+        }
+    }
+    /* Lay the tiles from the replayed values/yaws. */
     float ox = MT_GX * ROOM_SPACING, oz = MT_GY * ROOM_SPACING;
     mtInstCount = 0;
+    mtGenOK = 0;
     mtMinX = mtMinZ = 1e30f; mtMaxX = mtMaxZ = -1e30f;
     for (int j = 0; j < MT_GRID && mtInstCount < MT_INST_MAX; j++) {
         for (int i = 0; i < MT_GRID && mtInstCount < MT_INST_MAX; i++) {
-            int n = cnt[i + j * MT_GRID];
-            if (n <= 0) continue;
-            int up = j - 1 >= 0 && grid[i + (j - 1) * MT_GRID];
-            int down = j + 1 < MT_GRID && grid[i + (j + 1) * MT_GRID];
-            int right = i + 1 < MT_GRID && grid[(i + 1) + j * MT_GRID];
-            int left = i - 1 >= 0 && grid[(i - 1) + j * MT_GRID];
-            int mesh = MT_M_CROSS, yaw = 0;
-            int isElev = (i == firstX && j == firstY)
-                      || (i == lastX && j == lastY);
-            if (n == 1) {
-                mesh = MT_M_DEADEND;
-                yaw = right ? 1 : left ? 3 : down ? 2 : 0;
-            } else if (n == 2) {
-                int horiz = right && left, vert = up && down;
-                if (horiz || vert) {
-                    mesh = isElev ? MT_M_ELEV : MT_M_CORR;
-                    rng = rng * 1664525u + 1013904223u;
-                    int flip = (int)((rng >> 16) & 1u);
-                    yaw = horiz ? (flip * 2 + 1) : (flip * 2);
-                } else {
-                    mesh = MT_M_CORNER;
-                    yaw = (down && right) ? 0 : (down && left) ? 1
-                        : (up && right) ? 3 : 2;
+            int v = valArr[i + j * MT_GRID];
+            if (v <= 0) continue;
+            int mesh;
+            switch (v) {
+                case 1: mesh = MT_M_DEADEND; break;
+                case 2: {
+                    int east = valArr[(i + 1) + j * MT_GRID] > 0;
+                    int west = i > 0 && valArr[(i - 1) + j * MT_GRID] > 0;
+                    int north = j + 1 < MT_GRID
+                             && valArr[i + (j + 1) * MT_GRID] > 0;
+                    int south = j > 0 && valArr[i + (j - 1) * MT_GRID] > 0;
+                    mesh = ((east && west) || (north && south))
+                         ? MT_M_CORR : MT_M_CORNER;
+                    break;
                 }
-            } else if (n == 3) {
-                mesh = MT_M_TEE;
-                yaw = (down && right && left) ? 1
-                    : (up && right && left) ? 3
-                    : (right && up && down) ? 0 : 2;
-            } else {
-                mesh = MT_M_CROSS;
-                rng = rng * 1664525u + 1013904223u;
-                yaw = (int)((rng >> 16) % 4u);
+                case 3: mesh = MT_M_TEE; break;
+                case 4: mesh = MT_M_CROSS; break;
+                case 5: case 6: mesh = MT_M_ELEV; break;
+                default: mesh = MT_M_GEN; break;      /* 7 generator */
+            }
+            if (mesh == MT_M_GEN && !mtMesh[MT_M_GEN].scene) {
+                mesh = MT_M_DEADEND;
             }
             MtInstance *in = &mtInst[mtInstCount++];
             in->mesh = mesh;
             in->wx = ox + (float)i * MT_CELL;
             in->wz = oz + (float)j * MT_CELL;
-            in->yaw = yaw;
+            in->yaw = yawArr[i + j * MT_GRID];
             if (in->wx < mtMinX) mtMinX = in->wx;
             if (in->wx > mtMaxX) mtMaxX = in->wx;
             if (in->wz < mtMinZ) mtMinZ = in->wz;
             if (in->wz > mtMaxZ) mtMaxZ = in->wz;
-            if (isElev) {
+            if (v == 5) {
                 /* Land in the first elevator cell. */
-                if (i == firstX && j == firstY) {
-                    mtArrive[0] = in->wx;
-                    mtArrive[2] = in->wz;
-                    mtArrive[1] = 0.0f;
-                }
+                mtArrive[0] = in->wx;
+                mtArrive[2] = in->wz;
+                mtArrive[1] = 0.0f;
+            }
+            if (mesh == MT_M_GEN) {
+                mtGen[0] = in->wx;
+                mtGen[1] = 0.0f;
+                mtGen[2] = in->wz;
+                mtGenOK = 1;
             }
         }
     }
-    /* Fallback if no straight cell was found for a landing. */
+    /* Fallback if no elevator cell landed. */
     if (mtArrive[0] == 0.0f && mtArrive[2] == 0.0f && mtInstCount) {
         mtArrive[0] = mtInst[0].wx;
         mtArrive[2] = mtInst[0].wz;
     }
-    /* Turn a dead-end into the generator room (source MT_GENERATOR): the
-     * mt1_generator tile shares the dead-end's single opening, so the
-     * swap keeps its rotation. Its props/items spawn there. */
-    mtGenOK = 0;
-    for (int m = mtInstCount - 1; m >= 0; m--) {
-        if (mtInst[m].mesh == MT_M_DEADEND && mtMesh[MT_M_GEN].scene) {
-            mtInst[m].mesh = MT_M_GEN;
-            mtGen[0] = mtInst[m].wx;
-            mtGen[1] = 0.0f;
-            mtGen[2] = mtInst[m].wz;
-            mtGenOK = 1;
-            break;
-        }
-    }
 }
 
-/* World<->tile-local for a 90-degree-rotated MT tile (render does
- * glTranslate(w) then glRotatef(-yaw*90), matching the room transform). */
-static void mtToLocal(const MtInstance *in, const float w[3], float l[3]) {
-    float dx = w[0] - in->wx, dz = w[2] - in->wz;
-    switch (in->yaw & 3) {
-        case 0: l[0] = dx;  l[2] = dz;  break;
-        case 1: l[0] = dz;  l[2] = -dx; break;
-        case 2: l[0] = -dx; l[2] = -dz; break;
-        case 3: l[0] = -dz; l[2] = dx;  break;
-    }
-    l[1] = w[1];
-}
-
-static void mtToWorld(const MtInstance *in, const float l[3], float w[3]) {
-    float x = 0.0f, z = 0.0f;
-    switch (in->yaw & 3) {
-        case 0: x = l[0];  z = l[2];  break;
-        case 1: x = -l[2]; z = l[0];  break;
-        case 2: x = -l[0]; z = -l[2]; break;
-        case 3: x = l[2];  z = -l[0]; break;
-    }
-    w[0] = x + in->wx;
-    w[1] = l[1];
-    w[2] = z + in->wz;
-}
-
-static void appendPocketRoom(void) {
-    pdRoomIdx = -1;
-    int tplIdx = -1;
-    for (uint32_t i = 0; i < tplList.count; i++) {
-        if (strcmp(tplList.items[i].name, "dimension_106") == 0) {
-            tplIdx = (int)i;
-            break;
-        }
-    }
-    if (tplIdx < 0) return;
-    RoomPlacement *grown = (RoomPlacement *)realloc(
-        map.rooms, (map.roomCount + 1) * sizeof(RoomPlacement));
-    if (!grown) return;
-    map.rooms = grown;
-    RoomPlacement *p = &map.rooms[map.roomCount];
-    p->templateIndex = tplIdx;
-    p->gridX = PD_GX;
-    p->gridY = PD_GY;
-    p->angle = 0;
-    pdRoomIdx = (int)map.roomCount;
-    map.roomCount++;
-    buildPocketComposite();
-}
-
-/* The pocket-dimension labyrinth doors (Rooms_Core dimension_106, the
- * "For i = 0 To 9 / Select" block the door extractor skips because the
- * coordinates come from loop variables). Ten KEY_005 DEFAULT_DOORs at
- * fixed local offsets - x = xTemp, y = 2574, z = 32 + zTemp in raw
- * units - placed with the same room transform as every other
- * dimension_106 door. Call after spawnRoomDoors (which runs after
- * doorsGenerate resets the list). */
-static void spawnPocketLabyrinthDoors(void) {
-    if (pdRoomIdx < 0) return;
-    static const struct { float x, z, ang; } PD_LABYRINTH[10] = {
-        { 5187.0f, 2555.0f, 180.0f }, { 5521.0f, 1673.0f, 180.0f },
-        { 9128.0f, 2192.0f, 180.0f }, { 8523.0f, 1760.0f, 180.0f },
-        { 9880.0f, 1244.0f, 180.0f }, { 5299.0f,  392.0f,  90.0f },
-        { 7807.0f, 1291.0f,  90.0f }, { 8196.0f, 1436.0f,  90.0f },
-        { 8143.0f,  392.0f,  90.0f }, { 9709.0f,  920.0f,  90.0f },
-    };
-    const RoomPlacement *p = &map.rooms[pdRoomIdx];
-    for (int i = 0; i < 10; i++) {
-        float local[3] = { PD_LABYRINTH[i].x, 2574.0f, PD_LABYRINTH[i].z };
-        float w[3];
-        localToWorld(p, local, w);
-        int a = (int)(PD_LABYRINTH[i].ang / 90.0f + 0.5f) * 90 + p->angle * 90;
-        a = ((a % 360) + 360) % 360;
-        doorsAddInternal(&doors, w[0], w[1], w[2], a, 0, 0, 0, 0, 0, 0);
-    }
-}
-
-static void appendMaskRoom(void) {
-    maskRoomIdx = -1;
-    int tplIdx = -1;
-    for (uint32_t i = 0; i < tplList.count; i++) {
-        if (strcmp(tplList.items[i].name, "dimension_1499") == 0) {
-            tplIdx = (int)i;
-            break;
-        }
-    }
-    if (tplIdx < 0) return;
-    RoomPlacement *grown = (RoomPlacement *)realloc(
-        map.rooms, (map.roomCount + 1) * sizeof(RoomPlacement));
-    if (!grown) return;
-    map.rooms = grown;
-    RoomPlacement *p = &map.rooms[map.roomCount];
-    p->templateIndex = tplIdx;
-    p->gridX = MASK_GX;
-    p->gridY = MASK_GY;
-    p->angle = 0;
-    maskRoomIdx = (int)map.roomCount;
-    map.roomCount++;
-}
-
-/* Append the gate_a / gate_b surface rooms off-grid and give each a
- * return elevator, and record the facility gate-entrance landings, so
- * the entrance elevators actually travel to the surfaces. Call after the
- * grid doors are generated (it appends internal elevator doors). */
-static void appendGateRooms(void) {
-    gateARoomIdx = gateBRoomIdx = -1;
-    gateADoor = gateBDoor = -1;
-    struct { const char *name; int gx, gy; int *idx, *door; } G[2] = {
-        { "gate_a", GATEA_GX, GATEA_GY, &gateARoomIdx, &gateADoor },
-        { "gate_b", GATEB_GX, GATEB_GY, &gateBRoomIdx, &gateBDoor },
-    };
-    for (int g = 0; g < 2; g++) {
-        int tplIdx = -1;
-        for (uint32_t i = 0; i < tplList.count; i++) {
-            if (strcmp(tplList.items[i].name, G[g].name) == 0) {
-                tplIdx = (int)i;
-                break;
-            }
-        }
-        if (tplIdx < 0) continue;
-        RoomPlacement *grown = (RoomPlacement *)realloc(
-            map.rooms, (map.roomCount + 1) * sizeof(RoomPlacement));
-        if (!grown) return;
-        map.rooms = grown;
-        RoomPlacement *p = &map.rooms[map.roomCount];
-        p->templateIndex = tplIdx;
-        p->gridX = G[g].gx;
-        p->gridY = G[g].gy;
-        p->angle = 0;
-        *G[g].idx = (int)map.roomCount;
-        map.roomCount++;
-        /* A call elevator on the surface, to ride back. */
-        doorsAddInternal(&doors, G[g].gx * ROOM_SPACING, 0.0f,
-                         G[g].gy * ROOM_SPACING, 0, 1, 0, 0, 0, 0, 0);
-        *G[g].door = (int)doors.count - 1;
-    }
-    /* Facility landings (the entrance rooms are force-placed). */
-    gateAEntrOK = gateBEntrOK = 0;
-    for (uint32_t i = 0; i < map.roomCount; i++) {
-        const char *nm = tplList.items[map.rooms[i].templateIndex].name;
-        if (!gateAEntrOK && strcmp(nm, "gate_a_entrance") == 0) {
-            gateAEntr[0] = map.rooms[i].gridX * ROOM_SPACING;
-            gateAEntr[1] = 0.0f;
-            gateAEntr[2] = map.rooms[i].gridY * ROOM_SPACING;
-            gateAEntrOK = 1;
-        }
-        if (!gateBEntrOK && strcmp(nm, "gate_b_entrance") == 0) {
-            gateBEntr[0] = map.rooms[i].gridX * ROOM_SPACING;
-            gateBEntr[1] = 0.0f;
-            gateBEntr[2] = map.rooms[i].gridY * ROOM_SPACING;
-            gateBEntrOK = 1;
-        }
-    }
-}
-
-/* Build the maintenance-tunnel overlay, give it a return elevator, and
- * record the facility room2_mt landing so those cars ride to it and
- * back. Call after the grid doors are generated. */
 static void setupMaintenanceTunnel(void) {
     buildMtMaze();
     mtElevDoorA = -1;
@@ -2455,6 +2396,9 @@ static void regenerateMap(uint32_t seed) {
     doorsFree(&doors);
     mapSeed = seed;
     if (mapGenerate(&tplList, mapSeed, introEnabled, &map)) {
+        /* InitNewGame's next draw on the same stream: SCP-106's first
+         * spawn timer, 70*60*Rnd(13,17) source frames = 13..17 min. */
+        npc106SeedMinutes = mapRandFloat(13.0f, 17.0f);
         generateAccessCodes(mapSeed);
         appendIntroRoom();
         appendPocketRoom();
@@ -3143,6 +3087,7 @@ static float npc106Pos[3];
 static float npc106YawDeg;
 static float npc106Frame;
 static float npc106Timer;      /* dormant spawn countdown */
+static float npc106SeedMinutes = 15.0f; /* seeded Rnd(13,17) draw */
 static int npc106Cool;         /* teleport-behind cooldown */
 static float npc106ChaseTimer; /* sinks away when it runs out unseen (State3) */
 
@@ -5020,9 +4965,10 @@ static void spawn106Near(void) {
 static void reset106(void) {
     npc106Active = skin106 != NULL && !npc106Contained;
     npc106State = N106_DORMANT;
-    /* First appearance a while into the run (source idles ~22000+
-     * frames; scaled down so it turns up within a session). */
-    npc106Timer = 3600.0f + (float)(rand() % 3000);
+    /* First appearance: the source's seeded 70*60*Rnd(13,17) frame
+     * countdown (13..17 minutes at 60 fps here; aggressive
+     * difficulties tick it down twice as fast like the source). */
+    npc106Timer = npc106SeedMinutes * 60.0f * 60.0f;
     npc106Cool = 0;
     npc106GrabTimer = 0.0f;
     posed106 = 0;
@@ -6573,32 +6519,22 @@ static void spawn860(void) {
     npc860YawDeg = 0.0f;
     reset860();
     npc860Active = 1;
-    /* Carve a winding path down a 10x10 forest grid (source ForestGrid:
-     * the path starts at a top column and walks down, deviating sideways
-     * within a couple of columns of centre, then a tree stands on every
-     * off-path cell). Deterministic from the seed so the maze is stable. */
+    /* The maze comes from mapGenerate's Blitz-exact GenForestGrid run
+     * (map.forestGrid, generated inside the seed stream when
+     * cont2_860_1 was filled): 1 = path, 3 = the two wall doors,
+     * 0 = a tree. Grid row j = source row (top = door 1). */
     enum { FGRID = 10 };
     unsigned char pathGrid[FGRID][FGRID];
-    memset(pathGrid, 0, sizeof(pathGrid));
-    uint32_t rng = mapSeed ^ 0x8601860Bu;
-    int cen = FGRID / 2;
-    int px = cen, py = 0;
-    pathGrid[py][px] = 1;
-    int guard = 0;
-    while (py < FGRID - 1 && guard++ < 400) {
-        rng = rng * 1664525u + 1013904223u;
-        if (((rng >> 8) % 100u) < 35u) {          /* deviate sideways */
-            rng = rng * 1664525u + 1013904223u;
-            int nx = px + (((rng >> 8) & 1u) ? 1 : -1);
-            int off = nx - cen; if (off < 0) off = -off;
-            if (nx >= 1 && nx <= FGRID - 2 && off <= 2) {
-                px = nx;
-                pathGrid[py][px] = 1;
-                continue;
-            }
+    int px = FGRID / 2;
+    for (int j = 0; j < FGRID; j++) {
+        for (int i = 0; i < FGRID; i++) {
+            pathGrid[j][i] = map.forestGrid[j * FGRID + i] != 0;
         }
-        py++;                                      /* else step down */
-        pathGrid[py][px] = 1;
+    }
+    /* The path cell adjacent to the far door (row 0 holds door 1;
+     * row 1 is the path's far end). */
+    for (int i = 0; i < FGRID; i++) {
+        if (map.forestGrid[1 * FGRID + i] == 1) { px = i; break; }
     }
     /* SCP-860-1 lurks at the far (top) end of the path. */
     npc860Pos[0] = ox - 850.0f + ((float)px + 0.5f) * (1700.0f / FGRID);
@@ -10464,7 +10400,13 @@ static void updateRoomEvents2(void) {
                     blinkFrames = 8;
                     st[0] += 1.0f;
                     int loop = (int)st[0];
-                    if (loop == 2 && inventoryCount > 0) {
+                    if (loop == 1) {
+                        /* KEY2_SPAWNRATE is pinned to 5 for map-seed
+                         * parity, and 5 is this room: the White Key. */
+                        int t = itemTplFind("White Key");
+                        evLocal(p, -354.0f, 220.0f, 516.0f, w);
+                        if (t >= 0) worldItemAdd(t, w[0], w[1], w[2]);
+                    } else if (loop == 2 && inventoryCount > 0) {
                         int k = rand() % inventoryCount;
                         for (int i = k; i < inventoryCount - 1; i++) {
                             inventory[i] = inventory[i + 1];

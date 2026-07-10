@@ -42,9 +42,9 @@ static float bbRnd(float from, float to) {
     return bbRndF() * (to - from) + from;
 }
 
-static int rand1(int n) {
-    return bbRand(1, n);
-}
+void mapSeedRnd(int32_t seed) { bbSeedRnd(seed); }
+int mapRandInt(int from, int to) { return bbRand(from, to); }
+float mapRandFloat(float from, float to) { return bbRnd(from, to); }
 
 /* ---------------- rooms.ini parsing ---------------- */
 
