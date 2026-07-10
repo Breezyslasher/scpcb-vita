@@ -16,6 +16,10 @@ set(VITA_TITLEID  "SCPBUE001")
 set(VITA_VERSION  "01.00")
 
 set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wall -O2 -g")
+# The map generator replays Blitz3D's float32 RNG stream; FMA
+# contraction would change results vs the PC game.
+set_source_files_properties(src/game/mapgen.c PROPERTIES
+  COMPILE_OPTIONS "-ffp-contract=off")
 
 add_executable(${PROJECT_NAME}
   src/main.c

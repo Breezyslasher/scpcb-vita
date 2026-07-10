@@ -47,10 +47,26 @@ typedef struct {
     int angle;          /* quarter turns, *90 degrees, Blitz convention */
 } RoomPlacement;
 
+/* A grid door produced during generation (the source creates these
+ * inside CreateMap from the same RNG stream, so their open states are
+ * part of seed parity). */
+typedef struct {
+    float x, z;         /* raw world units */
+    int angle;          /* 0 or 90 */
+    int heavy;          /* HCZ heavy doors */
+    int open;
+} GridDoorGen;
+
 typedef struct {
     RoomPlacement *rooms;
     uint32_t roomCount;
     int startX, startY; /* player spawn tile */
+    GridDoorGen *gridDoors;
+    uint32_t gridDoorCount;
+    /* The SCP-860-1 forest maze (GenForestGrid), 10x10, generated
+     * inside the same stream when cont2_860_1 is filled:
+     * 0 empty, 1 path, 3 door. */
+    unsigned char forestGrid[100];
 } GeneratedMap;
 
 /* Zone band of a grid row, matching Math_Core.bb GetZone(): the top of
@@ -67,7 +83,7 @@ void templatesFree(RoomTemplateList *list);
 /* Generate a facility. Returns 0 on allocation failure or if the
  * template list lacks a shape needed somewhere on the grid. */
 int mapGenerate(const RoomTemplateList *templates, uint32_t seed,
-                GeneratedMap *out);
+                int introEnabled, GeneratedMap *out);
 void mapFree(GeneratedMap *map);
 
 #endif

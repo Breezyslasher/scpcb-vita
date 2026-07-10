@@ -53,7 +53,7 @@ unsigned int _newlib_heap_size_user = 220 * 1024 * 1024;
 
 #define DATA_ROOT "ux0:data/scpcb-ue"
 /* Shown in the debug HUD so a stale VPK install is instantly visible. */
-#define PORT_BUILD_TAG "fogblend"
+#define PORT_BUILD_TAG "pcseed"
 
 /* Diagnostic switch: set to 1 to skip ALL video playback (boot clips
  * and intro). The diag2-novid device test proved the video player was
@@ -998,6 +998,7 @@ static int facilityPower;        /* the room2_sl generator lever */
 static int remoteDoorOn;         /* room2c_ec's remote door control */
 static int ecBlackout;           /* the electrical centre lights are cut */
 static void eventHumansClear(void);
+static int introEnabled;   /* defined with the options block */
 static float camShake;          /* decays; jitters the view rotation */
 static float cameraZoom;         /* FOV narrowing (deg) - 106's dread pulse */
 static float blurAmount;         /* 0..1 screen blur (me\BlurVolume) */
@@ -2453,7 +2454,7 @@ static void regenerateMap(uint32_t seed) {
     mapFree(&map);
     doorsFree(&doors);
     mapSeed = seed;
-    if (mapGenerate(&tplList, mapSeed, &map)) {
+    if (mapGenerate(&tplList, mapSeed, introEnabled, &map)) {
         generateAccessCodes(mapSeed);
         appendIntroRoom();
         appendPocketRoom();

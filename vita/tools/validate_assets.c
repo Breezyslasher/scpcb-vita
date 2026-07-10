@@ -333,7 +333,7 @@ int main(int argc, char **argv) {
         unsigned long long totalRooms = 0, totalDoors = 0;
         for (uint32_t seed = 1; seed <= 50; seed++) {
             GeneratedMap m;
-            if (mapGenerate(&tpls, seed, &m)) {
+            if (mapGenerate(&tpls, seed, 1, &m)) {
                 genOk++;
                 totalRooms += m.roomCount;
                 DoorList dl;
