@@ -53,7 +53,7 @@ unsigned int _newlib_heap_size_user = 220 * 1024 * 1024;
 
 #define DATA_ROOT "ux0:data/scpcb-ue"
 /* Shown in the debug HUD so a stale VPK install is instantly visible. */
-#define PORT_BUILD_TAG "events2"
+#define PORT_BUILD_TAG "events3"
 
 /* Diagnostic switch: set to 1 to skip ALL video playback (boot clips
  * and intro). The diag2-novid device test proved the video player was
@@ -974,6 +974,8 @@ enum {
     EV_1162ARC,       /* the hole in the wall that trades items */
     EV_SCIENTISTS2,   /* Dr. L's office corpses */
     EV_066,           /* SCP-066 rolls about, humming its notes */
+    EV_EC,            /* the electrical centre: remote door + blackout */
+    EV_GATE_ENT,      /* gate entrances: remote-door gating, 106 laugh */
     EV_1123,          /* touching the skull brings the flashback */
     EV_GATEWAY,       /* the greenhouse airlock cycle */
     EV_CHECKPOINT,    /* doors/monitors mirror the room2_sl power */
@@ -993,6 +995,8 @@ static float evSt[MAX_EVENT_ROOMS][2][3];
 static signed char evNpc[MAX_EVENT_ROOMS][2][2];
 static float lightBlinkT;        /* the source's me\LightBlink flicker */
 static int facilityPower;        /* the room2_sl generator lever */
+static int remoteDoorOn;         /* room2c_ec's remote door control */
+static int ecBlackout;           /* the electrical centre lights are cut */
 static void eventHumansClear(void);
 static float camShake;          /* decays; jitters the view rotation */
 static float cameraZoom;         /* FOV narrowing (deg) - 106's dread pulse */
@@ -3736,16 +3740,20 @@ static void spawnRoomEvents(void) {
         { "room2_checkpoint_lcz_hcz", EV_CHECKPOINT },
         { "room2_checkpoint_hcz_ez",  EV_CHECKPOINT },
         { "room2_storage",      EV_STORAGE_970 },
+        { "room2c_ec",          EV_EC },
+        { "gate_a_entrance",    EV_GATE_ENT },
+        { "gate_b_entrance",    EV_GATE_ENT },
     };
     int n2 = (int)(sizeof(TABLE2) / sizeof(TABLE2[0]));
-    /* No generator room on this map: the checkpoints stay powered. */
+    /* No generator room on this map: the checkpoints stay powered.
+     * Same rule for the electrical centre's remote door control. */
     facilityPower = 1;
+    remoteDoorOn = 1;
+    ecBlackout = 0;
     for (uint32_t r = 0; r < map.roomCount; r++) {
-        if (!strcmp(tplList.items[map.rooms[r].templateIndex].name,
-                    "room2_sl")) {
-            facilityPower = 0;
-            break;
-        }
+        const char *enm = tplList.items[map.rooms[r].templateIndex].name;
+        if (!strcmp(enm, "room2_sl")) facilityPower = 0;
+        if (!strcmp(enm, "room2c_ec")) remoteDoorOn = 0;
     }
     uint32_t rng = mapSeed ^ 0x51ED2C0Bu;
     for (uint32_t r = 0; r < map.roomCount && r < MAX_EVENT_ROOMS; r++) {
@@ -9109,6 +9117,42 @@ static WorldLever *evLeverNear(float cx, float cz, float radius) {
     return best;
 }
 
+/* The lever standing at a specific room-local fixture spot. */
+static WorldLever *evLeverAt(const RoomPlacement *p, float lx, float ly,
+                             float lz) {
+    float l[3] = { lx, ly, lz }, w[3];
+    localToWorld(p, l, w);
+    WorldLever *best = NULL;
+    float bestD2 = 100.0f * 100.0f;
+    for (int i = 0; i < worldLeverCount; i++) {
+        float dx = worldLevers[i].x - w[0];
+        float dz = worldLevers[i].z - w[2];
+        float d2 = dx * dx + dz * dz;
+        if (d2 < bestD2) {
+            bestD2 = d2;
+            best = &worldLevers[i];
+        }
+    }
+    return best;
+}
+
+/* SCP-294's menu (the port has no drink-name keyboard: a random pour
+ * from the machine's classics, messages from Data/SCP-294.jsonc). */
+static const struct {
+    const char *msg;
+    const char *snd;    /* drink sound within SFX/SCP/294 */
+    int effect;         /* 0 none, 1 coffee, 2 alcohol, 3 empty */
+} EV294_DRINKS[] = {
+    { "\"The drink tastes like fairly strong black coffee.\"",
+      "Slurp", 1 },
+    { "\"Mmm...\"", "Slurp", 0 },
+    { "\"Even in the worst situations, nothing beats a fresh "
+      "cosmopolitan.\"", "Ahh", 0 },
+    { "\"Damn, that's strong.\"", "Ew1", 2 },
+    { "\"There is nothing to drink in the cup.\"", NULL, 3 },
+    { "You hear a voice inside your head.", NULL, 0 },
+};
+
 /* The trade pool for SCP-1162-ARC (arm-in-the-hole): common items the
  * port's templates all carry. */
 static const char *EV1162_POOL[] = {
@@ -10125,7 +10169,29 @@ static void updateRoomEvents2(void) {
                                      "/SCP/294/Dispense%d.ogg",
                                      rand() % 4);
                             audioPlay(audioLoad(sp), 1.0f, 0.0f);
-                            int cup = itemTplFind("Cup");
+                            /* A pour from the machine's classics, its
+                             * message and effects, and the cup left at
+                             * the spout. */
+                            int dk = rand() % (int)(sizeof(EV294_DRINKS)
+                                     / sizeof(EV294_DRINKS[0]));
+                            snprintf(toastMsg, sizeof(toastMsg), "%s",
+                                     EV294_DRINKS[dk].msg);
+                            toastTimer = 260;
+                            if (EV294_DRINKS[dk].snd) {
+                                snprintf(sp, sizeof(sp), SFX_DIR
+                                         "/SCP/294/%s.ogg",
+                                         EV294_DRINKS[dk].snd);
+                                audioPlay(audioLoad(sp), 1.0f, 0.0f);
+                            }
+                            if (EV294_DRINKS[dk].effect == 1) {
+                                stamina = 100.0f;
+                                staminaBlocked = 0;
+                            } else if (EV294_DRINKS[dk].effect == 2) {
+                                blurAmount = 0.8f;
+                            }
+                            int cup = itemTplFind(
+                                EV294_DRINKS[dk].effect == 3
+                                    ? "Empty Cup" : "Cup");
                             evLocal(p, 1780.0f, -248.0f, -276.0f, w);
                             if (cup >= 0) {
                                 worldItemAdd(cup, w[0], w[1], w[2]);
@@ -10355,6 +10421,21 @@ static void updateRoomEvents2(void) {
                     localToWorld(p, lw, w1);
                     camPos[0] += w1[0] - w0[0];
                     camPos[2] += w1[2] - w0[2];
+                    /* Loose items ride the loop with you (the source
+                     * mirrors dropped items across the seam). */
+                    for (unsigned wi = 0; wi < worldItemCount; wi++) {
+                        if (worldItems[wi].taken) continue;
+                        float il[3];
+                        float ip[3] = { worldItems[wi].x, 0.0f,
+                                        worldItems[wi].z };
+                        worldToLocal(p, ip, il);
+                        if (il[0] < -1500.0f || il[0] > 1500.0f
+                            || il[2] < -800.0f || il[2] > 800.0f) {
+                            continue;
+                        }
+                        worldItems[wi].x += w1[0] - w0[0];
+                        worldItems[wi].z += w1[2] - w0[2];
+                    }
                     blinkFrames = 8;
                     st[0] += 1.0f;
                     int loop = (int)st[0];
@@ -10413,6 +10494,53 @@ static void updateRoomEvents2(void) {
                             110.0f);
                     } else if (loop == 52) {
                         eventHumanFree(&np[1]);
+                    }
+                    break;
+                }
+                case EV_EC: {
+                    /* The electrical centre: the remote-door lever the
+                     * gate entrances mirror, and the lights that do
+                     * not stay on. */
+                    WorldLever *rd = evLeverAt(p, -239.0f, 1104.0f,
+                                               504.0f);
+                    if (rd) remoteDoorOn = rd->on;
+                    WorldLever *sec = evLeverAt(p, -239.0f, 1104.0f,
+                                                568.0f);
+                    if (inRoom && st[0] == 0.0f && sec && sec->on
+                        && (rand() % 200) == 1) {
+                        audioPlay(EVSND("/Horror/Horror7.ogg"), 1.0f,
+                                  0.0f);
+                        audioPlay(EVSND("/Room/Blackout.ogg"), 1.0f,
+                                  0.0f);
+                        sec->on = 0;
+                        st[0] = 1.0f;
+                    }
+                    ecBlackout = inRoom && sec && !sec->on;
+                    break;
+                }
+                case EV_GATE_ENT: {
+                    /* The surface gates: the big door answers only to
+                     * the electrical centre's remote control. Old
+                     * Fickle Fingers has a laugh on the way up Gate
+                     * A. */
+                    const char *nm2 =
+                        tplList.items[p->templateIndex].name;
+                    int gateA = strstr(nm2, "gate_a") != NULL;
+                    Door *big = evNearestDoor(p, 0.0f, 0.0f,
+                                              gateA ? -360.0f : -320.0f,
+                                              250.0f);
+                    if (big) big->locked = remoteDoorOn ? 0 : 1;
+                    if (gateA && inRoom && remoteDoorOn
+                        && !npc106Contained && st[0] == 0.0f) {
+                        float el[3];
+                        evLocal(p, 720.0f, 0.0f, 512.0f, el);
+                        float gdx = el[0] - camPos[0];
+                        float gdz = el[2] - camPos[2];
+                        if (gdx * gdx + gdz * gdz < 300.0f * 300.0f) {
+                            audioPlay(EVSND("/SCP/106/Laugh.ogg"), 1.0f,
+                                      0.0f);
+                            st[0] = 1.0f;
+                        }
                     }
                     break;
                 }
@@ -14233,6 +14361,11 @@ int main(void) {
         /* Chamber lights cut before the breach. */
         if (introDark && deathTimer == 0) {
             drawQuad(0, 0, SCREEN_W, SCREEN_H, 0, 0.0f, 0.0f, 0.0f, 0.6f);
+        }
+        /* The electrical centre with its lights cut. */
+        if (ecBlackout && deathTimer == 0) {
+            drawQuad(0, 0, SCREEN_W, SCREEN_H, 0, 0.0f, 0.0f, 0.0f,
+                     0.72f);
         }
         /* The source's me\LightBlink: the room lights stutter. */
         if (lightBlinkT > 0.0f && deathTimer == 0) {
