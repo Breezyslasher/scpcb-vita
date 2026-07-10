@@ -15,7 +15,7 @@ set(VITA_APP_NAME "SCP:CB Ultimate Edition")
 set(VITA_TITLEID  "SCPBUE001")
 set(VITA_VERSION  "01.00")
 
-set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wall -O2")
+set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wall -O2 -g")
 
 add_executable(${PROJECT_NAME}
   src/main.c

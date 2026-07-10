@@ -96,3 +96,10 @@ jobs:
           name: scpcb-ue-vita-vpk
           path: vita/build/*.vpk
           if-no-files-found: error
+
+      - name: Upload ELF for crash symbolication
+        uses: actions/upload-artifact@v4
+        with:
+          name: scpcb-ue-vita-elf
+          path: vita/build/scpcb_ue_vita*
+          if-no-files-found: error
