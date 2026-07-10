@@ -27,7 +27,7 @@ A full line-evidence source-vs-port audit (2026-07-10) lives in
 | Dynamic room lights / light sprites | missing | RMesh light/light_fix/spotlight entities are parsed then discarded; rooms have only baked vertex colour + lightmaps - no point-light glow, lamp flares or coloured pools (also listed under Known visual gaps) |
 | Skybox / surface sky | missing | Sky_Core not ported; the gate surface areas render with no sky |
 | Particles / emitters | missing | Particles_Core / Devil_Particles_Core not ported at all: no dust, steam, gas clouds, sparks or blood mist (event gas/spark beats play sound-only) |
-| Per-zone ambient colour / screen gamma | missing | CurrAmbientColor zone tinting and the RenderGamma brightness post-process are absent |
+| Per-zone ambient colour / screen gamma | done | UpdateZoneColor's ambient half: the room composite's ambient term is now the source's AmbientLightRoomTex - a flat CurrAmbientColor/3 fed as a texenv constant (exact, because a host scan showed every room vertex colour is pure white), per zone LCZ 030030030 / HCZ 030023023 / EZ 023023030, defaulting to LCZ in the special areas like SetZoneColor does, eased with CurveValue speed 50 (fog colours now ease the same way instead of snapping). The night-vision colour multipliers (x3/x6 green, x3/x6 blue for the fine pair) and the forest's flat-200 daylight ambient apply after easing like the source. NOTE: this darkens rooms to the PC game's real look - earlier builds effectively used ambient 1.0 (the white vertex colour), i.e. everything was ~2x brighter than the source. RenderGamma is ported as the "Screen gamma" options slider (0..2, saved): above 1 the frame re-adds itself scaled by gamma-1 (saturating brighten), below 1 it multiplies down - done with dst-colour blends instead of the source's buffer copies, applied over the finished frame and the menus like the source. Not simulated: AmbientLight() on entities (props/NPCs draw as before - applying the true 030 ambient without the dynamic room lights the port lacks would black them out), and AdaptScreenGamma's temporary clamp while bright document images are open |
 | Prop collision flag | partial | All prop triangles enter the collision grid regardless of the source per-prop hasCollision flag, so decorative no-collide props block the player |
 
 ## Player
@@ -144,6 +144,23 @@ memory HUD; fixed by decoding sounds lazily on first play (boot heap
 now ~42-67 MB used), retrying + logging template failures to
 `ux0:data/scpcb-ue/render_log.txt`, and freeing the loading-screen art
 after boot. First play of a long sound costs a one-time decode hitch.
+
+Second chapter (the load-into-a-map crash, 2026-07-10): two psp2cores
+resolved - against the exact CI ELF artifact the device ran - to a
+data abort inside vitaGL's `_glDrawElements_FixedFunctionIMPL` with a
+NULL source pointer, first `drawItems` after a map load. vitaGL's
+`glBufferData` fails SILENTLY when its memory pools are exhausted
+(verified in its source: the buffer's backing pointer stays NULL and
+the next draw memcpys from address 0). The 220 MB newlib heap left
+vitaGL almost no LPDDR pool, so every texture and VBO lived in
+CDRAM+PHYCONT (~118 MB) and a heavy map load ran it dry. Fixed three
+ways: the heap is now 176 MB (observed peak ~97 MB), handing vitaGL a
+~44 MB RAM fallback pool; every batch upload goes through
+`batchUpload()`, which checks `glGetError` and on OOM zeroes the
+handles and logs all pool levels to render_log.txt; and
+`drawBatchSet` skips zeroed batches - so a future exhaustion costs a
+missing model and a log line, not a crash. The map-gen log line now
+prints vram/ram/phycont free alongside the heap.
 
 ## Room-streaming performance
 

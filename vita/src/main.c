@@ -45,7 +45,12 @@
 
 /* vitasdk newlib defaults to a 32 MB heap; rooms, collision and PCM
  * audio need far more. */
-unsigned int _newlib_heap_size_user = 220 * 1024 * 1024;
+/* 220 MB starved vitaGL's LPDDR pool to almost nothing, so every
+ * texture/VBO lived in CDRAM+PHYCONT (~118 MB); a heavy map load ran
+ * that dry and glBufferData began failing (the load-crash psp2cores).
+ * Observed newlib peak is ~97 MB (lazy sound decodes included); 176 MB
+ * keeps ~80 MB of slack and hands vitaGL a ~44 MB RAM fallback pool. */
+unsigned int _newlib_heap_size_user = 176 * 1024 * 1024;
 
 #define SCREEN_W 960
 #define SCREEN_H 544
@@ -53,7 +58,7 @@ unsigned int _newlib_heap_size_user = 220 * 1024 * 1024;
 
 #define DATA_ROOT "ux0:data/scpcb-ue"
 /* Shown in the debug HUD so a stale VPK install is instantly visible. */
-#define PORT_BUILD_TAG "fpsfix2"
+#define PORT_BUILD_TAG "ambgamma"
 
 /* Diagnostic switch: set to 1 to skip ALL video playback (boot clips
  * and intro). The diag2-novid device test proved the video player was
@@ -496,6 +501,43 @@ typedef struct {
     GLuint ibo;
 } BatchGL;
 
+/* Upload one batch's VBO/IBO with the OOM check vitaGL doesn't do
+ * for us: a failed glBufferData leaves the buffer's backing pointer
+ * NULL and the next draw of it memcpys from address 0 - the exact
+ * data-abort in the two device psp2cores (fault in
+ * _glDrawElements_FixedFunctionIMPL, r1=0, first drawItems after a
+ * map load exhausted the GPU pools). On failure the handles are
+ * deleted and zeroed so drawBatchSet skips the batch (a missing
+ * model instead of a crash), and the pool state is logged. */
+static int batchUploadFails;
+
+static int batchUpload(BatchGL *g, const SceneBatch *b) {
+    while (glGetError() != GL_NO_ERROR) { } /* clear stale flags */
+    glGenBuffers(1, &g->vbo);
+    glBindBuffer(GL_ARRAY_BUFFER, g->vbo);
+    glBufferData(GL_ARRAY_BUFFER,
+                 (GLsizeiptr)(b->vertexCount * sizeof(SceneVertex)),
+                 b->vertices, GL_STATIC_DRAW);
+    glGenBuffers(1, &g->ibo);
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, g->ibo);
+    glBufferData(GL_ELEMENT_ARRAY_BUFFER,
+                 (GLsizeiptr)(b->indexCount * sizeof(uint16_t)),
+                 b->indices, GL_STATIC_DRAW);
+    if (glGetError() != GL_NO_ERROR) {
+        if (g->vbo) glDeleteBuffers(1, &g->vbo);
+        if (g->ibo) glDeleteBuffers(1, &g->ibo);
+        g->vbo = g->ibo = 0;
+        batchUploadFails++;
+        plog("vbo OOM #%d (%u verts): vram=%uK ram=%uK phycont=%uK",
+             batchUploadFails, b->vertexCount,
+             (unsigned)(vglMemFree(VGL_MEM_VRAM) / 1024),
+             (unsigned)(vglMemFree(VGL_MEM_RAM) / 1024),
+             (unsigned)(vglMemFree(VGL_MEM_SLOW) / 1024));
+        return 0;
+    }
+    return 1;
+}
+
 #define MAX_ROOM_EMITTERS 6
 typedef struct {
     float x, y, z;    /* room-local raw units */
@@ -815,16 +857,7 @@ static int templateEnsureStep(int idx, int allowAsync) {
     if (end > rt->scene->batchCount) end = rt->scene->batchCount;
     for (; rt->vboDone < end; rt->vboDone++) {
         const SceneBatch *b = &rt->scene->batches[rt->vboDone];
-        glGenBuffers(1, &rt->gl[rt->vboDone].vbo);
-        glBindBuffer(GL_ARRAY_BUFFER, rt->gl[rt->vboDone].vbo);
-        glBufferData(GL_ARRAY_BUFFER,
-                     (GLsizeiptr)(b->vertexCount * sizeof(SceneVertex)),
-                     b->vertices, GL_STATIC_DRAW);
-        glGenBuffers(1, &rt->gl[rt->vboDone].ibo);
-        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, rt->gl[rt->vboDone].ibo);
-        glBufferData(GL_ELEMENT_ARRAY_BUFFER,
-                     (GLsizeiptr)(b->indexCount * sizeof(uint16_t)),
-                     b->indices, GL_STATIC_DRAW);
+        batchUpload(&rt->gl[rt->vboDone], b);
     }
     glBindBuffer(GL_ARRAY_BUFFER, 0);
     glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
@@ -1188,16 +1221,7 @@ static void buildIntroCell(void) {
         const SceneBatch *b = &introCellScene->batches[i];
         introCellGL[i].diffuse = textureGet(b->diffuseName);
         introCellGL[i].lightmap = textureGet(b->lightmapName);
-        glGenBuffers(1, &introCellGL[i].vbo);
-        glBindBuffer(GL_ARRAY_BUFFER, introCellGL[i].vbo);
-        glBufferData(GL_ARRAY_BUFFER,
-                     (GLsizeiptr)(b->vertexCount * sizeof(SceneVertex)),
-                     b->vertices, GL_STATIC_DRAW);
-        glGenBuffers(1, &introCellGL[i].ibo);
-        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, introCellGL[i].ibo);
-        glBufferData(GL_ELEMENT_ARRAY_BUFFER,
-                     (GLsizeiptr)(b->indexCount * sizeof(uint16_t)),
-                     b->indices, GL_STATIC_DRAW);
+        batchUpload(&introCellGL[i], b);
     }
     glBindBuffer(GL_ARRAY_BUFFER, 0);
     glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
@@ -1393,16 +1417,7 @@ static int buildPocketMesh(const char *path) {
         const SceneBatch *b = &sc->batches[i];
         gl[i].diffuse = textureGet(b->diffuseName);
         gl[i].lightmap = textureGet(b->lightmapName);
-        glGenBuffers(1, &gl[i].vbo);
-        glBindBuffer(GL_ARRAY_BUFFER, gl[i].vbo);
-        glBufferData(GL_ARRAY_BUFFER,
-                     (GLsizeiptr)(b->vertexCount * sizeof(SceneVertex)),
-                     b->vertices, GL_STATIC_DRAW);
-        glGenBuffers(1, &gl[i].ibo);
-        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, gl[i].ibo);
-        glBufferData(GL_ELEMENT_ARRAY_BUFFER,
-                     (GLsizeiptr)(b->indexCount * sizeof(uint16_t)),
-                     b->indices, GL_STATIC_DRAW);
+        batchUpload(&gl[i], b);
     }
     glBindBuffer(GL_ARRAY_BUFFER, 0);
     glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
@@ -1531,16 +1546,7 @@ static int buildMtMesh(const char *path) {
         const SceneBatch *b = &sc->batches[i];
         gl[i].diffuse = textureGet(b->diffuseName);
         gl[i].lightmap = textureGet(b->lightmapName);
-        glGenBuffers(1, &gl[i].vbo);
-        glBindBuffer(GL_ARRAY_BUFFER, gl[i].vbo);
-        glBufferData(GL_ARRAY_BUFFER,
-                     (GLsizeiptr)(b->vertexCount * sizeof(SceneVertex)),
-                     b->vertices, GL_STATIC_DRAW);
-        glGenBuffers(1, &gl[i].ibo);
-        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, gl[i].ibo);
-        glBufferData(GL_ELEMENT_ARRAY_BUFFER,
-                     (GLsizeiptr)(b->indexCount * sizeof(uint16_t)),
-                     b->indices, GL_STATIC_DRAW);
+        batchUpload(&gl[i], b);
     }
     glBindBuffer(GL_ARRAY_BUFFER, 0);
     glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
@@ -2596,9 +2602,13 @@ static void regenerateMap(uint32_t seed) {
         reset106();
         {
             struct mallinfo mi = mallinfo();
-            plog("map gen: seed %u rooms %u; heap used=%uK free=%uK",
+            plog("map gen: seed %u rooms %u; heap used=%uK free=%uK "
+                 "vram=%uK ram=%uK phycont=%uK",
                  mapSeed, map.roomCount, (unsigned)mi.uordblks / 1024,
-                 (unsigned)mi.fordblks / 1024);
+                 (unsigned)mi.fordblks / 1024,
+                 (unsigned)(vglMemFree(VGL_MEM_VRAM) / 1024),
+                 (unsigned)(vglMemFree(VGL_MEM_RAM) / 1024),
+                 (unsigned)(vglMemFree(VGL_MEM_SLOW) / 1024));
         }
         snprintf(statusLine, sizeof(statusLine), "map seed %u: %u rooms %u doors",
                  mapSeed, map.roomCount, doors.count);
@@ -2633,6 +2643,14 @@ static void setPerspective(void) {
 static float fogDistW = 6.0f;   /* me\CameraFogDist, world units */
 static float fogNearW = 0.1f;
 static float fogRGB[3] = { 5.0f / 255.0f, 5.0f / 255.0f, 5.0f / 255.0f };
+/* The room ambient term (source AmbientLightRooms: a flat texture
+ * cleared to CurrAmbientColor/3, added under the lightmap). Every
+ * room vertex colour in the shipped meshes is pure white (host scan),
+ * so a texenv CONSTANT reproduces the source composite exactly:
+ * colour = 2 * diffuse * (ambient + lightmap). Per-zone: LCZ
+ * 030030030, HCZ 030023023, EZ 023023030, eased like the fog. */
+static float ambEnv[4] = { 10.0f / 255.0f, 10.0f / 255.0f,
+                           10.0f / 255.0f, 1.0f };
 
 static void applyDebugState(void) {
     if (cullMode == 0) {
@@ -2678,7 +2696,17 @@ static void setLitMode(int lit) {
     if (litModeCur == lit) return;
     litModeCur = lit;
     if (lit) {
-        glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_ADD);
+        /* Unit 0: lightmap + the flat room-ambient constant (the
+         * source's AmbientLightRoomTex layer; vertex colours are all
+         * white so PRIMARY carries nothing the constant doesn't). */
+        glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_COMBINE);
+        glTexEnvi(GL_TEXTURE_ENV, GL_COMBINE_RGB, GL_ADD);
+        glTexEnvi(GL_TEXTURE_ENV, GL_SRC0_RGB, GL_TEXTURE);
+        glTexEnvi(GL_TEXTURE_ENV, GL_SRC1_RGB, GL_CONSTANT);
+        glTexEnvi(GL_TEXTURE_ENV, GL_COMBINE_ALPHA, GL_MODULATE);
+        glTexEnvi(GL_TEXTURE_ENV, GL_SRC0_ALPHA, GL_PRIMARY_COLOR);
+        glTexEnvi(GL_TEXTURE_ENV, GL_SRC1_ALPHA, GL_TEXTURE);
+        glTexEnvfv(GL_TEXTURE_ENV, GL_TEXTURE_ENV_COLOR, ambEnv);
         glActiveTexture(GL_TEXTURE1);
         glEnable(GL_TEXTURE_2D);
         glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_COMBINE);
@@ -2727,6 +2755,10 @@ static void drawBatchSet(const Scene *scene, const BatchGL *gl, int alphaPass) {
     for (uint32_t i = 0; i < scene->batchCount; i++) {
         const SceneBatch *b = &scene->batches[i];
         if (b->alphaClip != alphaPass) continue;
+        /* Batch whose upload hit GPU OOM (batchUpload zeroed it):
+         * drawing would bind buffer 0 and read client arrays from
+         * the raw offsets - address 0. Skip it. */
+        if (!gl[i].vbo || !gl[i].ibo) continue;
 
         glBindBuffer(GL_ARRAY_BUFFER, gl[i].vbo);
         glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, gl[i].ibo);
@@ -3139,16 +3171,7 @@ static void buildModelRT(ModelRT *rt, const char *name, float tw, float th,
         const SceneBatch *b = &rt->scene->batches[i];
         rt->gl[i].diffuse = textureGet(b->diffuseName);
         rt->gl[i].lightmap = 0;
-        glGenBuffers(1, &rt->gl[i].vbo);
-        glBindBuffer(GL_ARRAY_BUFFER, rt->gl[i].vbo);
-        glBufferData(GL_ARRAY_BUFFER,
-                     (GLsizeiptr)(b->vertexCount * sizeof(SceneVertex)),
-                     b->vertices, GL_STATIC_DRAW);
-        glGenBuffers(1, &rt->gl[i].ibo);
-        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, rt->gl[i].ibo);
-        glBufferData(GL_ELEMENT_ARRAY_BUFFER,
-                     (GLsizeiptr)(b->indexCount * sizeof(uint16_t)),
-                     b->indices, GL_STATIC_DRAW);
+        batchUpload(&rt->gl[i], b);
     }
     glBindBuffer(GL_ARRAY_BUFFER, 0);
     glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
@@ -6613,16 +6636,7 @@ static void chunkLoadMeshes(void) {
             const SceneBatch *bt = &sc->batches[b];
             gl[b].diffuse = textureGet(bt->diffuseName);
             gl[b].lightmap = textureGet(bt->lightmapName);
-            glGenBuffers(1, &gl[b].vbo);
-            glBindBuffer(GL_ARRAY_BUFFER, gl[b].vbo);
-            glBufferData(GL_ARRAY_BUFFER,
-                         (GLsizeiptr)(bt->vertexCount * sizeof(SceneVertex)),
-                         bt->vertices, GL_STATIC_DRAW);
-            glGenBuffers(1, &gl[b].ibo);
-            glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, gl[b].ibo);
-            glBufferData(GL_ELEMENT_ARRAY_BUFFER,
-                         (GLsizeiptr)(bt->indexCount * sizeof(uint16_t)),
-                         bt->indices, GL_STATIC_DRAW);
+            batchUpload(&gl[b], bt);
         }
         glBindBuffer(GL_ARRAY_BUFFER, 0);
         glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
@@ -6653,18 +6667,7 @@ static void chunkLoadMeshes(void) {
                 for (uint32_t b = 0; b < chunkPlaneScene->batchCount; b++) {
                     const SceneBatch *bt = &chunkPlaneScene->batches[b];
                     chunkPlaneGL[b].diffuse = textureGet(bt->diffuseName);
-                    glGenBuffers(1, &chunkPlaneGL[b].vbo);
-                    glBindBuffer(GL_ARRAY_BUFFER, chunkPlaneGL[b].vbo);
-                    glBufferData(GL_ARRAY_BUFFER,
-                                 (GLsizeiptr)(bt->vertexCount
-                                              * sizeof(SceneVertex)),
-                                 bt->vertices, GL_STATIC_DRAW);
-                    glGenBuffers(1, &chunkPlaneGL[b].ibo);
-                    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, chunkPlaneGL[b].ibo);
-                    glBufferData(GL_ELEMENT_ARRAY_BUFFER,
-                                 (GLsizeiptr)(bt->indexCount
-                                              * sizeof(uint16_t)),
-                                 bt->indices, GL_STATIC_DRAW);
+                    batchUpload(&chunkPlaneGL[b], bt);
                 }
                 glBindBuffer(GL_ARRAY_BUFFER, 0);
                 glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
@@ -9154,6 +9157,7 @@ static void oskStart(char *target, int cap, const char *title) {
 static float optMusicVol = 1.0f;
 static float optSfxVol = 1.0f;
 static float optLookSens = 1.0f;
+static float optGamma = 1.0f;   /* opt\ScreenGamma, slider 0..2 */
 static int optInvertY = 0;
 static int optSel;
 
@@ -9165,9 +9169,10 @@ static void optionsApply(void) {
 static void optionsSave(void) {
     FILE *f = fopen(OPTIONS_PATH, "w");
     if (!f) return;
-    fprintf(f, "music=%f\nsfx=%f\nsens=%f\ninverty=%d\nintro=%d\nstartup=%d\n",
+    fprintf(f, "music=%f\nsfx=%f\nsens=%f\ninverty=%d\nintro=%d\nstartup=%d\n"
+            "gamma=%f\n",
             optMusicVol, optSfxVol, optLookSens, optInvertY, introEnabled,
-            startupVideosEnabled);
+            startupVideosEnabled, optGamma);
     fclose(f);
 }
 
@@ -9188,12 +9193,15 @@ static void optionsLoad(void) {
             introEnabled = (int)strtol(line + 6, NULL, 10);
         } else if (strncmp(line, "startup=", 8) == 0) {
             startupVideosEnabled = (int)strtol(line + 8, NULL, 10);
+        } else if (strncmp(line, "gamma=", 6) == 0) {
+            optGamma = strtof(line + 6, NULL);
         }
     }
     fclose(f);
     if (optMusicVol < 0.0f || optMusicVol > 1.0f) optMusicVol = 1.0f;
     if (optSfxVol < 0.0f || optSfxVol > 1.0f) optSfxVol = 1.0f;
     if (optLookSens < 0.25f || optLookSens > 3.0f) optLookSens = 1.0f;
+    if (optGamma < 0.0f || optGamma > 2.0f) optGamma = 1.0f;
 }
 
 static GLuint menuBackTex, menuTitleTex, pausePanelTex, menu173Tex;
@@ -11018,44 +11026,87 @@ static void updateRoomEvents2(void) {
 /* Called each gameplay frame: swap the track when the zone changes. */
 /* UpdateZoneColor: fog colour and distance per zone and context (the
  * Main_Core FogColor* constants, "RRRGGGBBB" strings). */
+/* Blitz CurveValue at the nominal 60 fps tick. */
+static float curveValue(float target, float cur, float speed) {
+    return cur + (target - cur) / speed;
+}
+
 static void updateFogModel(void) {
     float r = 5.0f, g = 5.0f, b = 5.0f;     /* FogColorLCZ */
+    /* SetZoneColor's ambient argument defaults to AmbientColorLCZ, so
+     * every room-specific override keeps 030030030; only the zone
+     * fallback picks the HCZ/EZ tints. */
+    float ar = 30.0f, ag = 30.0f, ab = 30.0f;
     float dist = 6.0f, near = 0.1f;
     int zone = zoneAt(camPos);
-    if (zone == 2) { r = 7.0f; g = 2.0f; b = 2.0f; }        /* HCZ */
-    else if (zone == 3) { r = 7.0f; g = 7.0f; b = 12.0f; }  /* EZ */
+    if (zone == 2) { r = 7.0f; g = 2.0f; b = 2.0f;          /* HCZ */
+                     ag = ab = 23.0f; }
+    else if (zone == 3) { r = 7.0f; g = 7.0f; b = 12.0f;    /* EZ */
+                          ar = ag = 23.0f; }
     const char *nm = NULL;
     int cell = playerRoomLookup(camPos);
     if (cell >= 0) nm = tplList.items[map.rooms[cell].templateIndex].name;
+    int inForest = 0;
     if (introPhase >= 0 || inIntroBounds(camPos[0], camPos[2])) {
         /* IsOutSide includes cont1_173_intro: white, far fog. */
         r = g = b = 255.0f;
         dist = 60.0f;
         near = 5.0f;
+        ar = ag = ab = 30.0f;
     } else if (inPocket) {
         r = g = b = 0.0f;                     /* FogColorPD */
+        ar = ag = ab = 30.0f;
     } else if (inMask) {
         r = 96.0f; g = 97.0f; b = 104.0f;     /* FogColorDimension_1499 */
         dist = 80.0f;
         near = 40.0f;
+        ar = ag = ab = 30.0f;
     } else if (nm && !strcmp(nm, "cont2_860_1")) {
         r = 98.0f; g = 133.0f; b = 162.0f;    /* FogColorForest */
         dist = 8.0f;
+        ar = ag = ab = 30.0f;
+        inForest = 1;
     } else if (nm && (!strcmp(nm, "gate_a") || !strcmp(nm, "gate_b"))) {
         r = g = b = 255.0f;                   /* FogColorOutside */
         dist = 60.0f;
         near = 5.0f;
+        ar = ag = ab = 30.0f;
     } else if (nm && !strcmp(nm, "room3_storage")
                && camPos[1] < -4100.0f) {
         r = 2.0f; g = 7.0f; b = 0.0f;         /* FogColorStorageTunnels */
+        ar = ag = ab = 30.0f;
     } else if (ecBlackout) {
         dist = 4.0f;                          /* 6.0 - 2.0 * IsBlackOut */
     }
-    fogRGB[0] = r / 255.0f;
-    fogRGB[1] = g / 255.0f;
-    fogRGB[2] = b / 255.0f;
+    /* The source eases both colours (CurveValue, speed 50) so zone
+     * crossings blend instead of snapping. */
+    static float fogSm[3] = { 5.0f, 5.0f, 5.0f };
+    static float ambSm[3] = { 30.0f, 30.0f, 30.0f };
+    fogSm[0] = curveValue(r, fogSm[0], 50.0f);
+    fogSm[1] = curveValue(g, fogSm[1], 50.0f);
+    fogSm[2] = curveValue(b, fogSm[2], 50.0f);
+    ambSm[0] = curveValue(ar, ambSm[0], 50.0f);
+    ambSm[1] = curveValue(ag, ambSm[1], 50.0f);
+    ambSm[2] = curveValue(ab, ambSm[2], 50.0f);
+    fogRGB[0] = fogSm[0] / 255.0f;
+    fogRGB[1] = fogSm[1] / 255.0f;
+    fogRGB[2] = fogSm[2] / 255.0f;
     fogDistW = dist;
     fogNearW = near;
+    /* UpdateZoneColor's post-smoothing multipliers, then the room
+     * term is CurrAmbient/3 (AmbientLightRooms fills the ambient
+     * texture with a third of the entity ambient). */
+    float cr = ambSm[0], cg = ambSm[1], cb = ambSm[2];
+    if (wearNVG == 1) { cr *= 3.0f; cg *= 6.0f; cb *= 3.0f; }
+    else if (wearNVG == 2) { cr *= 3.0f; cg *= 3.0f; cb *= 6.0f; }
+    else if (inForest) { cr = cg = cb = 200.0f; }
+    if (cr > 255.0f) cr = 255.0f;
+    if (cg > 255.0f) cg = 255.0f;
+    if (cb > 255.0f) cb = 255.0f;
+    ambEnv[0] = cr / 3.0f / 255.0f;
+    ambEnv[1] = cg / 3.0f / 255.0f;
+    ambEnv[2] = cb / 3.0f / 255.0f;
+    ambEnv[3] = 1.0f;
 }
 
 static void updateZoneMusic(void) {
@@ -12350,6 +12401,35 @@ static void drawTexQuad(float x, float y, float w, float h, GLuint tex,
     drawQuad(x, y, w, h, tex, 1.0f, 1.0f, 1.0f, alpha);
 }
 
+/* Graphics_Core RenderGamma, as blend math instead of buffer copies:
+ * above 1.0 the source re-adds the frame scaled by (gamma - 1)
+ * (frame * gamma, saturating); below 1.0 it multiplies the frame by a
+ * gray of 255 * gamma. dst-colour blends do both without a copy.
+ * Runs over the finished frame like the source (called right before
+ * the swap, inside the HUD 2D state). */
+static void drawScreenGamma(void) {
+    if (optGamma > 0.99f && optGamma < 1.01f) return;
+    GLfloat verts[12] = { 0, 0, SCREEN_W, 0, SCREEN_W, SCREEN_H,
+                          0, 0, SCREEN_W, SCREEN_H, 0, SCREEN_H };
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+    glDisable(GL_TEXTURE_2D);
+    glEnable(GL_BLEND);
+    if (optGamma > 1.0f) {
+        float k = optGamma - 1.0f;
+        glBlendFunc(GL_DST_COLOR, GL_ONE);        /* dst * (1 + k) */
+        glColor4f(k, k, k, 1.0f);
+    } else {
+        glBlendFunc(GL_ZERO, GL_SRC_COLOR);       /* dst * gamma */
+        glColor4f(optGamma, optGamma, optGamma, 1.0f);
+    }
+    glVertexPointer(2, GL_FLOAT, 0, verts);
+    glDrawArrays(GL_TRIANGLES, 0, 6);
+    glDisable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    glEnable(GL_TEXTURE_2D);
+    glColor4f(1, 1, 1, 1);
+}
+
 /* Icon plus a segmented bar like the game's blink/stamina meters. */
 static void drawMeter(float x, float y, GLuint icon, GLuint seg,
                       float fraction) {
@@ -13230,7 +13310,7 @@ static void loadGameTab(void) {
 
 /* ---- OPTIONS tab ---- */
 
-#define OPT_ROWS 5
+#define OPT_ROWS 6
 
 static void optionsTab(void) {
     const float SX = MENU_SX, SY = MENU_SY;
@@ -13250,14 +13330,15 @@ static void optionsTab(void) {
             float ry = y + (30.0f + i * 55.0f) * SY;
             if (!tapIn(x, ry - 10.0f, 580.0f * SX, 34.0f)) continue;
             optSel = i;
-            if (i < 2) {
+            if (i < 2 || i == 5) {
                 /* Tap sets the slider position directly. */
                 float frac = (menuTapX - (x + 330.0f * SX))
                            / (150.0f * SX);
                 if (frac < 0.0f) frac = 0.0f;
                 if (frac > 1.0f) frac = 1.0f;
                 if (i == 0) optMusicVol = frac;
-                else optSfxVol = frac;
+                else if (i == 1) optSfxVol = frac;
+                else optGamma = frac * 2.0f;
                 optionsApply();
             } else if (i == 3) {
                 optInvertY = !optInvertY;
@@ -13294,6 +13375,11 @@ static void optionsTab(void) {
             case 4:
                 startupVideosEnabled = !startupVideosEnabled;
                 break;
+            case 5:
+                optGamma += d * 0.1f;
+                if (optGamma < 0.0f) optGamma = 0.0f;
+                if (optGamma > 2.0f) optGamma = 2.0f;
+                break;
         }
     }
     if (inputHit(ACTION_INTERACT)) {
@@ -13312,11 +13398,11 @@ static void optionsTab(void) {
     }
 
     drawTabHeader("OPTIONS", optSel == backIdx);
-    drawFrame(x, y, 580.0f * SX, 310.0f * SY, 0);
+    drawFrame(x, y, 580.0f * SX, 365.0f * SY, 0);
 
     const char *labels[OPT_ROWS] = {
         "Music volume", "Sound volume", "Look sensitivity", "Invert Y axis",
-        "Startup videos",
+        "Startup videos", "Screen gamma",
     };
     for (int i = 0; i < OPT_ROWS; i++) {
         float ry = y + (30.0f + i * 55.0f) * SY;
@@ -13333,21 +13419,24 @@ static void optionsTab(void) {
             snprintf(val, sizeof(val), "< %.2fx >", optLookSens);
         } else if (i == 3) {
             snprintf(val, sizeof(val), "< %s >", optInvertY ? "ON" : "OFF");
-        } else {
+        } else if (i == 4) {
             snprintf(val, sizeof(val), "< %s >",
                      startupVideosEnabled ? "ON" : "OFF");
+        } else {
+            snprintf(val, sizeof(val), "< %.2f >", optGamma);
         }
         mtext(x + 330.0f * SX, ry, 1.5f, g, g, g, val);
         /* Volume sliders like the game's option bars. */
-        if (i < 2) {
-            float frac = i == 0 ? optMusicVol : optSfxVol;
+        if (i < 2 || i == 5) {
+            float frac = i == 0 ? optMusicVol
+                       : i == 1 ? optSfxVol : optGamma * 0.5f;
             drawQuad(x + 330.0f * SX, ry + 16.0f, 150.0f * SX, 6, 0, 0.25f,
                      0.25f, 0.25f, 1.0f);
             drawQuad(x + 330.0f * SX, ry + 16.0f, 150.0f * SX * frac, 6, 0,
                      0.85f, 0.85f, 0.85f, 1.0f);
         }
     }
-    mtext(x + 24.0f * SX, y + 310.0f * SY + 10.0f, 1.5f, 0.5f, 0.5f, 0.5f,
+    mtext(x + 24.0f * SX, y + 365.0f * SY + 10.0f, 1.5f, 0.5f, 0.5f, 0.5f,
           "left/right: adjust   O: back");
 }
 
@@ -13856,6 +13945,7 @@ int main(void) {
             glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
             beginHud2D();
             menuFrame(&running);
+            drawScreenGamma(); /* the source runs RenderGamma over menus too */
             endHud2D();
             vglSwapBuffers(GL_FALSE);
             continue;
@@ -14917,6 +15007,7 @@ int main(void) {
         if (blinkFrames > 0 && !invOpen && !pauseOpen && deathTimer == 0) {
             drawQuad(0, 0, SCREEN_W, SCREEN_H, 0, 0.0f, 0.0f, 0.0f, 1.0f);
         }
+        drawScreenGamma();
         glEnableClientState(GL_COLOR_ARRAY);
         glEnableClientState(GL_TEXTURE_COORD_ARRAY);
         glEnable(GL_DEPTH_TEST);
