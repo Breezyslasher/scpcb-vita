@@ -53,7 +53,7 @@ unsigned int _newlib_heap_size_user = 220 * 1024 * 1024;
 
 #define DATA_ROOT "ux0:data/scpcb-ue"
 /* Shown in the debug HUD so a stale VPK install is instantly visible. */
-#define PORT_BUILD_TAG "lm1pass"
+#define PORT_BUILD_TAG "deathmenu"
 
 /* Diagnostic switch: set to 1 to skip ALL video playback (boot clips
  * and intro). The diag2-novid device test proved the video player was
@@ -2218,6 +2218,98 @@ static int npc173SpotTimer;     /* horror-sting cooldown (n\LastSeen) */
 static float npc173LastDist = 1e9f;
 static float npc173WanderYawDeg;
 static int deathTimer;          /* >0: death screen counting down */
+static int deathMenuOpen;       /* the source's post-death report menu */
+static int deathMenuNoLoad;     /* permadeath: the save is gone */
+static int deathSel;
+static char deathReport[640];
+
+/* The mortuary reports ship in Data/local.ini's [death] section; look a
+ * key up there (source GetLocalString("death", key)). Returns NULL when
+ * absent. The file is read once. */
+static const char *deathString(const char *key) {
+    static char *sect;
+    static int loaded;
+    if (!loaded) {
+        loaded = 1;
+        FILE *f = fopen(DATA_ROOT "/Data/local.ini", "rb");
+        if (f) {
+            fseek(f, 0, SEEK_END);
+            long sz = ftell(f);
+            fseek(f, 0, SEEK_SET);
+            char *all = (char *)malloc((size_t)sz + 1);
+            if (all && fread(all, 1, (size_t)sz, f) == (size_t)sz) {
+                all[sz] = '\0';
+                char *d = strstr(all, "[death]");
+                if (d) {
+                    char *end = strchr(d + 1, '[');
+                    if (end) *end = '\0';
+                    sect = strdup(d);
+                }
+            }
+            free(all);
+            fclose(f);
+        }
+    }
+    if (!sect) return NULL;
+    static char val[512];
+    char pat[64];
+    snprintf(pat, sizeof(pat), "\n%s = ", key);
+    char *hit = strstr(sect, pat);
+    if (!hit) return NULL;
+    hit += strlen(pat);
+    size_t n = strcspn(hit, "\r\n");
+    if (n >= sizeof(val)) n = sizeof(val) - 1;
+    memcpy(val, hit, n);
+    val[n] = '\0';
+    return val;
+}
+
+/* Build the report for the port's deathCause (the source formats the
+ * matching [death] line with "Subject D-9341"). */
+static void deathBuildReport(void) {
+    static const struct { const char *cause, *key; } MAP[] = {
+        { "SCP-173", "173.default" },
+        { "THE GUARDS", "guard.173" },
+        { "SCP-106", "106.dimension" },
+        { "THE POCKET DIMENSION", "106.dimension" },
+        { "SCP-096", "096" },
+        { "SCP-049", "049" },
+        { "SCP-049-2", "0492killed" },
+        { "SCP-939", "939" },
+        { "SCP-966", "966" },
+        { "SCP-860-1", "860" },
+        { "A TESLA GATE", "tesla" },
+        { "SCP-205", "205" },
+        { "SCP-035", "035.default" },
+        { "THE PEOPLE OF SCP-1499", "1499.dimension" },
+        { "SCP-008", "008" },
+        { "SCP-1499", "1499" },
+        { "SCP-914", "914" },
+        { "SCP-012", "012" },
+        { "SCP-895", "895" },
+    };
+    const char *fmt = NULL;
+    for (unsigned i = 0; i < sizeof(MAP) / sizeof(MAP[0]); i++) {
+        if (strcmp(deathCause, MAP[i].cause) == 0) {
+            fmt = deathString(MAP[i].key);
+            break;
+        }
+    }
+    const char *subject = "Subject D-9341"; /* local.ini misc.subject */
+    if (!fmt) {
+        snprintf(deathReport, sizeof(deathReport),
+                 "%s found dead in [DATA REDACTED]. "
+                 "Cause of death: [DATA REDACTED].", subject);
+        return;
+    }
+    const char *ph = strstr(fmt, "%s");
+    if (ph) {
+        snprintf(deathReport, sizeof(deathReport), "%.*s%s%s",
+                 (int)(ph - fmt), fmt, subject, ph + 2);
+    } else {
+        snprintf(deathReport, sizeof(deathReport), "%s", fmt);
+    }
+}
 
 
 static void reset173(void);
@@ -11439,7 +11531,39 @@ int main(void) {
             prewarmSpawnArea(); /* mop up what the video time missed */
         }
 
-        if (haveData && inputHit(ACTION_MENU)) {
+        if (deathMenuOpen) {
+            menuPollTap();
+            if (inputHit(ACTION_SAVE) && deathSel > 0) deathSel--;
+            if (inputDpadDownHit() && deathSel < 1) deathSel++;
+            if (deathMenuNoLoad) deathSel = 1;
+            int dact = inputHit(ACTION_INTERACT) ? deathSel : -1;
+            float dw = 660.0f, dbx = (SCREEN_W - dw) * 0.5f;
+            float dby = SCREEN_H * 0.5f + 116.0f;
+            for (int i = 0; menuTapped && i < 2; i++) {
+                if (tapIn(dbx + 20.0f + i * 320.0f, dby, 300.0f, 54.0f)) {
+                    deathSel = i;
+                    dact = i;
+                }
+            }
+            if (dact == 0 && !deathMenuNoLoad) {
+                if (loadGame()) {
+                    deathMenuOpen = 0;
+                    deathTimer = 0;
+                    snprintf(toastMsg, sizeof(toastMsg), "GAME LOADED");
+                    toastTimer = 150;
+                } else {
+                    snprintf(toastMsg, sizeof(toastMsg), "NO SAVE FOUND");
+                    toastTimer = 150;
+                }
+            } else if (dact == 1) {
+                deathMenuOpen = 0;
+                deathTimer = 0;
+                worldReady = 0;
+                enterMenu();
+                continue;
+            }
+        }
+        if (haveData && inputHit(ACTION_MENU) && !deathMenuOpen) {
             pauseOpen = !pauseOpen;
             if (pauseOpen) {
                 invOpen = 0;
@@ -11818,22 +11942,27 @@ int main(void) {
             itemSpin += 1.0f;
             if (itemSpin >= 360.0f) itemSpin -= 360.0f;
         }
-        if (deathTimer > 0) {
+        if (deathTimer > 1) {
             deathTimer--;
-            if (deathTimer == 0) {
+            if (deathTimer == 1) {
+                /* The source opens the pause menu in its "dead" state
+                 * once the kill anim ends: the mortuary report plus
+                 * Load Game / Quit (no respawn). Holding deathTimer at
+                 * 1 keeps every gameplay system frozen behind it. */
+                deathBuildReport();
+                deathMenuOpen = 1;
+                deathSel = 0;
+                deathMenuNoLoad = 0;
+                audioStopMusic();
                 if (DIFFICULTIES[gameDiff].saveType >= SAVE_ON_QUIT) {
-                    /* One life (Keter and up): the run and its save are
-                     * gone; back to the main menu. */
+                    /* One life (Keter and up): the save is gone. */
                     char sp[256];
                     currentSavePath(sp, sizeof(sp));
                     remove(sp);
-                    worldReady = 0;
-                    enterMenu();
-                    snprintf(toastMsg, sizeof(toastMsg),
-                             "YOU DIED - GAME OVER");
-                    toastTimer = 240;
-                    continue;
+                    deathMenuNoLoad = 1;
                 }
+            }
+            if (0) { /* (the old auto-respawn, retired) */
                 if (introPhase >= 0) {
                     introPhase = -1;
                     gameMusicStart();
@@ -12299,12 +12428,35 @@ int main(void) {
             float red = t < 0.2f ? (0.2f - t) * 2.5f : 0.0f;
             drawQuad(0, 0, SCREEN_W, SCREEN_H, 0, red, 0.0f, 0.0f,
                      0.35f + 0.65f * t);
-            glPushMatrix();
-            glScalef(3.0f, 3.0f, 1.0f);
-            glColor4f(0.8f, 0.1f, 0.1f, 1.0f);
-            drawText(SCREEN_W / 6.0f - 34.0f, SCREEN_H / 6.0f, "YOU DIED");
-            glColor4f(1, 1, 1, 1);
-            glPopMatrix();
+            if (!deathMenuOpen) {
+                glPushMatrix();
+                glScalef(3.0f, 3.0f, 1.0f);
+                glColor4f(0.8f, 0.1f, 0.1f, 1.0f);
+                drawText(SCREEN_W / 6.0f - 34.0f, SCREEN_H / 6.0f,
+                         "YOU DIED");
+                glColor4f(1, 1, 1, 1);
+                glPopMatrix();
+            } else {
+                /* The source's post-death report: the [death] entry for
+                 * the killer, then Load Game / Quit to Menu. */
+                float dw = 660.0f, dh = 330.0f;
+                float dx = (SCREEN_W - dw) * 0.5f;
+                float dy = (SCREEN_H - dh) * 0.5f - 40.0f;
+                drawFrame(dx, dy, dw, dh, 0);
+                mtextC(SCREEN_W * 0.5f, dy + 22.0f, 2.4f, 0.85f, 0.12f,
+                       0.12f, "GAME OVER");
+                mtextWrap(dx + 26.0f, dy + 64.0f, dw - 52.0f, 1.3f,
+                          deathReport);
+                float dby = SCREEN_H * 0.5f + 116.0f;
+                drawFrame(dx + 20.0f, dby, 300.0f, 54.0f,
+                          deathSel == 0 && !deathMenuNoLoad);
+                float lg = deathMenuNoLoad ? 0.35f : 1.0f;
+                mtextC(dx + 170.0f, dby + 20.0f, 1.7f, lg, lg, lg,
+                       "LOAD GAME");
+                drawFrame(dx + 340.0f, dby, 300.0f, 54.0f, deathSel == 1);
+                mtextC(dx + 490.0f, dby + 20.0f, 1.7f, 1, 1, 1,
+                       "QUIT TO MENU");
+            }
         }
 
         /* Chamber lights cut before the breach. */

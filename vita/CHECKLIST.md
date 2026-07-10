@@ -27,6 +27,7 @@ Updated as features land. States: **done** / **partial** / **missing**.
 | Feature | Status | Notes |
 | --- | --- | --- |
 | Movement, sprint, crouch, stamina, blink | done | Source metrics |
+| Death screen / game-over menu | done | The source's post-death flow: the fade holds, then the mortuary report for the killer (read from Data/local.ini's [death] section, formatted with "Subject D-9341" - 173/guards/106/096/049/049-2/939/966/860/tesla/205/035/1499/008/914/012/895 all mapped, [DATA REDACTED] fallback otherwise) with LOAD GAME / QUIT TO MENU. No auto-respawn (the source has none); on Keter+ the save is deleted and only QUIT remains |
 | Lean | missing | D-pad left/right taken by inventory/menus |
 | Health (injuries/bloodloss/sanity) | done | Damage adds injuries that bleed into bloodloss (fatal at 100, warning vignette + HUD bar); first aid clots it; sanity drains in the dark / pocket dimension / near 106 and distorts the view when low. No 008 zombie infection / vomit yet |
 | Save types per difficulty | partial | Save-anywhere / save-on-quit / no-saves honored; Euclid's save-on-screens saves anywhere (no monitor interaction) |
