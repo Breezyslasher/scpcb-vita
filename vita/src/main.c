@@ -53,7 +53,7 @@ unsigned int _newlib_heap_size_user = 220 * 1024 * 1024;
 
 #define DATA_ROOT "ux0:data/scpcb-ue"
 /* Shown in the debug HUD so a stale VPK install is instantly visible. */
-#define PORT_BUILD_TAG "pcseed2"
+#define PORT_BUILD_TAG "fpsfix2"
 
 /* Diagnostic switch: set to 1 to skip ALL video playback (boot clips
  * and intro). The diag2-novid device test proved the video player was
@@ -2512,6 +2512,8 @@ static void spawn205(void);
 static void spawn914(void);
 static void spawn035(void);
 
+static int chunkReady;  /* 1499 chunk layout derived for this seed */
+
 static void regenerateMap(uint32_t seed) {
     memset(roomVisited, 0, sizeof(roomVisited));
     currentMusicZone = -1;
@@ -2552,6 +2554,9 @@ static void regenerateMap(uint32_t seed) {
      * right after a death-menu LOAD GAME. */
     activeCount = 0;
     eventHumansClear();
+    /* The 1499 chunk yaws/CHUNKDATA are drawn from the map seed;
+     * re-derive them on the next mask entry (meshes stay cached). */
+    chunkReady = 0;
     mapFree(&map);
     doorsFree(&doors);
     mapSeed = seed;
@@ -2662,7 +2667,51 @@ static int drawCallsFrame, drawCallsShown;
 static unsigned blurUsFrame, skinUsFrame;
 static unsigned blurUsShown, skinUsShown;
 
+/* Cached multitexture blend mode for the batch renderer.
+ * 0 = plain single-texture modulate; 1 = lit (lightmap ADDed on unit
+ * 0, diffuse COMBINE x2 on unit 1). vitaGL re-derives its ffp shader
+ * whenever texenv state is touched, so this must switch only on
+ * transitions, never per batch. */
+static int litModeCur = -1;
+
+static void setLitMode(int lit) {
+    if (litModeCur == lit) return;
+    litModeCur = lit;
+    if (lit) {
+        glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_ADD);
+        glActiveTexture(GL_TEXTURE1);
+        glEnable(GL_TEXTURE_2D);
+        glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_COMBINE);
+        glTexEnvi(GL_TEXTURE_ENV, GL_COMBINE_RGB, GL_MODULATE);
+        glTexEnvi(GL_TEXTURE_ENV, GL_SRC0_RGB, GL_PREVIOUS);
+        glTexEnvi(GL_TEXTURE_ENV, GL_SRC1_RGB, GL_TEXTURE);
+        glTexEnvf(GL_TEXTURE_ENV, GL_RGB_SCALE, 2.0f);
+        glTexEnvi(GL_TEXTURE_ENV, GL_COMBINE_ALPHA, GL_REPLACE);
+        glTexEnvi(GL_TEXTURE_ENV, GL_SRC0_ALPHA, GL_PREVIOUS);
+        glActiveTexture(GL_TEXTURE0);
+        glClientActiveTexture(GL_TEXTURE1);
+        glEnableClientState(GL_TEXTURE_COORD_ARRAY);
+        glClientActiveTexture(GL_TEXTURE0);
+    } else {
+        glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_MODULATE);
+        glActiveTexture(GL_TEXTURE1);
+        glDisable(GL_TEXTURE_2D);
+        glTexEnvf(GL_TEXTURE_ENV, GL_RGB_SCALE, 1.0f);
+        glActiveTexture(GL_TEXTURE0);
+        glClientActiveTexture(GL_TEXTURE1);
+        glDisableClientState(GL_TEXTURE_COORD_ARRAY);
+        glClientActiveTexture(GL_TEXTURE0);
+    }
+}
+
+/* Back to plain state for everything that draws outside the batch
+ * renderer (skinned NPCs, decals, HUD). */
+static void batchBlendReset(void) {
+    setLitMode(0);
+}
+
 static void drawBatchSet(const Scene *scene, const BatchGL *gl, int alphaPass) {
+    int tex0Off = 0;
     if (!alphaPass) {
         /* Backface-cull the opaque room geometry: measured CCW-outward
          * across the shipped meshes (floor-normal and signed-volume
@@ -2687,40 +2736,29 @@ static void drawBatchSet(const Scene *scene, const BatchGL *gl, int alphaPass) {
         GLuint diffuse = gl[i].diffuse;
         GLuint lightmap = alphaPass ? 0 : gl[i].lightmap;
         if (lightmap && diffuse) {
-            /* The source composite (Map_Core: TextureBlend 3 on the
-             * _lm layer, TextureBlend 5 on the diffuse):
-             *   2 * diffuse * (vertex ambient + lightmap)
-             * in one pass: unit 0 ADDs the lightmap onto the baked
-             * vertex colour, unit 1 modulates by the diffuse doubled
-             * (COMBINE with RGB_SCALE 2). */
-            glEnable(GL_TEXTURE_2D);
+            /* The source composite (2 * diffuse * (ambient + lm)) -
+             * see setLitMode. Only pointers/bindings per batch; the
+             * texenv state switches ONLY on lit/unlit transitions
+             * (vitaGL re-derives its ffp shader on every texenv
+             * touch, and doing that per batch cost ~1 ms per draw
+             * call - the post-fogblend fps regression). */
+            setLitMode(1);
             glBindTexture(GL_TEXTURE_2D, lightmap);
-            glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_ADD);
             glTexCoordPointer(2, GL_FLOAT, sizeof(SceneVertex), VTX_OFF(lu));
             glActiveTexture(GL_TEXTURE1);
-            glEnable(GL_TEXTURE_2D);
             glBindTexture(GL_TEXTURE_2D, diffuse);
-            glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_COMBINE);
-            glTexEnvi(GL_TEXTURE_ENV, GL_COMBINE_RGB, GL_MODULATE);
-            glTexEnvi(GL_TEXTURE_ENV, GL_SRC0_RGB, GL_PREVIOUS);
-            glTexEnvi(GL_TEXTURE_ENV, GL_SRC1_RGB, GL_TEXTURE);
-            glTexEnvf(GL_TEXTURE_ENV, GL_RGB_SCALE, 2.0f);
-            glTexEnvi(GL_TEXTURE_ENV, GL_COMBINE_ALPHA, GL_REPLACE);
-            glTexEnvi(GL_TEXTURE_ENV, GL_SRC0_ALPHA, GL_PREVIOUS);
+            glActiveTexture(GL_TEXTURE0);
             glClientActiveTexture(GL_TEXTURE1);
-            glEnableClientState(GL_TEXTURE_COORD_ARRAY);
             glTexCoordPointer(2, GL_FLOAT, sizeof(SceneVertex), VTX_OFF(du));
             glClientActiveTexture(GL_TEXTURE0);
-            glActiveTexture(GL_TEXTURE0);
         } else if (diffuse) {
-            glEnable(GL_TEXTURE_2D);
+            setLitMode(0);
             glBindTexture(GL_TEXTURE_2D, diffuse);
-            glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_MODULATE);
             glTexCoordPointer(2, GL_FLOAT, sizeof(SceneVertex), VTX_OFF(du));
-            lightmap = 0;
         } else {
+            setLitMode(0);
             glDisable(GL_TEXTURE_2D);
-            lightmap = 0;
+            tex0Off = 1;
         }
         if (alphaPass) {
             /* The game alpha-blends these surfaces with the texture's
@@ -2735,16 +2773,9 @@ static void drawBatchSet(const Scene *scene, const BatchGL *gl, int alphaPass) {
         drawCallsFrame++;
         glDrawElements(GL_TRIANGLES, (GLsizei)b->indexCount,
                        GL_UNSIGNED_SHORT, NULL);
-        if (lightmap) {
-            glActiveTexture(GL_TEXTURE1);
-            glDisable(GL_TEXTURE_2D);
-            glTexEnvf(GL_TEXTURE_ENV, GL_RGB_SCALE, 1.0f);
-            glClientActiveTexture(GL_TEXTURE1);
-            glDisableClientState(GL_TEXTURE_COORD_ARRAY);
-            glClientActiveTexture(GL_TEXTURE0);
-            glActiveTexture(GL_TEXTURE0);
-            /* Unit 0 back to plain modulate for everything else. */
-            glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_MODULATE);
+        if (tex0Off) {
+            glEnable(GL_TEXTURE_2D);
+            tex0Off = 0;
         }
         if (alphaPass) {
             glDisable(GL_ALPHA_TEST);
@@ -6461,6 +6492,309 @@ static void mask1499Place(int k, float x, float z, int type, float yaw) {
     npc1499Active[k] = 1;
 }
 
+/* ---- SCP-1499 chunk streets (Map_Core CHUNKDATA/CreateChunkParts +
+ * Data/1499chunks.jsonc): outside the arrival church, the dimension
+ * is an endless seeded city - 40-world-unit cells, each stamped with
+ * one of the JSON chunk layouts (1-3 building meshes + the ground
+ * plane). CHUNKDATA and the per-object random yaws are drawn from the
+ * map seed exactly like the source (both reseed with
+ * GenerateSeedNumber). Collision is approximated: a flat floor plus a
+ * cylinder push per building. ---- */
+#define CHUNK_WU 10240.0f            /* 40 world units in raw */
+#define CHUNK_OBJ_MAX 16
+#define CHUNK_TYPE_MAX 8
+#define CHUNK_PART_MAX 4
+
+static struct {
+    Scene *scene;
+    BatchGL *gl;
+    float radius;                    /* push cylinder */
+} chunkObj[CHUNK_OBJ_MAX];
+static Scene *chunkPlaneScene;
+static BatchGL *chunkPlaneGL;
+
+typedef struct {
+    int id;
+    float x, z;                      /* world units within the cell */
+    float yaw;
+    int randYaw;
+} ChunkPartDef;
+static ChunkPartDef chunkPart[CHUNK_TYPE_MAX][CHUNK_PART_MAX];
+static int chunkPartCount[CHUNK_TYPE_MAX];
+static int chunkTypeCount;
+static unsigned char chunkData1499[4096];
+/* chunkReady is declared above regenerateMap (it resets per seed) */
+
+/* Minimal reader for the fixed shape of 1499chunks.jsonc. */
+static void chunkParseJson(void) {
+    chunkTypeCount = 0;
+    FILE *f = fopen(DATA_ROOT "/Data/1499chunks.jsonc", "rb");
+    if (!f) return;
+    fseek(f, 0, SEEK_END);
+    long len = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    char *buf = (char *)malloc((size_t)len + 1);
+    if (!buf) { fclose(f); return; }
+    fread(buf, 1, (size_t)len, f);
+    buf[len] = '\0';
+    fclose(f);
+    /* Strip // comments. */
+    for (char *p = buf; *p; p++) {
+        if (p[0] == '/' && p[1] == '/') {
+            while (*p && *p != '\n') *p++ = ' ';
+            if (!*p) break;
+        }
+    }
+    const char *p = buf;
+    int type = -1;
+    while ((p = strstr(p, "\"id\"")) != NULL) {
+        /* A new chunk begins when this object's "id" follows an
+         * "objects" keyword closer than the previous id. */
+        const char *back = p;
+        int newChunk = 0;
+        for (int k = 0; k < 200 && back > buf; k++) {
+            back--;
+            if (!strncmp(back, "\"objects\"", 9)) { newChunk = 1; break; }
+            if (!strncmp(back, "\"yaw\"", 5)) break;
+        }
+        if (newChunk) {
+            type++;
+            if (type >= CHUNK_TYPE_MAX) break;
+            chunkPartCount[type] = 0;
+        }
+        if (type < 0) { p += 4; continue; }
+        ChunkPartDef *d = NULL;
+        if (chunkPartCount[type] < CHUNK_PART_MAX) {
+            d = &chunkPart[type][chunkPartCount[type]++];
+        }
+        int id = atoi(strchr(p, ':') + 1);
+        const char *px = strstr(p, "\"x\"");
+        const char *pz = strstr(p, "\"z\"");
+        const char *py = strstr(p, "\"yaw\"");
+        if (d && px && pz && py) {
+            d->id = id;
+            d->x = (float)atoi(strchr(px, ':') + 1);
+            d->z = (float)atoi(strchr(pz, ':') + 1);
+            const char *v = strchr(py, ':') + 1;
+            while (*v == ' ' || *v == '\t') v++;
+            if (!strncmp(v, "null", 4)) {
+                d->randYaw = 1;
+                d->yaw = 0.0f;
+            } else {
+                d->randYaw = 0;
+                d->yaw = (float)atoi(v);
+            }
+        } else if (d) {
+            chunkPartCount[type]--;
+        }
+        p = py ? py + 5 : p + 4;
+    }
+    chunkTypeCount = type + 1;
+    free(buf);
+}
+
+static void chunkLoadMeshes(void) {
+    static int loaded;
+    if (loaded) return;
+    loaded = 1;
+    char path[256], err[128];
+    for (int i = 1; i < CHUNK_OBJ_MAX; i++) {
+        snprintf(path, sizeof(path), MAP_DIR
+                 "/dimension1499/dimension_1499_object(%d).rmesh", i);
+        RMesh *mesh = rmeshLoadFile(path, err, sizeof(err));
+        if (!mesh) continue;
+        Scene *sc = sceneBuild(mesh);
+        rmeshFree(mesh);
+        if (!sc) continue;
+        BatchGL *gl = (BatchGL *)calloc(sc->batchCount ? sc->batchCount : 1,
+                                        sizeof(BatchGL));
+        if (!gl) { sceneFree(sc); continue; }
+        for (uint32_t b = 0; b < sc->batchCount; b++) {
+            const SceneBatch *bt = &sc->batches[b];
+            gl[b].diffuse = textureGet(bt->diffuseName);
+            gl[b].lightmap = textureGet(bt->lightmapName);
+            glGenBuffers(1, &gl[b].vbo);
+            glBindBuffer(GL_ARRAY_BUFFER, gl[b].vbo);
+            glBufferData(GL_ARRAY_BUFFER,
+                         (GLsizeiptr)(bt->vertexCount * sizeof(SceneVertex)),
+                         bt->vertices, GL_STATIC_DRAW);
+            glGenBuffers(1, &gl[b].ibo);
+            glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, gl[b].ibo);
+            glBufferData(GL_ELEMENT_ARRAY_BUFFER,
+                         (GLsizeiptr)(bt->indexCount * sizeof(uint16_t)),
+                         bt->indices, GL_STATIC_DRAW);
+        }
+        glBindBuffer(GL_ARRAY_BUFFER, 0);
+        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
+        chunkObj[i].scene = sc;
+        chunkObj[i].gl = gl;
+        float ex = sc->boundsMax[0] - sc->boundsMin[0];
+        float ez = sc->boundsMax[2] - sc->boundsMin[2];
+        float r = (ex < ez ? ex : ez) * 0.35f;
+        if (r < 60.0f) r = 60.0f;
+        if (r > 1400.0f) r = 1400.0f;
+        chunkObj[i].radius = r;
+    }
+    /* The ground platform (1499plane.b3d). */
+    B3DModel *plane = b3dLoadFile(MAP_DIR "/dimension1499/1499plane.b3d",
+                                  err, sizeof(err));
+    if (plane) {
+        RMesh empty;
+        memset(&empty, 0, sizeof(empty));
+        chunkPlaneScene = sceneBuild(&empty);
+        if (chunkPlaneScene) {
+            float pos[3] = { 0, 0, 0 }, euler[3] = { 0, 0, 0 };
+            float scl[3] = { 1, 1, 1 };
+            sceneAppendB3D(chunkPlaneScene, plane, pos, euler, scl, NULL);
+            chunkPlaneGL = (BatchGL *)calloc(
+                chunkPlaneScene->batchCount ? chunkPlaneScene->batchCount : 1,
+                sizeof(BatchGL));
+            if (chunkPlaneGL) {
+                for (uint32_t b = 0; b < chunkPlaneScene->batchCount; b++) {
+                    const SceneBatch *bt = &chunkPlaneScene->batches[b];
+                    chunkPlaneGL[b].diffuse = textureGet(bt->diffuseName);
+                    glGenBuffers(1, &chunkPlaneGL[b].vbo);
+                    glBindBuffer(GL_ARRAY_BUFFER, chunkPlaneGL[b].vbo);
+                    glBufferData(GL_ARRAY_BUFFER,
+                                 (GLsizeiptr)(bt->vertexCount
+                                              * sizeof(SceneVertex)),
+                                 bt->vertices, GL_STATIC_DRAW);
+                    glGenBuffers(1, &chunkPlaneGL[b].ibo);
+                    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, chunkPlaneGL[b].ibo);
+                    glBufferData(GL_ELEMENT_ARRAY_BUFFER,
+                                 (GLsizeiptr)(bt->indexCount
+                                              * sizeof(uint16_t)),
+                                 bt->indices, GL_STATIC_DRAW);
+                }
+                glBindBuffer(GL_ARRAY_BUFFER, 0);
+                glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
+            }
+        }
+        b3dFree(plane);
+    }
+}
+
+static void chunkEnsure(void) {
+    if (chunkReady) return;
+    chunkReady = 1;
+    chunkParseJson();
+    if (chunkTypeCount <= 0) return;
+    chunkLoadMeshes();
+    /* CreateChunkParts: reseeded; one Rnd(360) per null-yaw object,
+     * chunks then objects in file order. */
+    mapSeedRnd((int32_t)mapSeed);
+    for (int t = 0; t < chunkTypeCount; t++) {
+        for (int j = 0; j < chunkPartCount[t]; j++) {
+            if (chunkPart[t][j].randYaw) {
+                chunkPart[t][j].yaw = mapRandFloat(0.0f, 360.0f);
+            }
+        }
+    }
+    /* SetChunkDataValues: reseeded; the source's exact 2-step fill
+     * (cells it never writes stay 0 = chunk0). */
+    memset(chunkData1499, 0, sizeof(chunkData1499));
+    mapSeedRnd((int32_t)mapSeed);
+    for (int i = 0; i <= 62; i += 2) {
+        for (int j = 0; j <= 62; j += 2) {
+            chunkData1499[i + j * 64] =
+                (unsigned char)mapRandInt(0, chunkTypeCount - 1);
+            chunkData1499[(i + 1) + (j + 1) * 64] =
+                (unsigned char)mapRandInt(0, chunkTypeCount - 1);
+        }
+    }
+}
+
+/* Chunk type of the 40-unit cell whose corner is at (xw, zw) world
+ * units - the source's CHUNKDATA index formula. */
+static int chunkTypeAt(float xw, float zw) {
+    int a = (int)((xw + 32.0f) / 40.0f) % 64;
+    int b = (int)((zw + 32.0f) / 40.0f) % 64;
+    if (a < 0) a = -a;
+    if (b < 0) b = -b;
+    return chunkData1499[a + b * 64];
+}
+
+/* The arrival church occupies its own cell (the source's spawn
+ * chunk). */
+static int chunkIsSpawnCell(float cx, float cz) {
+    float ox = MASK_GX * ROOM_SPACING, oz = MASK_GY * ROOM_SPACING;
+    return fabsf(cx + CHUNK_WU * 0.5f - ox) < CHUNK_WU * 0.75f
+        && fabsf(cz + CHUNK_WU * 0.5f - oz) < CHUNK_WU * 0.75f;
+}
+
+static void drawChunks(const float viewPos[3], int alphaPass) {
+    if (!inMask || !chunkReady || chunkTypeCount <= 0) return;
+    float range = fogDistW * 256.0f + CHUNK_WU;
+    int cx0 = (int)floorf((viewPos[0] - range) / CHUNK_WU);
+    int cx1 = (int)floorf((viewPos[0] + range) / CHUNK_WU);
+    int cz0 = (int)floorf((viewPos[2] - range) / CHUNK_WU);
+    int cz1 = (int)floorf((viewPos[2] + range) / CHUNK_WU);
+    for (int cz = cz0; cz <= cz1; cz++) {
+        for (int cx = cx0; cx <= cx1; cx++) {
+            float wx = (float)cx * CHUNK_WU, wz = (float)cz * CHUNK_WU;
+            float ccx = wx + CHUNK_WU * 0.5f, ccz = wz + CHUNK_WU * 0.5f;
+            float dx = ccx - viewPos[0], dz = ccz - viewPos[2];
+            if (dx * dx + dz * dz > range * range) continue;
+            if (chunkIsSpawnCell(wx, wz)) continue;
+            int t = chunkTypeAt(wx / 256.0f, wz / 256.0f);
+            if (t >= chunkTypeCount) t = 0;
+            if (!alphaPass && chunkPlaneScene && chunkPlaneGL) {
+                glPushMatrix();
+                glTranslatef(ccx, 0.0f, ccz);
+                drawBatchSet(chunkPlaneScene, chunkPlaneGL, 0);
+                glPopMatrix();
+            }
+            for (int j = 0; j < chunkPartCount[t]; j++) {
+                const ChunkPartDef *d = &chunkPart[t][j];
+                if (d->id < 0 || d->id >= CHUNK_OBJ_MAX
+                    || !chunkObj[d->id].scene) {
+                    continue;
+                }
+                glPushMatrix();
+                glTranslatef(ccx + d->x * 256.0f, 0.0f,
+                             ccz + d->z * 256.0f);
+                glRotatef(-d->yaw, 0.0f, 1.0f, 0.0f);
+                drawBatchSet(chunkObj[d->id].scene, chunkObj[d->id].gl,
+                             alphaPass);
+                glPopMatrix();
+            }
+        }
+    }
+}
+
+/* Cylinder-push the player out of the chunk buildings (approximated
+ * collision; the source uses full mesh collision). */
+static void chunkCollide(float pos[3], float radius) {
+    if (!inMask || !chunkReady || chunkTypeCount <= 0) return;
+    int pcx = (int)floorf(pos[0] / CHUNK_WU);
+    int pcz = (int)floorf(pos[2] / CHUNK_WU);
+    for (int cz = pcz - 1; cz <= pcz + 1; cz++) {
+        for (int cx = pcx - 1; cx <= pcx + 1; cx++) {
+            float wx = (float)cx * CHUNK_WU, wz = (float)cz * CHUNK_WU;
+            if (chunkIsSpawnCell(wx, wz)) continue;
+            int t = chunkTypeAt(wx / 256.0f, wz / 256.0f);
+            if (t >= chunkTypeCount) t = 0;
+            float ccx = wx + CHUNK_WU * 0.5f, ccz = wz + CHUNK_WU * 0.5f;
+            for (int j = 0; j < chunkPartCount[t]; j++) {
+                const ChunkPartDef *d = &chunkPart[t][j];
+                if (d->id < 0 || d->id >= CHUNK_OBJ_MAX
+                    || !chunkObj[d->id].scene) {
+                    continue;
+                }
+                float bx = ccx + d->x * 256.0f, bz = ccz + d->z * 256.0f;
+                float ddx = pos[0] - bx, ddz = pos[2] - bz;
+                float r = chunkObj[d->id].radius + radius;
+                float d2 = ddx * ddx + ddz * ddz;
+                if (d2 < r * r && d2 > 1.0f) {
+                    float dd = sqrtf(d2);
+                    pos[0] = bx + ddx / dd * r;
+                    pos[2] = bz + ddz / dd * r;
+                }
+            }
+        }
+    }
+}
+
 static void enterMaskDimension(void) {
     if (maskRoomIdx < 0 || !skin1499) return;
     maskReturn[0] = camPos[0];
@@ -6478,6 +6812,7 @@ static void enterMaskDimension(void) {
     camPitch = 0.0f;
     velY = 0.0f;
     inMask = 1;
+    chunkEnsure();     /* the seeded city outside the church */
     blinkFrames = 20;
     blinkTimer = 100.0f;
     npc1499Count = 0;
@@ -14144,9 +14479,17 @@ int main(void) {
             pushWorld(camPos, PLAYER_RADIUS, &pushedUp);
             doorsCollide(&doors, camPos, PLAYER_RADIUS);
             collide860Trees(camPos);
+            chunkCollide(camPos, PLAYER_RADIUS);
 
             float hitY;
-            if (rayDownWorld(camPos, eye + STEP_SLACK, &hitY)) {
+            int onGround = rayDownWorld(camPos, eye + STEP_SLACK, &hitY);
+            /* Beyond the church there is no room geometry; the 1499
+             * city stands on its ground plane at y = 0. */
+            if (!onGround && inMask && chunkReady) {
+                hitY = 0.0f;
+                onGround = 1;
+            }
+            if (onGround) {
                 float target = hitY + eye;
                 if (camPos[1] <= target) {
                     /* Landing after a long drop hurts (the game's
@@ -14249,10 +14592,12 @@ int main(void) {
             }
             drawMtMaze(0);
             drawPocketComposite(0);
+            drawChunks(camPos, 0);
             decalsDraw();
             drawDoors(camPos);
             drawFixtures(camPos);
             camerasDraw(camPos);
+            batchBlendReset();
             drawMonitors(camPos);
             draw079(camPos);
             draw895(camPos);
@@ -14296,6 +14641,8 @@ int main(void) {
             }
             drawMtMaze(1);
             drawPocketComposite(1);
+            drawChunks(camPos, 1);
+            batchBlendReset();
             drawScreenBlur();
         }
 
