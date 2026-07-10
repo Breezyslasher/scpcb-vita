@@ -964,6 +964,7 @@ enum {
     EV_789J,          /* the butt ghost in the EZ toilets */
     EV_EZ_GUARD,      /* dead guard in the EZ hall */
     EV_MEDIBAY,       /* medibay corpse + pickups */
+    EV_SHAFT,         /* the dead guard in the elevator shaft */
     EV_SL,            /* Dr. L's server-room lockdown */
     EV_STORAGE1,      /* room1_storage cameo */
     EV_ROOM4_IC,      /* room4_ic corpse */
@@ -9016,6 +9017,7 @@ static void spawnZombieAtWorld(float x, float y, float z) {
 #define EVSND(path) audioLoad(SFX_DIR path)
 
 static int ambienceSound(int id); /* defined with the ambience system */
+static void drawModelRTTinted(const ModelRT *rt, GLuint texOverride);
 
 /* Room-local -> world (the same transform as doors/items). */
 static void evLocal(const RoomPlacement *p, float x, float y, float z,
@@ -9260,7 +9262,7 @@ static void updateRoomEvents2(void) {
                 case EV_IC_CORPSE:
                     if (inRoom) {
                         evLocal(p, -1200.0f, 51.0f, 0.0f, w);
-                        decalSpawn(DECAL_BLOOD_2, w[0], w[1] - 50.0f,
+                        decalSpawn(DECAL_BLOOD_1 + 1, w[0], w[1] - 50.0f,
                                    w[2], 90.0f, (float)(rand() % 360),
                                    0.0f, 128.0f, 1.0f, 0);
                         evCorpse(p, 0, "Gonzales.png", -1200.0f, 51.0f,
@@ -9422,7 +9424,7 @@ static void updateRoomEvents2(void) {
                             np[0] = (signed char)evCorpse(p, 1, NULL,
                                 1322.0f, 52.0f, 491.0f, 90.0f, 287.0f);
                             evLocal(p, 1322.0f, 2.0f, 491.0f, w);
-                            decalSpawn(DECAL_BLOOD_2, w[0], w[1] + 0.5f,
+                            decalSpawn(DECAL_BLOOD_1 + 1, w[0], w[1] + 0.5f,
                                        w[2], 90.0f, (float)(rand() % 360),
                                        0.0f, 77.0f, 1.0f, 0);
                             st[0] = 1.0f;
@@ -9865,7 +9867,7 @@ static void updateRoomEvents2(void) {
                             damageFlash = 0.8f;
                             lightBlinkT = 5.0f;
                             bloodloss += 26.0f;
-                            decalSpawn(DECAL_BLOOD_2, camPos[0], 0.5f,
+                            decalSpawn(DECAL_BLOOD_1 + 1, camPos[0], 0.5f,
                                        camPos[2], 90.0f,
                                        (float)(rand() % 360), 0.0f,
                                        190.0f, 0.9f, 0);
