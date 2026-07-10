@@ -103,3 +103,23 @@ jobs:
           name: scpcb-ue-vita-elf
           path: vita/build/scpcb_ue_vita*
           if-no-files-found: error
+
+      # Prints function/line info for psp2core text-segment offsets
+      # listed in vita/tools/crash_offsets.txt (one hex offset per
+      # line, relative to segments[0].vaddr from the dump's module
+      # info). Read the result in this step's log.
+      - name: Symbolicate crash offsets
+        run: |
+          ELF=vita/build/scpcb_ue_vita
+          LIST=vita/tools/crash_offsets.txt
+          [ -f "$LIST" ] || { echo "no crash_offsets.txt"; exit 0; }
+          BASE=$(arm-vita-eabi-readelf -l "$ELF" \
+                 | awk '/LOAD/{print strtonum($3); exit}')
+          echo "link base: $(printf 0x%x "$BASE")"
+          while read -r off; do
+            [ -n "$off" ] || continue
+            addr=$(( BASE + off ))
+            echo "== offset $off (addr $(printf 0x%x "$addr")) =="
+            arm-vita-eabi-addr2line -f -C -i -e "$ELF" \
+              "$(printf 0x%x "$addr")"
+          done < "$LIST"
