@@ -999,6 +999,7 @@ static int remoteDoorOn;         /* room2c_ec's remote door control */
 static int ecBlackout;           /* the electrical centre lights are cut */
 static void eventHumansClear(void);
 static int introEnabled;   /* defined with the options block */
+static float npc106SeedMinutes; /* tentative; defined with the 106 system */
 static float camShake;          /* decays; jitters the view rotation */
 static float cameraZoom;         /* FOV narrowing (deg) - 106's dread pulse */
 static float blurAmount;         /* 0..1 screen blur (me\BlurVolume) */
@@ -1797,6 +1798,165 @@ static void buildMtMaze(void) {
         mtArrive[2] = mtInst[0].wz;
     }
 }
+
+/* World<->tile-local for a 90-degree-rotated MT tile (render does
+ * glTranslate(w) then glRotatef(-yaw*90), matching the room transform). */
+static void mtToLocal(const MtInstance *in, const float w[3], float l[3]) {
+    float dx = w[0] - in->wx, dz = w[2] - in->wz;
+    switch (in->yaw & 3) {
+        case 0: l[0] = dx;  l[2] = dz;  break;
+        case 1: l[0] = dz;  l[2] = -dx; break;
+        case 2: l[0] = -dx; l[2] = -dz; break;
+        case 3: l[0] = -dz; l[2] = dx;  break;
+    }
+    l[1] = w[1];
+}
+
+static void mtToWorld(const MtInstance *in, const float l[3], float w[3]) {
+    float x = 0.0f, z = 0.0f;
+    switch (in->yaw & 3) {
+        case 0: x = l[0];  z = l[2];  break;
+        case 1: x = -l[2]; z = l[0];  break;
+        case 2: x = -l[0]; z = -l[2]; break;
+        case 3: x = l[2];  z = -l[0]; break;
+    }
+    w[0] = x + in->wx;
+    w[1] = l[1];
+    w[2] = z + in->wz;
+}
+
+static void appendPocketRoom(void) {
+    pdRoomIdx = -1;
+    int tplIdx = -1;
+    for (uint32_t i = 0; i < tplList.count; i++) {
+        if (strcmp(tplList.items[i].name, "dimension_106") == 0) {
+            tplIdx = (int)i;
+            break;
+        }
+    }
+    if (tplIdx < 0) return;
+    RoomPlacement *grown = (RoomPlacement *)realloc(
+        map.rooms, (map.roomCount + 1) * sizeof(RoomPlacement));
+    if (!grown) return;
+    map.rooms = grown;
+    RoomPlacement *p = &map.rooms[map.roomCount];
+    p->templateIndex = tplIdx;
+    p->gridX = PD_GX;
+    p->gridY = PD_GY;
+    p->angle = 0;
+    pdRoomIdx = (int)map.roomCount;
+    map.roomCount++;
+    buildPocketComposite();
+}
+
+/* The pocket-dimension labyrinth doors (Rooms_Core dimension_106, the
+ * "For i = 0 To 9 / Select" block the door extractor skips because the
+ * coordinates come from loop variables). Ten KEY_005 DEFAULT_DOORs at
+ * fixed local offsets - x = xTemp, y = 2574, z = 32 + zTemp in raw
+ * units - placed with the same room transform as every other
+ * dimension_106 door. Call after spawnRoomDoors (which runs after
+ * doorsGenerate resets the list). */
+static void spawnPocketLabyrinthDoors(void) {
+    if (pdRoomIdx < 0) return;
+    static const struct { float x, z, ang; } PD_LABYRINTH[10] = {
+        { 5187.0f, 2555.0f, 180.0f }, { 5521.0f, 1673.0f, 180.0f },
+        { 9128.0f, 2192.0f, 180.0f }, { 8523.0f, 1760.0f, 180.0f },
+        { 9880.0f, 1244.0f, 180.0f }, { 5299.0f,  392.0f,  90.0f },
+        { 7807.0f, 1291.0f,  90.0f }, { 8196.0f, 1436.0f,  90.0f },
+        { 8143.0f,  392.0f,  90.0f }, { 9709.0f,  920.0f,  90.0f },
+    };
+    const RoomPlacement *p = &map.rooms[pdRoomIdx];
+    for (int i = 0; i < 10; i++) {
+        float local[3] = { PD_LABYRINTH[i].x, 2574.0f, PD_LABYRINTH[i].z };
+        float w[3];
+        localToWorld(p, local, w);
+        int a = (int)(PD_LABYRINTH[i].ang / 90.0f + 0.5f) * 90 + p->angle * 90;
+        a = ((a % 360) + 360) % 360;
+        doorsAddInternal(&doors, w[0], w[1], w[2], a, 0, 0, 0, 0, 0, 0);
+    }
+}
+
+static void appendMaskRoom(void) {
+    maskRoomIdx = -1;
+    int tplIdx = -1;
+    for (uint32_t i = 0; i < tplList.count; i++) {
+        if (strcmp(tplList.items[i].name, "dimension_1499") == 0) {
+            tplIdx = (int)i;
+            break;
+        }
+    }
+    if (tplIdx < 0) return;
+    RoomPlacement *grown = (RoomPlacement *)realloc(
+        map.rooms, (map.roomCount + 1) * sizeof(RoomPlacement));
+    if (!grown) return;
+    map.rooms = grown;
+    RoomPlacement *p = &map.rooms[map.roomCount];
+    p->templateIndex = tplIdx;
+    p->gridX = MASK_GX;
+    p->gridY = MASK_GY;
+    p->angle = 0;
+    maskRoomIdx = (int)map.roomCount;
+    map.roomCount++;
+}
+
+/* Append the gate_a / gate_b surface rooms off-grid and give each a
+ * return elevator, and record the facility gate-entrance landings, so
+ * the entrance elevators actually travel to the surfaces. Call after the
+ * grid doors are generated (it appends internal elevator doors). */
+static void appendGateRooms(void) {
+    gateARoomIdx = gateBRoomIdx = -1;
+    gateADoor = gateBDoor = -1;
+    struct { const char *name; int gx, gy; int *idx, *door; } G[2] = {
+        { "gate_a", GATEA_GX, GATEA_GY, &gateARoomIdx, &gateADoor },
+        { "gate_b", GATEB_GX, GATEB_GY, &gateBRoomIdx, &gateBDoor },
+    };
+    for (int g = 0; g < 2; g++) {
+        int tplIdx = -1;
+        for (uint32_t i = 0; i < tplList.count; i++) {
+            if (strcmp(tplList.items[i].name, G[g].name) == 0) {
+                tplIdx = (int)i;
+                break;
+            }
+        }
+        if (tplIdx < 0) continue;
+        RoomPlacement *grown = (RoomPlacement *)realloc(
+            map.rooms, (map.roomCount + 1) * sizeof(RoomPlacement));
+        if (!grown) return;
+        map.rooms = grown;
+        RoomPlacement *p = &map.rooms[map.roomCount];
+        p->templateIndex = tplIdx;
+        p->gridX = G[g].gx;
+        p->gridY = G[g].gy;
+        p->angle = 0;
+        *G[g].idx = (int)map.roomCount;
+        map.roomCount++;
+        /* A call elevator on the surface, to ride back. */
+        doorsAddInternal(&doors, G[g].gx * ROOM_SPACING, 0.0f,
+                         G[g].gy * ROOM_SPACING, 0, 1, 0, 0, 0, 0, 0);
+        *G[g].door = (int)doors.count - 1;
+    }
+    /* Facility landings (the entrance rooms are force-placed). */
+    gateAEntrOK = gateBEntrOK = 0;
+    for (uint32_t i = 0; i < map.roomCount; i++) {
+        const char *nm = tplList.items[map.rooms[i].templateIndex].name;
+        if (!gateAEntrOK && strcmp(nm, "gate_a_entrance") == 0) {
+            gateAEntr[0] = map.rooms[i].gridX * ROOM_SPACING;
+            gateAEntr[1] = 0.0f;
+            gateAEntr[2] = map.rooms[i].gridY * ROOM_SPACING;
+            gateAEntrOK = 1;
+        }
+        if (!gateBEntrOK && strcmp(nm, "gate_b_entrance") == 0) {
+            gateBEntr[0] = map.rooms[i].gridX * ROOM_SPACING;
+            gateBEntr[1] = 0.0f;
+            gateBEntr[2] = map.rooms[i].gridY * ROOM_SPACING;
+            gateBEntrOK = 1;
+        }
+    }
+}
+
+/* Build the maintenance-tunnel overlay, give it a return elevator, and
+ * record the facility room2_mt landing so those cars ride to it and
+ * back. Call after the grid doors are generated. */
 
 static void setupMaintenanceTunnel(void) {
     buildMtMaze();
@@ -6540,7 +6700,9 @@ static void spawn860(void) {
     npc860Pos[0] = ox - 850.0f + ((float)px + 0.5f) * (1700.0f / FGRID);
     npc860Pos[2] = oz - 850.0f + 0.5f * (1700.0f / FGRID);
     npc860Pos[1] = 0.0f;
-    /* Stand a tree on every off-path cell. */
+    /* Stand a tree on every off-path cell (cosmetic jitter from a
+     * local stream; the maze itself is the seeded source grid). */
+    uint32_t rng = mapSeed ^ 0x8601860Bu;
     float cell = 1700.0f / FGRID;
     for (int j = 0; j < FGRID && tree860Count < MAX_TREES; j++) {
         for (int i = 0; i < FGRID && tree860Count < MAX_TREES; i++) {
