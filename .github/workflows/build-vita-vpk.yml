@@ -113,8 +113,8 @@ jobs:
           ELF=vita/build/scpcb_ue_vita
           LIST=vita/tools/crash_offsets.txt
           [ -f "$LIST" ] || { echo "no crash_offsets.txt"; exit 0; }
-          BASE=$(arm-vita-eabi-readelf -l "$ELF" \
-                 | awk '/LOAD/{print strtonum($3); exit}')
+          BASE=$(( $(arm-vita-eabi-readelf -l "$ELF" \
+                     | awk '/LOAD/{print $3; exit}') ))
           echo "link base: $(printf 0x%x "$BASE")"
           while read -r off; do
             [ -n "$off" ] || continue
