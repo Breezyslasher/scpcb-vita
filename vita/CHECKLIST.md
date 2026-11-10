@@ -179,6 +179,23 @@ the device never runs a PNG/JPG decoder for them. Requires re-running
 the package-data job and reinstalling the data (~90 MB larger raw);
 old PNG data still works, just slower.
 
+## Screen read-backs (the SCP-106 slowdown)
+
+The per-5-second `perf` line in render_log.txt showed normal play at
+43-60 fps but ~12 fps whenever SCP-106 was near, with alternate frames
+at ~130-180 ms: the screen blur copied the whole frame into a texture
+every other frame. vitaGL implements glCopyTexImage2D as a glReadPixels
+into a temporary buffer plus a texture upload; moving to its block-copy
+path only took the call from ~175 ms to ~135 ms, and the 256x256
+monitor-feed copy cost ~40 ms each, so the read-back itself is the
+cost. Both now render straight into a texture through a framebuffer
+object (the feed as before but into its own target; the blur re-draws
+rooms, tunnels and doors from the player's view into a 256x256 target
+every other frame). If the FBO is not complete on the device the old
+copy path is used and render_log.txt says so. Not yet seen on hardware:
+the feed/blur orientation through the FBO, and the blur source now
+lacks NPCs and items.
+
 ## Chirality (the mirrored-world fix)
 
 Blitz3D data is left-handed; the port drew it verbatim through a

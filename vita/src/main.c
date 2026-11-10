@@ -53,7 +53,7 @@ unsigned int _newlib_heap_size_user = 220 * 1024 * 1024;
 
 #define DATA_ROOT "ux0:data/scpcb-ue"
 /* Shown in the debug HUD so a stale VPK install is instantly visible. */
-#define PORT_BUILD_TAG "fps5"
+#define PORT_BUILD_TAG "fps6"
 
 /* Diagnostic switch: set to 1 to skip ALL video playback (boot clips
  * and intro). The diag2-novid device test proved the video player was
@@ -11662,6 +11662,68 @@ static void copyBackbufferTo(GLuint tex, int *allocated, int w, int h) {
     glCopyTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 0, 0, w, h);
 }
 
+/* A small render target for the monitor feed and the blur source.
+ * Reading the backbuffer back is the expensive part on this hardware
+ * whatever the format (device profile: ~40 ms for the 256x256 feed
+ * copy, ~135 ms for the full screen even on the block-copy path), so
+ * these render straight into a texture through a framebuffer object
+ * instead. vitaGL gives an FBO its own depth surface on first use. If
+ * the FBO does not come up complete the target falls back to the old
+ * render-into-a-corner-and-copy path, and says so in the log. */
+typedef struct {
+    GLuint tex, fbo;
+    int state;      /* 0 untried, 1 FBO, -1 copy fallback */
+    int alloc;      /* texture storage exists */
+} SceneRT;
+
+static int rtBegin(SceneRT *rt, int w, int h) {
+    if (!rt->tex) {
+        glGenTextures(1, &rt->tex);
+        glBindTexture(GL_TEXTURE_2D, rt->tex);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    }
+    if (!rt->alloc) {
+        void *zero = calloc((size_t)w * (size_t)h, 4);
+        glBindTexture(GL_TEXTURE_2D, rt->tex);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0, GL_RGBA,
+                     GL_UNSIGNED_BYTE, zero);
+        free(zero);
+        rt->alloc = 1;
+    }
+    if (rt->state == 0) {
+        glGenFramebuffers(1, &rt->fbo);
+        glBindFramebuffer(GL_FRAMEBUFFER, rt->fbo);
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                               GL_TEXTURE_2D, rt->tex, 0);
+        int ok = rt->fbo
+              && glCheckFramebufferStatus(GL_FRAMEBUFFER)
+                 == GL_FRAMEBUFFER_COMPLETE;
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);
+        rt->state = ok ? 1 : -1;
+        plog("render target %dx%d: %s", w, h,
+             ok ? "framebuffer object" : "FBO incomplete, copy fallback");
+    }
+    if (rt->state == 1) {
+        glBindFramebuffer(GL_FRAMEBUFFER, rt->fbo);
+        return 1;
+    }
+    return 0;
+}
+
+static void rtEnd(SceneRT *rt, int w, int h) {
+    if (rt->state == 1) {
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    } else {
+        glBindTexture(GL_TEXTURE_2D, rt->tex);
+        glCopyTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 0, 0, w, h);
+    }
+}
+
+static SceneRT monFeedRT, blurRT;
+
 /* Render the nearest Screen camera's view into monFeedTex. Draws the
  * scene into a MON_FEED_SIZE corner of the backbuffer (pointed from the
  * camera toward the player, a security-cam-watching-the-occupant view),
@@ -11706,6 +11768,7 @@ static void renderCameraFeed(void) {
     float yaw = atan2f(dx, -dz) * (180.0f / 3.14159265f);
     float pitch = atan2f(-dy, horiz) * (180.0f / 3.14159265f);
 
+    rtBegin(&monFeedRT, MON_FEED_SIZE, MON_FEED_SIZE);
     glViewport(0, 0, MON_FEED_SIZE, MON_FEED_SIZE);
     glEnable(GL_SCISSOR_TEST);
     glScissor(0, 0, MON_FEED_SIZE, MON_FEED_SIZE);
@@ -11732,20 +11795,60 @@ static void renderCameraFeed(void) {
     float feedEye[3] = { c->x, eyeY, c->z };
     draw205(feedEye);
 
-    if (!monFeedTex) {
-        glGenTextures(1, &monFeedTex);
-        glBindTexture(GL_TEXTURE_2D, monFeedTex);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-    }
-    static int monFeedAlloc;
-    copyBackbufferTo(monFeedTex, &monFeedAlloc, MON_FEED_SIZE,
-                     MON_FEED_SIZE);
     glDisable(GL_SCISSOR_TEST);
+    rtEnd(&monFeedRT, MON_FEED_SIZE, MON_FEED_SIZE);
+    monFeedTex = monFeedRT.tex;
     glViewport(0, 0, SCREEN_W, SCREEN_H);
     monFeedActive = 1;
+}
+
+/* The blur's smear source, without a read-back: while the blur is up,
+ * the room geometry is re-drawn from the player's own view into a small
+ * render target every other frame, before the main clear. The low
+ * resolution stretched over the screen is itself soft, which is what a
+ * smear source wants. Only rooms, tunnels and doors go in (no NPCs or
+ * items). Returns silently when the target has no FBO - drawScreenBlur
+ * then uses the full-screen copy as before. */
+#define BLUR_RT_SIZE 256
+static int blurRTFresh;      /* the FBO source holds a usable image */
+
+static void renderBlurSource(void) {
+    if (blurAmount <= 0.02f || !worldReady || activeCount == 0) {
+        blurRTFresh = 0;
+        return;
+    }
+    static int tick;
+    if (blurRTFresh && ((tick++) & 1)) return;
+    if (!rtBegin(&blurRT, BLUR_RT_SIZE, BLUR_RT_SIZE)) return;
+    glViewport(0, 0, BLUR_RT_SIZE, BLUR_RT_SIZE);
+    glClearColor(fogRGB[0], fogRGB[1], fogRGB[2], 1.0f);
+    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+    glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+    setPerspective();
+    applyDebugState();
+    glMatrixMode(GL_MODELVIEW);
+    glLoadIdentity();
+    glScalef(-1.0f, 1.0f, 1.0f);
+    glRotatef(camPitch * 180.0f / 3.14159265f, 1, 0, 0);
+    glRotatef(camYaw * 180.0f / 3.14159265f, 0, 1, 0);
+    glTranslatef(-camPos[0], -camPos[1], -camPos[2]);
+    glEnable(GL_DEPTH_TEST);
+    glColor4f(1, 1, 1, 1);
+    float cullFx = sinf(camYaw), cullFz = -cosf(camYaw);
+    float fogCull = fogDistW * 256.0f + 1700.0f;
+    for (int i = 0; i < activeCount; i++) {
+        float rdx = activeRooms[i]->gridX * ROOM_SPACING - camPos[0];
+        float rdz = activeRooms[i]->gridY * ROOM_SPACING - camPos[2];
+        if (rdx * cullFx + rdz * cullFz < -ROOM_SPACING) continue;
+        if (fogOn && rdx * rdx + rdz * rdz > fogCull * fogCull) continue;
+        drawRoomBatches(activeRooms[i], 0);
+    }
+    drawMtMaze(0);
+    drawPocketComposite(0);
+    drawDoors(camPos);
+    rtEnd(&blurRT, BLUR_RT_SIZE, BLUR_RT_SIZE);
+    glViewport(0, 0, SCREEN_W, SCREEN_H);
+    blurRTFresh = 1;
 }
 
 /* Draw the monitor props; the active one shows the live feed, the rest a
@@ -12489,27 +12592,33 @@ static void drawScreenBlur(void) {
     if (blurAmount <= 0.02f) return;
     uint64_t t0 = sceKernelGetProcessTimeWide();
     float amt = blurAmount > 0.9f ? 0.9f : blurAmount;
-    int firstUse = !blurTex;
-    if (!blurTex) {
-        glGenTextures(1, &blurTex);
-        glBindTexture(GL_TEXTURE_2D, blurTex);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-    }
-    /* The full-screen copy stalls the GPU pipeline; refreshing the
-     * smear source every other frame is imperceptible and halves the
-     * cost (measured as the main suspect in 106's fps drop). */
-    static int copyTick;
-    if (firstUse || ((copyTick++) & 1) == 0) {
-        static int blurAlloc;
-        copyBackbufferTo(blurTex, &blurAlloc, SCREEN_W, SCREEN_H);
+    GLuint src = 0;
+    if (blurRT.state == 1 && blurRTFresh) {
+        src = blurRT.tex;            /* rendered by renderBlurSource */
+    } else {
+        /* No FBO: the old full-screen copy, every other frame. */
+        int firstUse = !blurTex;
+        if (!blurTex) {
+            glGenTextures(1, &blurTex);
+            glBindTexture(GL_TEXTURE_2D, blurTex);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S,
+                            GL_CLAMP_TO_EDGE);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T,
+                            GL_CLAMP_TO_EDGE);
+        }
+        static int copyTick;
+        if (firstUse || ((copyTick++) & 1) == 0) {
+            static int blurAlloc;
+            copyBackbufferTo(blurTex, &blurAlloc, SCREEN_W, SCREEN_H);
+        }
+        src = blurTex;
     }
 
     beginHud2D();
     glEnable(GL_TEXTURE_2D);
-    glBindTexture(GL_TEXTURE_2D, blurTex);
+    glBindTexture(GL_TEXTURE_2D, src);
     glEnableClientState(GL_TEXTURE_COORD_ARRAY);
     glEnable(GL_BLEND);
     glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
@@ -14613,6 +14722,7 @@ int main(void) {
         /* Capture the nearest monitor's live feed before clearing the
          * frame (it renders into a scissored corner, then copies out). */
         renderCameraFeed();
+        renderBlurSource();
         tFeed = sceKernelGetProcessTimeWide();
 
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
