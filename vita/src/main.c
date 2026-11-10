@@ -53,7 +53,7 @@ unsigned int _newlib_heap_size_user = 220 * 1024 * 1024;
 
 #define DATA_ROOT "ux0:data/scpcb-ue"
 /* Shown in the debug HUD so a stale VPK install is instantly visible. */
-#define PORT_BUILD_TAG "fps4"
+#define PORT_BUILD_TAG "fps5"
 
 /* Diagnostic switch: set to 1 to skip ALL video playback (boot clips
  * and intro). The diag2-novid device test proved the video player was
@@ -2686,6 +2686,7 @@ static int drawCallsFrame, drawCallsShown;
  * quads while 106 is near) and the 106 CPU skinning. */
 static unsigned blurUsFrame, skinUsFrame;
 static unsigned blurUsShown, skinUsShown;
+static unsigned blurMaxUs;   /* worst blur call in the perf window */
 
 /* Cached texenv mode for the batch renderer: 0 = plain single-texture
  * modulate, 1 = the lit room composite (unit 0 lightmap + ambient
@@ -11641,6 +11642,26 @@ static void cameraCheckUpdate(void) {
     }
 }
 
+/* Copy a w x h corner of the backbuffer into `tex`. vitaGL implements
+ * glCopyTexImage2D as glReadPixels into a temporary RGBA buffer followed
+ * by a normal glTexImage2D: with GL_RGB that re-allocates the texture
+ * and converts every pixel through read/write callbacks on each call -
+ * the device profile showed the full-screen blur copy costing ~175 ms
+ * (every other frame at ~180 ms while SCP-106 was near). Allocating
+ * the texture once as RGBA and refreshing it with glCopyTexSubImage2D
+ * keeps the storage and takes vitaGL's block-copy path instead. */
+static void copyBackbufferTo(GLuint tex, int *allocated, int w, int h) {
+    glBindTexture(GL_TEXTURE_2D, tex);
+    if (!*allocated) {
+        void *zero = calloc((size_t)w * (size_t)h, 4);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0, GL_RGBA,
+                     GL_UNSIGNED_BYTE, zero);
+        free(zero);
+        *allocated = 1;
+    }
+    glCopyTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 0, 0, w, h);
+}
+
 /* Render the nearest Screen camera's view into monFeedTex. Draws the
  * scene into a MON_FEED_SIZE corner of the backbuffer (pointed from the
  * camera toward the player, a security-cam-watching-the-occupant view),
@@ -11719,9 +11740,9 @@ static void renderCameraFeed(void) {
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
     }
-    glBindTexture(GL_TEXTURE_2D, monFeedTex);
-    glCopyTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, 0, 0, MON_FEED_SIZE,
-                     MON_FEED_SIZE, 0);
+    static int monFeedAlloc;
+    copyBackbufferTo(monFeedTex, &monFeedAlloc, MON_FEED_SIZE,
+                     MON_FEED_SIZE);
     glDisable(GL_SCISSOR_TEST);
     glViewport(0, 0, SCREEN_W, SCREEN_H);
     monFeedActive = 1;
@@ -12447,6 +12468,23 @@ static void endHud2D(void) {
  * texture, then drawn back four times at growing offsets so the
  * overlapping copies soften it. Real post-process, no FBO needed. */
 static GLuint blurTex;
+/* The smear source is an RGBA copy of the backbuffer whose alpha is
+ * whatever the frame left there, so the blur quads take colour from
+ * the texture but alpha from glColor alone. Pre-built at boot by
+ * warmFfpVariants like every other texenv combination. */
+static void blurEnv(int on) {
+    if (on) {
+        glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_COMBINE);
+        glTexEnvi(GL_TEXTURE_ENV, GL_COMBINE_RGB, GL_MODULATE);
+        glTexEnvi(GL_TEXTURE_ENV, GL_SRC0_RGB, GL_TEXTURE);
+        glTexEnvi(GL_TEXTURE_ENV, GL_SRC1_RGB, GL_PRIMARY_COLOR);
+        glTexEnvi(GL_TEXTURE_ENV, GL_COMBINE_ALPHA, GL_REPLACE);
+        glTexEnvi(GL_TEXTURE_ENV, GL_SRC0_ALPHA, GL_PRIMARY_COLOR);
+    } else {
+        glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_MODULATE);
+    }
+}
+
 static void drawScreenBlur(void) {
     if (blurAmount <= 0.02f) return;
     uint64_t t0 = sceKernelGetProcessTimeWide();
@@ -12465,9 +12503,8 @@ static void drawScreenBlur(void) {
      * cost (measured as the main suspect in 106's fps drop). */
     static int copyTick;
     if (firstUse || ((copyTick++) & 1) == 0) {
-        glBindTexture(GL_TEXTURE_2D, blurTex);
-        glCopyTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, 0, 0, SCREEN_W, SCREEN_H,
-                         0);
+        static int blurAlloc;
+        copyBackbufferTo(blurTex, &blurAlloc, SCREEN_W, SCREEN_H);
     }
 
     beginHud2D();
@@ -12476,6 +12513,7 @@ static void drawScreenBlur(void) {
     glEnableClientState(GL_TEXTURE_COORD_ARRAY);
     glEnable(GL_BLEND);
     glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    blurEnv(1);
     float off = 1.5f + amt * 6.0f;   /* offset in pixels grows with blur */
     static const float dir[4][2] = { {1,0}, {-1,0}, {0,1}, {0,-1} };
     /* The capture is bottom-up; flip V so screen top maps to V=1. */
@@ -12493,10 +12531,12 @@ static void drawScreenBlur(void) {
         glTexCoordPointer(2, GL_FLOAT, 0, uv);
         glDrawArrays(GL_TRIANGLE_FAN, 0, 4);
     }
+    blurEnv(0);
     glDisable(GL_BLEND);
     glColor4f(1, 1, 1, 1);
     endHud2D();
     blurUsFrame += (unsigned)(sceKernelGetProcessTimeWide() - t0);
+    if (blurUsFrame > blurMaxUs) blurMaxUs = blurUsFrame;
 }
 
 /* Design-space mapping: Menu_Core.bb lays the menu out in 1280x960. */
@@ -13735,6 +13775,23 @@ static void warmFfpVariants(void) {
         glDrawArrays(GL_TRIANGLES, 0, 3);
     }
     glDisable(GL_FOG);
+    /* The blur quad's variant, in the HUD 2D state it draws under. */
+    {
+        static const GLfloat q[8], uv[8];
+        beginHud2D();
+        glEnable(GL_TEXTURE_2D);
+        glBindTexture(GL_TEXTURE_2D, white);
+        glEnableClientState(GL_TEXTURE_COORD_ARRAY);
+        glEnable(GL_BLEND);
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+        blurEnv(1);
+        glVertexPointer(2, GL_FLOAT, 0, q);
+        glTexCoordPointer(2, GL_FLOAT, 0, uv);
+        glDrawArrays(GL_TRIANGLE_FAN, 0, 4);
+        blurEnv(0);
+        glDisable(GL_BLEND);
+        endHud2D();
+    }
     glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
 }
 
@@ -14962,13 +15019,14 @@ int main(void) {
                 if (tEnd - pStart > 5000000 && pN) {
                     plog("perf fps=%.1f upd=%.1f draw=%.1f swap=%.1f ms "
                          "dc=%u adc=%u act=%d | feed=%.1f rooms=%.1f "
-                         "ents=%.1f alpha=%.1f hud=%.1f",
+                         "ents=%.1f alpha=%.1f hud=%.1f blurmax=%.1f",
                          pN * 1000000.0 / (double)(tEnd - pStart),
                          pU / 1000.0 / pN, pD / 1000.0 / pN,
                          pS / 1000.0 / pN, pDc / pN, pAdc / pN, activeCount,
                          pFeed / 1000.0 / pN, pRooms / 1000.0 / pN,
                          pEnts / 1000.0 / pN, pAlpha / 1000.0 / pN,
-                         pHud / 1000.0 / pN);
+                         pHud / 1000.0 / pN, blurMaxUs / 1000.0);
+                    blurMaxUs = 0;
                     pStart = tEnd;
                     pU = pD = pS = pFeed = pRooms = pEnts = pAlpha = pHud = 0;
                     pN = pDc = pAdc = 0;
