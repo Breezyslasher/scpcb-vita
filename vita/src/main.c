@@ -53,7 +53,7 @@ unsigned int _newlib_heap_size_user = 220 * 1024 * 1024;
 
 #define DATA_ROOT "ux0:data/scpcb-ue"
 /* Shown in the debug HUD so a stale VPK install is instantly visible. */
-#define PORT_BUILD_TAG "heart1"
+#define PORT_BUILD_TAG "fps3"
 
 /* Diagnostic switch: set to 1 to skip ALL video playback (boot clips
  * and intro). The diag2-novid device test proved the video player was
@@ -2687,6 +2687,54 @@ static int drawCallsFrame, drawCallsShown;
 static unsigned blurUsFrame, skinUsFrame;
 static unsigned blurUsShown, skinUsShown;
 
+/* Cached texenv mode for the batch renderer: 0 = plain single-texture
+ * modulate, 1 = the lit room composite (unit 0 lightmap + ambient
+ * constant, unit 1 diffuse modulate x2). Every glTexEnv call marks
+ * vitaGL's fixed-function fragment state dirty (ffp_dirty_frag), which
+ * makes the next draw re-derive and look up its shader; issuing the
+ * whole combine setup per batch did that ~18 times a batch. Now the
+ * state is touched only on lit/unlit transitions, and drawBatchSet
+ * always leaves mode 0 behind so nothing outside it can draw with the
+ * second unit enabled. Both modes are pre-built by warmFfpVariants. */
+static int litModeCur;
+
+static void setLitMode(int lit) {
+    if (litModeCur == lit) return;
+    litModeCur = lit;
+    if (lit) {
+        glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_COMBINE);
+        glTexEnvi(GL_TEXTURE_ENV, GL_COMBINE_RGB, GL_ADD);
+        glTexEnvi(GL_TEXTURE_ENV, GL_SRC0_RGB, GL_TEXTURE);
+        glTexEnvi(GL_TEXTURE_ENV, GL_SRC1_RGB, GL_CONSTANT);
+        glTexEnvi(GL_TEXTURE_ENV, GL_COMBINE_ALPHA, GL_MODULATE);
+        glTexEnvi(GL_TEXTURE_ENV, GL_SRC0_ALPHA, GL_PRIMARY_COLOR);
+        glTexEnvi(GL_TEXTURE_ENV, GL_SRC1_ALPHA, GL_TEXTURE);
+        glTexEnvfv(GL_TEXTURE_ENV, GL_TEXTURE_ENV_COLOR, ambEnv);
+        glActiveTexture(GL_TEXTURE1);
+        glEnable(GL_TEXTURE_2D);
+        glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_COMBINE);
+        glTexEnvi(GL_TEXTURE_ENV, GL_COMBINE_RGB, GL_MODULATE);
+        glTexEnvi(GL_TEXTURE_ENV, GL_SRC0_RGB, GL_PREVIOUS);
+        glTexEnvi(GL_TEXTURE_ENV, GL_SRC1_RGB, GL_TEXTURE);
+        glTexEnvf(GL_TEXTURE_ENV, GL_RGB_SCALE, 2.0f);
+        glTexEnvi(GL_TEXTURE_ENV, GL_COMBINE_ALPHA, GL_REPLACE);
+        glTexEnvi(GL_TEXTURE_ENV, GL_SRC0_ALPHA, GL_PREVIOUS);
+        glClientActiveTexture(GL_TEXTURE1);
+        glEnableClientState(GL_TEXTURE_COORD_ARRAY);
+        glClientActiveTexture(GL_TEXTURE0);
+        glActiveTexture(GL_TEXTURE0);
+    } else {
+        glActiveTexture(GL_TEXTURE1);
+        glDisable(GL_TEXTURE_2D);
+        glTexEnvf(GL_TEXTURE_ENV, GL_RGB_SCALE, 1.0f);
+        glClientActiveTexture(GL_TEXTURE1);
+        glDisableClientState(GL_TEXTURE_COORD_ARRAY);
+        glClientActiveTexture(GL_TEXTURE0);
+        glActiveTexture(GL_TEXTURE0);
+        glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_MODULATE);
+    }
+}
+
 static void drawBatchSet(const Scene *scene, const BatchGL *gl, int alphaPass) {
     if (!alphaPass) {
         /* Backface-cull the opaque room geometry: measured CCW-outward
@@ -2718,45 +2766,24 @@ static void drawBatchSet(const Scene *scene, const BatchGL *gl, int alphaPass) {
              * in one pass: unit 0 ADDs the lightmap onto the baked
              * vertex colour, unit 1 modulates by the diffuse doubled
              * (COMBINE with RGB_SCALE 2). */
+            setLitMode(1);
             glEnable(GL_TEXTURE_2D);
             glBindTexture(GL_TEXTURE_2D, lightmap);
-            /* Unit 0: lightmap + the flat room-ambient constant (the
-             * source's AmbientLightRoomTex layer; the room vertex
-             * colours are all white, so PRIMARY carries nothing the
-             * constant doesn't). */
-            glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_COMBINE);
-            glTexEnvi(GL_TEXTURE_ENV, GL_COMBINE_RGB, GL_ADD);
-            glTexEnvi(GL_TEXTURE_ENV, GL_SRC0_RGB, GL_TEXTURE);
-            glTexEnvi(GL_TEXTURE_ENV, GL_SRC1_RGB, GL_CONSTANT);
-            glTexEnvi(GL_TEXTURE_ENV, GL_COMBINE_ALPHA, GL_MODULATE);
-            glTexEnvi(GL_TEXTURE_ENV, GL_SRC0_ALPHA, GL_PRIMARY_COLOR);
-            glTexEnvi(GL_TEXTURE_ENV, GL_SRC1_ALPHA, GL_TEXTURE);
-            glTexEnvfv(GL_TEXTURE_ENV, GL_TEXTURE_ENV_COLOR, ambEnv);
             glTexCoordPointer(2, GL_FLOAT, sizeof(SceneVertex), VTX_OFF(lu));
             glActiveTexture(GL_TEXTURE1);
-            glEnable(GL_TEXTURE_2D);
             glBindTexture(GL_TEXTURE_2D, diffuse);
-            glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_COMBINE);
-            glTexEnvi(GL_TEXTURE_ENV, GL_COMBINE_RGB, GL_MODULATE);
-            glTexEnvi(GL_TEXTURE_ENV, GL_SRC0_RGB, GL_PREVIOUS);
-            glTexEnvi(GL_TEXTURE_ENV, GL_SRC1_RGB, GL_TEXTURE);
-            glTexEnvf(GL_TEXTURE_ENV, GL_RGB_SCALE, 2.0f);
-            glTexEnvi(GL_TEXTURE_ENV, GL_COMBINE_ALPHA, GL_REPLACE);
-            glTexEnvi(GL_TEXTURE_ENV, GL_SRC0_ALPHA, GL_PREVIOUS);
+            glActiveTexture(GL_TEXTURE0);
             glClientActiveTexture(GL_TEXTURE1);
-            glEnableClientState(GL_TEXTURE_COORD_ARRAY);
             glTexCoordPointer(2, GL_FLOAT, sizeof(SceneVertex), VTX_OFF(du));
             glClientActiveTexture(GL_TEXTURE0);
-            glActiveTexture(GL_TEXTURE0);
         } else if (diffuse) {
+            setLitMode(0);
             glEnable(GL_TEXTURE_2D);
             glBindTexture(GL_TEXTURE_2D, diffuse);
-            glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_MODULATE);
             glTexCoordPointer(2, GL_FLOAT, sizeof(SceneVertex), VTX_OFF(du));
-            lightmap = 0;
         } else {
+            setLitMode(0);
             glDisable(GL_TEXTURE_2D);
-            lightmap = 0;
         }
         if (alphaPass) {
             /* The game alpha-blends these surfaces with the texture's
@@ -2771,17 +2798,6 @@ static void drawBatchSet(const Scene *scene, const BatchGL *gl, int alphaPass) {
         drawCallsFrame++;
         glDrawElements(GL_TRIANGLES, (GLsizei)b->indexCount,
                        GL_UNSIGNED_SHORT, NULL);
-        if (lightmap) {
-            glActiveTexture(GL_TEXTURE1);
-            glDisable(GL_TEXTURE_2D);
-            glTexEnvf(GL_TEXTURE_ENV, GL_RGB_SCALE, 1.0f);
-            glClientActiveTexture(GL_TEXTURE1);
-            glDisableClientState(GL_TEXTURE_COORD_ARRAY);
-            glClientActiveTexture(GL_TEXTURE0);
-            glActiveTexture(GL_TEXTURE0);
-            /* Unit 0 back to plain modulate for everything else. */
-            glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_MODULATE);
-        }
         if (alphaPass) {
             glDisable(GL_ALPHA_TEST);
             glDisable(GL_BLEND);
@@ -2792,6 +2808,7 @@ static void drawBatchSet(const Scene *scene, const BatchGL *gl, int alphaPass) {
     if (!alphaPass) glDisable(GL_CULL_FACE);
     glBindBuffer(GL_ARRAY_BUFFER, 0);
     glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
+    setLitMode(0);
 }
 
 static void drawRoomBatches(const RoomPlacement *p, int alphaPass) {
@@ -13817,6 +13834,7 @@ int main(void) {
         static uint64_t frameMaxUs, updMaxUs, drawMaxUs, swapMaxUs;
         static unsigned worstMs, updWorst, drawWorst, swapWorst;
         uint64_t tUpd = 0, tDraw = 0;
+        uint64_t tFeed = 0, tRooms = 0, tEnts = 0, tAlpha = 0;
         if (framePrevUs && now - framePrevUs > frameMaxUs) {
             frameMaxUs = now - framePrevUs;
         }
@@ -14528,6 +14546,7 @@ int main(void) {
         /* Capture the nearest monitor's live feed before clearing the
          * frame (it renders into a scissored corner, then copies out). */
         renderCameraFeed();
+        tFeed = sceKernelGetProcessTimeWide();
 
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
 
@@ -14573,6 +14592,7 @@ int main(void) {
                 drawBatchSet(introCellScene, introCellGL, 0);
                 glPopMatrix();
             }
+            tRooms = sceKernelGetProcessTimeWide();
             drawMtMaze(0);
             drawPocketComposite(0);
             decalsDraw();
@@ -14604,6 +14624,7 @@ int main(void) {
             drawIntroHumans(camPos);
             drawEventHumans(camPos);
             drawEventProps(camPos);
+            tEnts = sceKernelGetProcessTimeWide();
             glDisable(GL_CULL_FACE);
             for (int i = 0; i < activeCount; i++) {
                 float rdx = activeRooms[i]->gridX * ROOM_SPACING - camPos[0];
@@ -14623,6 +14644,7 @@ int main(void) {
             drawMtMaze(1);
             drawPocketComposite(1);
             drawScreenBlur();
+            tAlpha = sceKernelGetProcessTimeWide();
         }
 
         char line1[320];
@@ -14909,6 +14931,38 @@ int main(void) {
             if (u > updMaxUs) updMaxUs = u;
             if (d > drawMaxUs) drawMaxUs = d;
             if (s > swapMaxUs) swapMaxUs = s;
+            /* Steady-state profile every ~5 s: averages over the
+             * window, and where the draw time goes (camera feed, room
+             * geometry, entities, alpha + blur, HUD). The slowframe
+             * line below only catches spikes over 80 ms. */
+            {
+                static uint64_t pStart, pU, pD, pS, pFeed, pRooms, pEnts,
+                                pAlpha, pHud;
+                static unsigned pN, pDc;
+                if (!pStart) pStart = tEnd;
+                pU += u; pD += d; pS += s; pN++; pDc += drawCallsFrame;
+                if (tRooms && tEnts && tAlpha && tFeed) {
+                    pFeed += tFeed - tUpd;
+                    pRooms += tRooms - tFeed;
+                    pEnts += tEnts - tRooms;
+                    pAlpha += tAlpha - tEnts;
+                    pHud += tDraw - tAlpha;
+                }
+                if (tEnd - pStart > 5000000 && pN) {
+                    plog("perf fps=%.1f upd=%.1f draw=%.1f swap=%.1f ms "
+                         "dc=%u act=%d | feed=%.1f rooms=%.1f ents=%.1f "
+                         "alpha=%.1f hud=%.1f",
+                         pN * 1000000.0 / (double)(tEnd - pStart),
+                         pU / 1000.0 / pN, pD / 1000.0 / pN,
+                         pS / 1000.0 / pN, pDc / pN, activeCount,
+                         pFeed / 1000.0 / pN, pRooms / 1000.0 / pN,
+                         pEnts / 1000.0 / pN, pAlpha / 1000.0 / pN,
+                         pHud / 1000.0 / pN);
+                    pStart = tEnd;
+                    pU = pD = pS = pFeed = pRooms = pEnts = pAlpha = pHud = 0;
+                    pN = pDc = 0;
+                }
+            }
             if (u + d + s > 80000) {
                 static uint64_t lastSlowLog;
                 if (tEnd - lastSlowLog > 1000000) {
