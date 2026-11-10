@@ -53,7 +53,7 @@ unsigned int _newlib_heap_size_user = 220 * 1024 * 1024;
 
 #define DATA_ROOT "ux0:data/scpcb-ue"
 /* Shown in the debug HUD so a stale VPK install is instantly visible. */
-#define PORT_BUILD_TAG "fps3"
+#define PORT_BUILD_TAG "fps4"
 
 /* Diagnostic switch: set to 1 to skip ALL video playback (boot clips
  * and intro). The diag2-novid device test proved the video player was
@@ -2735,7 +2735,10 @@ static void setLitMode(int lit) {
     }
 }
 
+static int alphaCallsFrame;   /* alpha-pass draw calls this frame */
+
 static void drawBatchSet(const Scene *scene, const BatchGL *gl, int alphaPass) {
+    int alphaOn = 0;
     if (!alphaPass) {
         /* Backface-cull the opaque room geometry: measured CCW-outward
          * across the shipped meshes (floor-normal and signed-volume
@@ -2785,25 +2788,31 @@ static void drawBatchSet(const Scene *scene, const BatchGL *gl, int alphaPass) {
             setLitMode(0);
             glDisable(GL_TEXTURE_2D);
         }
-        if (alphaPass) {
+        if (alphaPass && !alphaOn) {
             /* The game alpha-blends these surfaces with the texture's
              * alpha (glass is ~0.13-0.7); a mask-style alpha test only
-             * drops fully transparent texels. */
+             * drops fully transparent texels. Set once per scene, on
+             * its first alpha batch, not around every batch: the
+             * device profile put 85 ms a frame in the alpha pass of a
+             * glass-heavy area with the per-batch toggling (blend and
+             * depth-write state are baked into vitaGL's patched
+             * fragment program, so each flip re-patches). */
             glEnable(GL_ALPHA_TEST);
             glAlphaFunc(GL_GREATER, 0.01f);
             glEnable(GL_BLEND);
             glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
             glDepthMask(GL_FALSE);
+            alphaOn = 1;
         }
         drawCallsFrame++;
+        if (alphaPass) alphaCallsFrame++;
         glDrawElements(GL_TRIANGLES, (GLsizei)b->indexCount,
                        GL_UNSIGNED_SHORT, NULL);
-        if (alphaPass) {
-            glDisable(GL_ALPHA_TEST);
-            glDisable(GL_BLEND);
-            glDepthMask(GL_TRUE);
-        }
-
+    }
+    if (alphaOn) {
+        glDisable(GL_ALPHA_TEST);
+        glDisable(GL_BLEND);
+        glDepthMask(GL_TRUE);
     }
     if (!alphaPass) glDisable(GL_CULL_FACE);
     glBindBuffer(GL_ARRAY_BUFFER, 0);
@@ -13851,6 +13860,7 @@ int main(void) {
         }
         drawCallsShown = drawCallsFrame;
         drawCallsFrame = 0;
+        alphaCallsFrame = 0;
         blurUsShown = blurUsFrame;
         skinUsShown = skinUsFrame;
         blurUsFrame = skinUsFrame = 0;
@@ -14938,9 +14948,10 @@ int main(void) {
             {
                 static uint64_t pStart, pU, pD, pS, pFeed, pRooms, pEnts,
                                 pAlpha, pHud;
-                static unsigned pN, pDc;
+                static unsigned pN, pDc, pAdc;
                 if (!pStart) pStart = tEnd;
                 pU += u; pD += d; pS += s; pN++; pDc += drawCallsFrame;
+                pAdc += alphaCallsFrame;
                 if (tRooms && tEnts && tAlpha && tFeed) {
                     pFeed += tFeed - tUpd;
                     pRooms += tRooms - tFeed;
@@ -14950,17 +14961,17 @@ int main(void) {
                 }
                 if (tEnd - pStart > 5000000 && pN) {
                     plog("perf fps=%.1f upd=%.1f draw=%.1f swap=%.1f ms "
-                         "dc=%u act=%d | feed=%.1f rooms=%.1f ents=%.1f "
-                         "alpha=%.1f hud=%.1f",
+                         "dc=%u adc=%u act=%d | feed=%.1f rooms=%.1f "
+                         "ents=%.1f alpha=%.1f hud=%.1f",
                          pN * 1000000.0 / (double)(tEnd - pStart),
                          pU / 1000.0 / pN, pD / 1000.0 / pN,
-                         pS / 1000.0 / pN, pDc / pN, activeCount,
+                         pS / 1000.0 / pN, pDc / pN, pAdc / pN, activeCount,
                          pFeed / 1000.0 / pN, pRooms / 1000.0 / pN,
                          pEnts / 1000.0 / pN, pAlpha / 1000.0 / pN,
                          pHud / 1000.0 / pN);
                     pStart = tEnd;
                     pU = pD = pS = pFeed = pRooms = pEnts = pAlpha = pHud = 0;
-                    pN = pDc = 0;
+                    pN = pDc = pAdc = 0;
                 }
             }
             if (u + d + s > 80000) {
