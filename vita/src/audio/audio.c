@@ -484,6 +484,21 @@ void audioPlay(int sound, float vol, float pan) {
     }
 }
 
+int audioSoundPlaying(int sound) {
+    if (sound < 0) return 0;
+    for (int c = 0; c < MAX_CHANNELS; c++) {
+        if (channels[c].sound == sound) return 1;
+    }
+    return 0;
+}
+
+void audioStopSound(int sound) {
+    if (sound < 0) return;
+    for (int c = 0; c < MAX_CHANNELS; c++) {
+        if (channels[c].sound == sound) channels[c].sound = -1;
+    }
+}
+
 void audioPlay3D(int sound, const float pos[3], const float listener[3],
                  float yaw, float range) {
     float dx = pos[0] - listener[0];

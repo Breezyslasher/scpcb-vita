@@ -53,7 +53,7 @@ unsigned int _newlib_heap_size_user = 220 * 1024 * 1024;
 
 #define DATA_ROOT "ux0:data/scpcb-ue"
 /* Shown in the debug HUD so a stale VPK install is instantly visible. */
-#define PORT_BUILD_TAG "ambgamma2"
+#define PORT_BUILD_TAG "heart1"
 
 /* Diagnostic switch: set to 1 to skip ALL video playback (boot clips
  * and intro). The diag2-novid device test proved the video player was
@@ -1282,6 +1282,9 @@ static int npc1499Chat[MAX_1499];      /* citizen's conversation partner, -1 non
 static int npc1499Count;
 static int pdRoomIdx = -1;
 static int inPocket;          /* player is in the pocket dimension */
+/* Short per-frame holds raised by the code that owns the condition
+ * (the source's ShouldPlay = 18 / 29), read by desiredMusicPath. */
+static int musicHold1499Chase, musicHold1123;
 static float pocketTimer;     /* frames until it collapses (death) */
 static float pdCircle;        /* 106's orbit angle in the start room */
 static int pdLunging;         /* 106 has broken off to attack */
@@ -2342,6 +2345,18 @@ static float health = 100.0f;       /* derived HUD value = 100 - bloodloss */
 static float injuries;              /* 0..~5 */
 static float bloodloss;             /* 0..100 */
 static float sanity = 100.0f;       /* 0..100 (source uses 0..-850) */
+/* me\HeartBeatRate / HeartBeatVolume / HeartBeatTimer (UpdateMoving).
+ * In the source the rate only ever ratchets up through Max(); it is
+ * the volume, decaying 0.05 per tick, that lets the heart fall quiet
+ * once nothing is feeding it. */
+static float heartRate = 70.0f, heartVol, heartTimer;
+static int sndHeartbeat = -1, sndBreathRelaxed = -1;
+static int sndBreath[2][5];         /* BreathSFX(gas, i) */
+static int breathCur = -1;          /* BreathCHN: the breath now playing */
+static void heartBump(float rateMin, float volMin) {
+    if (heartRate < rateMin) heartRate = rateMin;
+    if (heartVol < volMin) heartVol = volMin;
+}
 static float damageFlash;           /* red flash on taking damage */
 static float fallPeakY;             /* apex of the current fall */
 static char deathCause[64] = "SCP-173";
@@ -2529,6 +2544,8 @@ static void regenerateMap(uint32_t seed) {
     injuries = 0.0f;
     bloodloss = 0.0f;
     sanity = 100.0f;
+    heartRate = 70.0f;
+    heartVol = heartTimer = 0.0f;
     equippedNav = -1;
     navVisible = 1;
     health = 100.0f;
@@ -2889,6 +2906,16 @@ static void loadSounds(void) {
         sndElevClose[i] = audioLoad(p);
     }
     sndElevMove = audioLoad(SFX_DIR "/General/Elevator/Moving.ogg");
+    sndHeartbeat = audioLoad(SFX_DIR "/Character/D9341/Heartbeat.ogg");
+    sndBreathRelaxed =
+        audioLoad(SFX_DIR "/Character/D9341/BreathGasRelaxed.ogg");
+    for (int i = 0; i < 5; i++) {
+        snprintf(p, sizeof(p), SFX_DIR "/Character/D9341/Breath%d.ogg", i);
+        sndBreath[0][i] = audioLoad(p);
+        snprintf(p, sizeof(p), SFX_DIR "/Character/D9341/Breath%dGas.ogg",
+                 i);
+        sndBreath[1][i] = audioLoad(p);
+    }
     for (int i = 0; i < 8; i++) {
         snprintf(p, sizeof(p), SFX_DIR "/Step/Step%d.ogg", i);
         sndStep[i] = audioLoad(p);
@@ -4085,6 +4112,8 @@ static void update173(void) {
             /* First moment it gets this close: a hard sting. */
             if (npc173LastDist > 512.0f && hasTarget) {
                 audioPlay(sndHorrorClose[rand() % 5], 1.0f, 0.0f);
+                if (heartRate < 140.0f) heartRate = 140.0f;
+                heartVol = 0.5f;
             }
         }
         npc173LastDist = dist;
@@ -6672,6 +6701,7 @@ static void update1499(void) {
         float hy;
         if (rayDownWorld(o, 6000.0f, &hy)) npc1499Pos[k][1] = hy;
     }
+    if (anyAggro) musicHold1499Chase = 3;
     sanity -= anyAggro ? 0.15f : 0.05f;
     if (sanity < 0.0f) sanity = 0.0f;
 }
@@ -8952,8 +8982,29 @@ static const char *desiredMusicPath(void) {
     if (npc049Active &&
         (npc049State == S049_PURSUE || npc049State == S049_KILL))
         return DATA_ROOT "/SFX/Music/049Chase.ogg";
+    /* The other dimensions and event tracks (Events_Core ShouldPlay
+     * 3 / 14 / 17 / 18 / 28 / 29). */
+    if (inPocket) {
+        if (pdState == PD_TRENCHES)
+            return DATA_ROOT "/SFX/Music/PDTrench.ogg";
+        if (pdState != PD_FAKETUNNEL)
+            return DATA_ROOT "/SFX/Music/PD.ogg";
+    }
+    if (inMask) {
+        return musicHold1499Chase > 0
+             ? DATA_ROOT "/SFX/Music/1499_1Chase.ogg"
+             : DATA_ROOT "/SFX/Music/1499Dimension.ogg";
+    }
+    if (musicHold1123 > 0) return DATA_ROOT "/SFX/Music/1123Chamber.ogg";
+    if (mtInstCount && inMtBounds(camPos[0], camPos[2]))
+        return DATA_ROOT "/SFX/Music/MaintenanceTunnels.ogg";
     /* Signature chamber music while the player is in the room. */
     const char *r = roomNameAt(camPos);
+    /* The two deep chambers only below their shafts (ShouldPlay 27/30). */
+    if (!strcmp(r, "cont2_409") && camPos[1] < -3728.0f)
+        return DATA_ROOT "/SFX/Music/409Chamber.ogg";
+    if (!strcmp(r, "cont2_008") && camPos[1] < -4496.0f)
+        return DATA_ROOT "/SFX/Music/008Chamber.ogg";
     if (!strcmp(r, "cont1_079")) return DATA_ROOT "/SFX/Music/079Chamber.ogg";
     if (!strcmp(r, "cont1_914")) return DATA_ROOT "/SFX/Music/914Chamber.ogg";
     if (!strcmp(r, "cont2_012")) return DATA_ROOT "/SFX/Music/012Chamber.ogg";
@@ -9028,6 +9079,39 @@ static void updatePlayerCondition(void) {
             float sv = (30.0f - sanity) / 30.0f * 1.8f;
             if (camShake < sv) camShake = sv;
         }
+
+        /* The heart (Main_Core). Sanity below -200 on the source's
+         * 0..-850 scale sets the volume outright and raises the rate;
+         * blood loss past 35 and 80 does the same in two bands. */
+        float srcSan = (sanity - 100.0f) * 8.5f;
+        if (srcSan < -200.0f) {
+            float v = fabsf(srcSan + 20.0f) / 500.0f;
+            heartVol = v < 1.0f ? v : 1.0f;
+            float r = 70.0f + fabsf(srcSan + 200.0f) / 6.0f;
+            if (heartRate < r) heartRate = r;
+        }
+        if (bloodloss > 80.0f) {
+            heartBump(150.0f - (bloodloss - 80.0f) * 5.0f,
+                      0.75f + (bloodloss - 80.0f) * 0.0125f);
+        } else if (bloodloss > 35.0f) {
+            heartBump(70.0f + bloodloss, (bloodloss - 35.0f) / 60.0f);
+        }
+        if (heartVol > 0.0f) {
+            if (heartTimer <= 0.0f) {
+                audioPlay(sndHeartbeat, heartVol > 1.0f ? 1.0f : heartVol,
+                          0.0f);
+                /* 70 * (60 / rate) source ticks = 60 / rate seconds. */
+                heartTimer = 60.0f * (60.0f / (heartRate > 1.0f ? heartRate
+                                                                : 1.0f));
+            } else {
+                heartTimer -= 1.0f;
+            }
+            /* 0.05 per 1/70 s tick, at the port's 60 fps frame. */
+            heartVol -= 0.05f * 70.0f / 60.0f;
+            if (heartVol < 0.0f) heartVol = 0.0f;
+        }
+    } else {
+        heartVol = 0.0f;                 /* Kill(): the heart stops */
     }
     health = 100.0f - bloodloss;
 }
@@ -10459,6 +10543,7 @@ static void updateRoomEvents2(void) {
                         }
                     } else if (st[0] == 2.0f) {
                         st[1] += 1.0f;
+                        musicHold1123 = 3;       /* ShouldPlay = 29 */
                         if (blurAmount < 0.35f) blurAmount = 0.35f;
                         if (st[1] == 500.0f) {
                             audioPlay(EVSND("/SCP/1123/Officer1.ogg"),
@@ -10791,6 +10876,8 @@ static void updateFogModel(void) {
 }
 
 static void updateZoneMusic(void) {
+    if (musicHold1499Chase > 0) musicHold1499Chase--;
+    if (musicHold1123 > 0) musicHold1123--;
     if (radioChannel >= 0 || !worldReady) return;
     const char *path = desiredMusicPath();
     if (path != currentMusicPath) {
@@ -11908,6 +11995,13 @@ static void update012(void) {
     float dx = camPos[0] - scp012Pos[0];
     float dz = camPos[2] - scp012Pos[2];
     int atScore = (dx * dx + dz * dz) < 153.0f * 153.0f;
+    /* The score in sight: the heart races, louder the closer you are
+     * (HeartBeatRate 150, volume (3 - dist) / 3 in world units). */
+    float d012 = sqrtf(dx * dx + dz * dz) / 256.0f;
+    if (d012 < 3.0f && fabsf(camPos[1] - scp012Pos[1]) < 600.0f) {
+        heartRate = 150.0f;
+        heartVol = (3.0f - d012) / 3.0f;
+    }
     if (atScore) {
         if (scp012Comp < 0.02f && sndHorror11 >= 0) {
             audioPlay(sndHorror11, 0.7f, 0.0f); /* HorrorSFX[11] */
@@ -13495,6 +13589,37 @@ static void drawNav(void) {
     glPopMatrix();
 }
 
+/* The player's breathing (UpdateMoving / UpdateGUI). Holding sprint
+ * on low stamina pants - Breath0 flat out under 5, one of Breath1..3
+ * under 40 at a volume that grows as stamina falls - with the muffled
+ * *Gas set behind a mask, hazmat suit or SCP-1499. While a mask is on
+ * and no pant is playing, the relaxed mask breathing fills in. */
+static void updateBreath(int sprintHeld) {
+    int masked = wearGasMask || wearHazmat || inMask;
+    int panting = audioSoundPlaying(breathCur);
+    if (deathTimer == 0 && sprintHeld && !invOpen && !panting) {
+        if (stamina < 5.0f) {
+            breathCur = sndBreath[masked][0];
+            audioPlay(breathCur, 1.0f, 0.0f);
+            panting = 1;
+        } else if (stamina < 40.0f) {
+            float v = (70.0f - stamina) / 70.0f;
+            breathCur = sndBreath[masked][1 + rand() % 3];
+            audioPlay(breathCur, v < 1.0f ? v : 1.0f, 0.0f);
+            panting = 1;
+        }
+    }
+    if (masked && deathTimer == 0) {
+        if (panting) {
+            audioStopSound(sndBreathRelaxed);
+        } else if (!audioSoundPlaying(sndBreathRelaxed)) {
+            audioPlay(sndBreathRelaxed, 1.0f, 0.0f);
+        }
+    } else {
+        audioStopSound(sndBreathRelaxed);
+    }
+}
+
 /* Build every fixed-function shader variant the game draws with, at
  * boot, with one degenerate (invisible) triangle each. vitaGL compiles
  * an ffp shader the FIRST time each texenv/fog/alpha-test combination
@@ -14276,6 +14401,7 @@ int main(void) {
                 if (stamina > 100.0f) stamina = 100.0f;
                 if (staminaBlocked && stamina > 25.0f) staminaBlocked = 0;
             }
+            updateBreath(wantSprint);
 
             /* Blink: meter drains; empty or R closes the eyes. New
              * blinks don't start while a menu is open or the player

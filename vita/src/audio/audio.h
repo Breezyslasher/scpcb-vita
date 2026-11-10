@@ -17,6 +17,11 @@ int audioLoad(const char *path);
 /* One-shot playback, vol 0..1, pan -1..1. */
 void audioPlay(int sound, float vol, float pan);
 
+/* Blitz ChannelPlaying/StopChannel by sound: nonzero while any
+ * one-shot channel is playing `sound`; stop every channel playing it. */
+int audioSoundPlaying(int sound);
+void audioStopSound(int sound);
+
 /* One-shot with distance attenuation and pan relative to a listener
  * at `listener` facing `yaw` (radians); `range` in the same units. */
 void audioPlay3D(int sound, const float pos[3], const float listener[3],
